@@ -1,0 +1,96 @@
+# monet-urlsession：iOS 原生 transport（Swift shim + cxx）
+
+## Context
+
+Android 端已闭环（monet-rustls 默认 + monet-cronet 遗留 + monet-ws）。**iOS 必须原生**（用户明确定调：原生优先是总原则，monet-urlsession 是生产前置；纯 Rust 仅限开发/测试）——Apple 的 URLSession 由 Apple 永续维护，无版本天花板，且系统代理/cookie/钥匙串免费。
+
+本 crate 是**独立 transport**，零 RN/JSI 依赖：开发与验证完全在 monet-rs workspace 内（macOS host 直跑 URLSession，iOS 交叉编译验证）。jsi-rs/monet-rn 是最后一步，本阶段不碰。
+
+已定决策（DESIGN.md）：
+- 不用 objc2；Swift 独占 URLSession delegate 状态机（nitro `NitroBufferedTaskDelegate` 为蓝本）
+- 桥接 = Swift↔C++ interop + cxx（复用 cxx 生态，无第二桥接体系）
+- 窄回调面：`transport_execute(req, {on_response_head, on_chunk, on_done/on_error})`
+- HTTP = URLSession + delegate；WS = URLSessionWebSocketTask（同一个 shim）
+- pinning：delegate challenge → 查 core（host 匹配语义在 Rust 一份）
+- WebSocket/流式：head 先行、chunk 流式、CancelToken 语义与其他 transport 一致
+
+## nitro-fetch 深读结论（已回填）
+
+- **蓝本入口**：`HybridNitroFetchClient.requestStatic(req, bodyData, options, onResponseStarted, onData, onProgress) async throws -> NitroResponse`——静态方法、可脱离 JS 复用，我们的 TransportShim 镜像它
+- **请求构建**：plain `URLRequest` + `addValue`；**上传全缓冲**（multipart/base64/string → `httpBody`，无 URLSessionUploadTask）——与我们 monet-cronet v1 的缓冲决策一致，v1 照抄
+- **redirect**：`willPerformHTTPRedirection` delegate 返回 nil 阻断；`followRedirects` 默认 true；无 redirect/priority 时走无 delegate 快速路径
+- **超时**：`req.timeoutMs > 0` → `r.timeoutInterval`（仅 per-request，无 session 级）——**我们要补：core 目前没有超时概念，Transport 层加默认超时配置**
+- **优先级**：iOS 16+ `task.priority`（didCreateTask 挂钩）
+- **cookie**：默认 `HTTPCookieStorage` 共享；`credentials == .omit` 时关——v1 跟随默认
+- **session**：静态共享 `URLSessionConfiguration.default` + `useProtocolCachePolicy` + URLCache（32MB/100MB）
+- **WS（意外发现）**：nitro iOS 主路径是 Network.framework `NWConnection` + **手写 WebSocket 帧**，`URLSessionWebSocketTask` 只是 Info.plist 可切的 fallback（带 challenge delegate pinning）——fallback 的存在证明 URLSessionWebSocketTask 路线可行且简单，我们直接用它
+- **nitro 的 Swift↔非Swift 模式**：`@objc` bridge（`NitroWSPinningBridge` 等）供 Obj-C++ 调用——因为它的混合侧是 Obj-C++；我们的对应物是 cxx + interop
+- **流式启发**（来自早前读的 NitroBufferedTaskDelegate）：`startsStreaming` Content-Type 启发（text/event-stream 等）、0.4s 缓冲窗口、256KB 文本阈值——v1 简化：一律流式（我们直接把 didReceive data 推给回调，缓冲策略留给前端）
+- **冷启动**：`+load` → `UIApplicationDidFinishLaunchingNotification` → serial queue 上 prefetchOnStart；配置存 UserDefaults（加密）；token refresh 在 prefetch 前——将来 Rust bootstrap 的挂点即此处（本期不做）
+
+## Swift↔C++ interop 研究结论（已回填，2026-11 本机验证）
+
+- **双向机制确认可行**（本机 Swift 6.2.1 / Xcode 26.1.1 实测过 flag 与 typecheck）：
+  - Swift → Rust：`swiftc -cxx-interoperability-mode=default` + modulemap（`module monet_urlsession { header "rust_bridge.h" export * }`，rust_bridge.h `#include` cxxbridge 生成头 + `rust/cxx.h`），经 `-I` 传入
+  - Rust → Swift：trampoline.cpp `#include "Shim-Swift.h"`（`swiftc ... -emit-clang-header-path` 生成），调用 `@_expose(Cxx)` 公开 Swift 函数（生成为模块命名空间内的 C++ 内联函数）
+  - 静态库：`swiftc -parse-as-library -emit-library -static -cxx-interoperability-mode=default`；iOS 交叉：`xcrun --sdk iphoneos swiftc -target arm64-apple-ios17.0 -sdk $(xcrun --sdk iphoneos --show-sdk-path) ...`
+- **Swift 不能实现 C++ virtual interface**（6.x 仍不支持继承 C++ 类；`@cxx @implementation` 仍是实验性）→ **自由函数设计完全绕开它**，原风险 #1 的"Swift 实现 cxx 接口"问号消失
+- 边界类型：原语/指针/切片可跨；`@_expose` 不支持 async/throws/generics——窄回调面恰好全是简单签名
+- 陷阱：C++ **引用类型** import 会把最低部署抬到 iOS 16.4/macOS 13.3——边界只用自由函数+值类型规避；`.a` 消费者也要开 interop；生成头必须随 `.a` 分发
+- **零生产先例**（Sourcegraph 无 cxxbridge+Swift-flag 代码）——该组合的先行者，M1 spike 价值高；Apple `swift-cmake-examples`（双向 Swift↔C++）是构建参考
+
+## 定稿：回调链路形状
+
+```
+数据面（Swift → Rust，高频）：Swift 直接调 cxx 生成的 extern "Rust" 函数
+    on_response_head(id, status) / on_header(id, name: &[u8], value: &[u8])
+    / on_chunk(id, data: &[u8]) / on_done(id) / on_error(id, code, msg: &[u8])
+    / on_redirect(id, location: &[u8])
+    —— Swift 侧 BridgeGlue.swift 把 Data/String 转成 rust::Slice 再调用，丑细节隔离在这一层
+
+控制面（Rust → Swift，低频）：cxx extern "C++" 声明 → trampoline.cpp → @_expose(Cxx) Swift 函数
+    transport_start(id, url/method 指针+长度, follow_redirects, timeout_ms)
+    transport_add_header / transport_set_body / transport_cancel
+    ws_open / ws_send / ws_close
+    —— trampoline 把 &[u8] 转 raw pointer 传 Swift（指针是 @_expose 可跨类型）
+
+生命周期：Swift 持有 task + delegate（标准 delegate 模式，无跨边界对象持有）；
+Rust 侧全局注册表 request_id(u64) → RequestState{oneshot, BodySender, cancel 接线}——
+与 monet-cronet 的 client_context 方案同构，但 id 解引用代替裸指针，更简单
+```
+
+超时：core 无超时概念，在 ffi 面传 `timeout_ms`，Swift 侧落 `URLRequest.timeoutInterval`（nitro 模式）。
+
+## 实施内容
+
+```
+crates/monet-urlsession/
+├── Cargo.toml        cxx、cc（build）、monet-core；无 rustls（pin 查询走 core）
+├── build.rs          编排：cxx 生成头 → modulemap → swiftc（.a + clang header）
+│                     → cc 编译 trampoline.cpp → 链接；按 CARGO_CFG_TARGET_OS 分支 macOS/iOS
+├── src/
+│   ├── lib.rs        Transport + WebSocketTransport 实现 + PinConfig 注册
+│   ├── ffi.rs        #[cxx::bridge]：数据面 extern "Rust" + 控制面 extern "C++"
+│   ├── registry.rs   request_id → RequestState 全局表（Mutex<HashMap> + AtomicU64 计数）
+│   └── pin.rs        challenge 查询：pins_for_host → 序列化 hashes 给 Swift
+├── cpp/trampoline.cpp
+├── swift/
+│   ├── BridgeGlue.swift      rust::Slice/指针转换隔离层
+│   ├── TransportShim.swift   requestStatic 蓝本：共享 session + delegate 状态机
+│   │                         （didReceive response/data、redirect、challenge→pin 查询、
+│   │                          buffered 上传 v1；不做 nitro 流式切换启发，一律直推）
+│   └── WebSocketShim.swift   URLSessionWebSocketTask：receive 循环 → 数据面回调，
+│                         send/close 经控制面，delegate 收 open/close 事件
+└── tests/
+    ├── http.rs   本地 hyper 服务器（复用 monet-rustls tests 的服务器模式）
+    └── ws.rs     本地 tokio-tungstenite echo（复用 monet-ws tests 的模式）
+```
+
+## 验证与里程碑
+
+- **M0（第一步）**：把本计划完整写入仓库 `docs/plans/2026-11-monet-urlsession.md` 并提交——计划随仓库走，可在任何设备上继续实施
+- **M1 spike（crate 内）**：build.rs 全链路 + 最小 Swift ping（`@_expose` 函数回调进 extern "Rust" pong）+ Rust 测试断言往返——一次性消解构建编排/双向链路/头生成顺序三个问号
+- **M2 HTTP**：TransportShim + registry + Transport 实现 + 本地服务器测试（head 先行/chunk 流式/POST/redirect/取消/错误映射；pin challenge 需自签证书，可 `#[ignore]` 手跑）
+- **M3 WS**：WebSocketShim + WebSocketTransport + echo 测试（close code/reason 往返）
+- **M4 iOS 交叉编译**：`cargo build -p monet-urlsession --target aarch64-apple-ios`（build.rs iPhone SDK 分支）；真机留到 monet-rn
+- 每步 workspace 测试全绿 + clippy/fmt/doc 干净 + 单独 commit（英文无署名）
