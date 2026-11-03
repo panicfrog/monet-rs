@@ -1,0 +1,27 @@
+[package]
+name = "monet-tls"
+description = "Shared rustls trust + SPKI pinning for monet-rs transports (monet-ws, monet-rustls)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = ["webpki-roots"]
+# Trust the platform certificate store (Android system CAs +
+# network_security_config, iOS/macOS keychain) via rustls-platform-verifier.
+# On Android the embedder must initialize it (see the crate docs) before any
+# connection; monet-rn does this from its JVM bootstrap.
+platform-verifier = ["dep:rustls-platform-verifier"]
+# Embedded Mozilla CA bundle — the always-available fallback and default.
+webpki-roots = ["dep:webpki-roots"]
+
+[dependencies]
+monet-core = { path = "../monet-core" }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-platform-verifier = { version = "0.7", optional = true }
+sha2 = "0.10"
+webpki-roots = { version = "1", optional = true }
+
+[lints]
+workspace = true

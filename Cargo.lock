@@ -558,6 +558,17 @@ name = "monet-cronet-sys"
 version = "0.1.0"
 
 [[package]]
+name = "monet-tls"
+version = "0.1.0"
+dependencies = [
+ "monet-core",
+ "rustls",
+ "rustls-platform-verifier",
+ "sha2",
+ "webpki-roots 1.0.11",
+]
+
+[[package]]
 name = "monet-ws"
 version = "0.1.0"
 dependencies = [
@@ -566,12 +577,9 @@ dependencies = [
  "futures-lite",
  "futures-util",
  "monet-core",
- "rustls",
- "rustls-platform-verifier",
- "sha2",
+ "monet-tls",
  "tokio",
  "tokio-tungstenite",
- "webpki-roots 1.0.11",
 ]
 
 [[package]]

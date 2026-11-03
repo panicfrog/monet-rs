@@ -6,7 +6,7 @@
 
 /// Returns the DER-encoded SPKI (tag + length + value) of `cert`, or `None`
 /// when the certificate is not shaped as expected.
-pub(crate) fn spki_der(cert: &[u8]) -> Option<&[u8]> {
+pub fn spki_der(cert: &[u8]) -> Option<&[u8]> {
     // Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signature }
     let (tag, tbs, rest) = tlv(cert)?;
     if tag != 0x30 || !rest.is_empty() {
@@ -65,7 +65,7 @@ mod tests {
 
     /// Minimal DER: Certificate SEQUENCE { TBS SEQUENCE { [0]{}, serial INT,
     /// sig SEQ, issuer SEQ, validity SEQ, subject SEQ, SPKI SEQ{...},
-    /// sigalg SEQ, sig BITSTRING }, rest }
+    /// sigalg SEQ, sig BITSTRING } }
     fn fixture() -> (Vec<u8>, Vec<u8>) {
         fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
             let mut out = vec![tag];

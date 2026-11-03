@@ -8,26 +8,19 @@ publish = false
 
 [features]
 default = ["webpki-roots"]
-# Trust the platform certificate store (Android system CAs +
-# network_security_config, iOS/macOS keychain) via rustls-platform-verifier.
-# On Android the embedder must initialize it (see the crate docs) before any
-# connection; monet-rn does this from its JVM bootstrap.
-platform-verifier = ["dep:rustls-platform-verifier"]
-# Embedded Mozilla CA bundle — the always-available fallback and default.
-webpki-roots = ["dep:webpki-roots"]
+# Forwarded to monet-tls.
+platform-verifier = ["monet-tls/platform-verifier"]
+webpki-roots = ["monet-tls/webpki-roots"]
 
 [dependencies]
 monet-core = { path = "../monet-core" }
+monet-tls = { path = "../monet-tls", default-features = false }
 bytes.workspace = true
 futures-channel.workspace = true
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 futures-lite.workspace = true
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
-rustls-platform-verifier = { version = "0.7", optional = true }
-sha2 = "0.10"
 tokio = { version = "1", features = ["rt", "sync", "net"] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
-webpki-roots = { version = "1", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "net"] }

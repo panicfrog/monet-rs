@@ -1,4 +1,4 @@
-//! TLS trust and pinning for the WebSocket transport.
+//! TLS trust and pinning for every monet-rs rustls transport.
 //!
 //! Two trust sources (feature-switched): the platform verifier (Android
 //! system CAs + network_security_config) or the embedded Mozilla bundle.
@@ -109,7 +109,7 @@ impl ServerCertVerifier for PinningVerifier {
 
 /// Builds a rustls client config: chosen trust source, optionally wrapped
 /// with the pin policy.
-pub(crate) fn client_config(trust: &TlsTrust, pins: &PinConfig) -> Result<Arc<ClientConfig>> {
+pub fn client_config(trust: &TlsTrust, pins: &PinConfig) -> Result<Arc<ClientConfig>> {
     let want_platform = matches!(trust, TlsTrust::PlatformVerifier);
 
     #[allow(unused_mut)]
@@ -118,14 +118,14 @@ pub(crate) fn client_config(trust: &TlsTrust, pins: &PinConfig) -> Result<Arc<Cl
         #[cfg(feature = "platform-verifier")]
         {
             let verifier = rustls_platform_verifier::Verifier::new().map_err(|e| {
-                Error::transport(format!("monet-ws: platform verifier unavailable: {e}"))
+                Error::transport(format!("monet-tls: platform verifier unavailable: {e}"))
             })?;
             base = Some(Arc::new(verifier));
         }
         #[cfg(not(feature = "platform-verifier"))]
         {
             return Err(Error::transport(
-                "monet-ws: built without the `platform-verifier` feature",
+                "monet-tls: built without the `platform-verifier` feature",
             ));
         }
     }
@@ -138,12 +138,12 @@ pub(crate) fn client_config(trust: &TlsTrust, pins: &PinConfig) -> Result<Arc<Cl
                 roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
                 rustls::client::WebPkiServerVerifier::builder(Arc::new(roots))
                     .build()
-                    .map_err(|e| Error::transport(format!("monet-ws: webpki verifier: {e}")))?
+                    .map_err(|e| Error::transport(format!("monet-tls: webpki verifier: {e}")))?
             }
             #[cfg(not(feature = "webpki-roots"))]
             {
                 return Err(Error::transport(
-                    "monet-ws: built without any trust source (enable `webpki-roots` or `platform-verifier`)",
+                    "monet-tls: built without any trust source (enable `webpki-roots` or `platform-verifier`)",
                 ));
             }
         }
@@ -161,7 +161,7 @@ pub(crate) fn client_config(trust: &TlsTrust, pins: &PinConfig) -> Result<Arc<Cl
     Ok(Arc::new(
         ClientConfig::builder_with_provider(ring_crypto::default_provider().into())
             .with_safe_default_protocol_versions()
-            .map_err(|e| Error::transport(format!("monet-ws: rustls protocol versions: {e}")))?
+            .map_err(|e| Error::transport(format!("monet-tls: rustls protocol versions: {e}")))?
             .dangerous()
             .with_custom_certificate_verifier(verifier)
             .with_no_client_auth(),

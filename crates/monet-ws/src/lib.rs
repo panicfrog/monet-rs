@@ -6,29 +6,15 @@
 //! callers get [`WebSocketTransport`](monet_core::transport::WebSocketTransport)
 //! futures and the shared channel-based `WebSocketStream`.
 //!
-//! # Trust and pinning
-//!
-//! - Default: the embedded Mozilla CA bundle (`webpki-roots` feature) —
-//!   works everywhere, matches nitro-fetch's libwebsockets approach.
-//! - Optional: the platform trust store (`platform-verifier` feature) via
-//!   rustls-platform-verifier — Android system CAs plus
-//!   `network_security_config`, iOS/macOS keychain. **On Android the
-//!   embedder must initialize it before any connection**: call
-//!   `rustls_platform_verifier::android::init_hosted` (or the JNI variant)
-//!   from the app's bootstrap — monet-rn will do this. Until then, keep the
-//!   default `webpki-roots`.
-//! - Pinned hosts (from [`monet_core::pin::PinConfig`]) additionally require
-//!   a matching SPKI hash in the presented chain, with monet-core's walk-up
-//!   matching — one implementation shared with the HTTP transports.
+//! TLS trust and pinning (including the Android platform-verifier
+//! initialization caveat) live in the shared `monet-tls` crate.
 
 #![allow(unsafe_code)] // rustls danger APIs for the custom verifier.
 
-mod spki;
 mod transport;
-mod verifier;
 
+pub use monet_tls::TlsTrust;
 pub use transport::{MonetWsTransport, WsConfig};
-pub use verifier::TlsTrust;
 
 #[cfg(test)]
 mod tests {

@@ -23,7 +23,7 @@ use tokio_tungstenite::tungstenite::Message as Tm;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{Connector, connect_async_tls_with_config};
 
-use crate::verifier::{TlsTrust, client_config};
+use monet_tls::{TlsTrust, client_config};
 
 /// Configuration for [`MonetWsTransport`].
 #[derive(Clone, Default)]
