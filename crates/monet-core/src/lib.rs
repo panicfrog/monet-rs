@@ -35,6 +35,7 @@
 
 pub mod body;
 pub mod cancel;
+pub mod client;
 pub mod error;
 pub mod extensions;
 pub mod headers;
@@ -49,6 +50,7 @@ pub mod ws;
 
 pub use body::{Body, BodySender, channel as body_channel};
 pub use cancel::CancelToken;
+pub use client::Client;
 pub use error::{Error, PlatformErrorCode, Result};
 pub use extensions::Extensions;
 pub use headers::HeaderMap;
