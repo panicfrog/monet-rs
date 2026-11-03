@@ -63,6 +63,12 @@ fn main() {
              inline void monet_on_error(\
              ::std::uint64_t id, ::std::int32_t code, const ::std::uint8_t *msg, ::std::size_t len) noexcept {{\n\
              \x20 on_error(id, code, rust::Slice<const ::std::uint8_t>(msg, len));\n\
+             }}\n\
+             inline ::std::size_t monet_pins_for_host(\
+             const ::std::uint8_t *host, ::std::size_t host_len, \
+             ::std::uint8_t *out, ::std::size_t out_capacity) noexcept {{\n\
+             \x20 return pins_for_host(rust::Slice<const ::std::uint8_t>(host, host_len), \n\
+             \x20                       rust::Slice<::std::uint8_t>(out, out_capacity));\n\
              }}\n",
             rel = bridge_header_rel.display()
         ),

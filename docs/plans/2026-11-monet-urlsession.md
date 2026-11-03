@@ -106,4 +106,4 @@ crates/monet-urlsession/
 - **无 header/body 的请求也必须能启动**：Swift 侧 start 用 get-or-create 拿请求盒（最初 guard 住"必须先有组装"导致裸 GET 静默不发）
 - **测试自带超时**：`wait_for(step, fut)` 辅助函数（futures_timer，10s），挂住会变成带步骤名的明确失败——排查本轮问题全靠它定位
 
-已知残留（M2 pinning 部分）：challenge → 查询 core pins → Swift SecTrustEvaluate + SPKI 比对的链路未实现；自签证书集成测试按计划留 `#[ignore]` 手跑。
+M2 pinning 部分随后落地：Rust 侧 `pin.rs` 全局注册 PinConfig（`UrlsessionTransport::with_pins`；shim 是进程级单例，注册随之全局，last-wins），数据面新增 `pins_for_host(host, out) -> usize`（Swift 提供 64×32 字节缓冲，0 = 未钉、走系统默认处理）；Swift 侧 `PinningShim.swift` 只做机械部分——异步 SecTrustEvaluate + 从 DER 证书直接切出 SubjectPublicKeyInfo 做 SHA-256 比对（nitro `CertificatePinning.swift` 同款），拒绝的 challenge 会以 -999 完成任务，didCompleteWithError 据此重映射为证书错误而非 Cancelled。host 匹配语义（walk-up/includeSubdomains/过期）只在 monet-core 一份，与 Rust transports 完全一致。Rust 侧查询服务有单元测试；Swift 侧 SecTrust 链路的集成验证需要受信证书，按计划留待真机阶段（monet-rn）。

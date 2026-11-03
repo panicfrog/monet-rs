@@ -12,6 +12,7 @@
 #![allow(unsafe_code)] // FFI boundary: this crate bridges Rust and Swift.
 
 mod ffi;
+mod pin;
 mod registry;
 
 pub use ffi::bridge;
@@ -21,6 +22,7 @@ use futures_lite::future::race;
 use monet_core::body::Body;
 use monet_core::cancel::CancelToken;
 use monet_core::error::{Error, Result};
+use monet_core::pin::PinConfig;
 use monet_core::request::Request;
 use monet_core::response::Response;
 use monet_core::transport::{BoxFuture, Transport};
@@ -56,6 +58,19 @@ impl UrlsessionTransport {
     /// approach). 0 keeps the system default.
     pub fn with_timeout_ms(mut self, ms: u64) -> Self {
         self.timeout_ms = ms;
+        self
+    }
+
+    /// Registers the pinning configuration the Swift shim enforces on
+    /// server-trust challenges (host matching lives in monet-core, so
+    /// the semantics match the Rust transports exactly).
+    ///
+    /// The shim is process-global — one shared URLSession — so this
+    /// registration is too: the last call wins. A config that failed to
+    /// parse never gets here; the loader is expected to fail closed
+    /// instead of constructing the transport.
+    pub fn with_pins(self, pins: PinConfig) -> Self {
+        pin::register(pins);
         self
     }
 }

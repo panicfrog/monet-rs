@@ -119,14 +119,57 @@ final class TransportShim {
 }
 
 /// The per-task delegate: pushes URLSession events into the Rust data
-/// plane. All methods run on the session's serial delegate queue.
+/// plane. All methods run on the session's serial delegate queue, except
+/// the pinning evaluation's async tail.
 final class TaskDelegate: NSObject, URLSessionDataDelegate {
   let id: UInt64
   let followRedirects: Bool
+  /// Set (before the challenge handler returns) when pinning rejected
+  /// the chain; the rejection completes the task as a cancellation, so
+  /// didCompleteWithError remaps it to a certificate error.
+  var pinRejection: String?
 
   init(id: UInt64, followRedirects: Bool) {
     self.id = id
     self.followRedirects = followRedirects
+  }
+
+  /// Server-trust challenges: pinned hosts get evaluated + matched
+  /// against monet-core's pins; everything else falls through to the
+  /// system's default handling (which already performs standard chain
+  /// validation — pinning is the extra layer on top).
+  func urlSession(
+    _ session: URLSession,
+    task: URLSessionTask,
+    didReceive challenge: URLAuthenticationChallenge,
+    completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+  ) {
+    let host = challenge.protectionSpace.host
+    let hashes = PinningShim.pinnedHashes(for: host)
+    guard !hashes.isEmpty,
+      challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+      let trust = challenge.protectionSpace.serverTrust
+    else {
+      completionHandler(.performDefaultHandling, nil)
+      return
+    }
+    PinningShim.evaluate(trust: trust, hashes: hashes) { [weak self] outcome in
+      guard let self else {
+        completionHandler(.performDefaultHandling, nil)
+        return
+      }
+      switch outcome {
+      case .use:
+        completionHandler(.useCredential, URLCredential(trust: trust))
+      case .defaultHandling:
+        completionHandler(.performDefaultHandling, nil)
+      case .reject:
+        // Recorded before the completion handler runs, so the task's
+        // didCompleteWithError (which it triggers) observes it.
+        self.pinRejection = "certificate pinning failed for \(host): no pinned key in the chain"
+        completionHandler(.cancelAuthenticationChallenge, nil)
+      }
+    }
   }
 
   func urlSession(
@@ -174,7 +217,14 @@ final class TaskDelegate: NSObject, URLSessionDataDelegate {
   func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
     TransportShim.shared.completed(id: id)
     if let error = error as NSError? {
-      notifyError(id, code: error.code, message: error.localizedDescription)
+      if error.code == NSURLErrorCancelled, let reason = pinRejection {
+        // A rejected pin surfaces as cancellation; remap so Rust reports
+        // a certificate failure instead of Error::Cancelled.
+        notifyError(
+          id, code: NSURLErrorServerCertificateUntrusted, message: reason)
+      } else {
+        notifyError(id, code: error.code, message: error.localizedDescription)
+      }
     } else {
       notifyDone(id)
     }

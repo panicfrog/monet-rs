@@ -25,6 +25,7 @@
 //! `transport_cancel` on a running task surfaces as `on_error` with code
 //! -999 (`NSURLErrorCancelled`), which maps to `Error::Cancelled`.
 
+use crate::pin;
 use crate::registry;
 
 // ---- data plane: Swift calls these through the generated header ----
@@ -62,6 +63,13 @@ fn on_error(id: u64, code: i32, message: &[u8]) {
     registry::on_error(id, code, message);
 }
 
+/// Pinning query for the server-trust challenge path: writes up to
+/// `out.len() / 32` SPKI hashes into `out` and returns the count. Zero
+/// means the host is not pinned.
+fn pins_for_host(host: &[u8], out: &mut [u8]) -> usize {
+    pin::hashes_for_host(host, out)
+}
+
 #[allow(unsafe_code)]
 #[cxx::bridge]
 pub mod bridge {
@@ -73,6 +81,7 @@ pub mod bridge {
         fn on_redirect(id: u64, location: &[u8]);
         fn on_done(id: u64);
         fn on_error(id: u64, code: i32, message: &[u8]);
+        fn pins_for_host(host: &[u8], out: &mut [u8]) -> usize;
     }
 
     // ---- control plane: C++ (trampoline) implementations, Rust callers ----

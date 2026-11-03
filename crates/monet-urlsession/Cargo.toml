@@ -18,6 +18,7 @@ cxx-build = "1"
 cc = "1"
 
 [dev-dependencies]
+base64.workspace = true
 futures-timer = "3"
 http-body = "1"
 http-body-util = "0.1"
