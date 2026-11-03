@@ -1,0 +1,18 @@
+[package]
+name = "monet-urlsession"
+description = "Native iOS transport (URLSession via Swift shim + cxx) for monet-core."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+monet-core = { path = "../monet-core" }
+cxx = "1"
+
+[build-dependencies]
+cxx-build = "1"
+cc = "1"
+
+[lints]
+workspace = true
