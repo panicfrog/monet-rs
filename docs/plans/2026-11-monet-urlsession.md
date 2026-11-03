@@ -94,3 +94,16 @@ crates/monet-urlsession/
 - **M3 WS**：WebSocketShim + WebSocketTransport + echo 测试（close code/reason 往返）
 - **M4 iOS 交叉编译**：`cargo build -p monet-urlsession --target aarch64-apple-ios`（build.rs iPhone SDK 分支）；真机留到 monet-rn
 - 每步 workspace 测试全绿 + clippy/fmt/doc 干净 + 单独 commit（英文无署名）
+
+## M2 实施记录（HTTP 部分，2026-11）
+
+数据面落地与计划的差异：Swift 不直接构造 `rust::Slice`（C++ 类模板，跨 interop 构造无先例），改由 build.rs 在 modulemap 的 `rust_bridge.h` 里生成指针版 inline 包装（`monet_on_chunk(id, ptr, len)` 等），Swift 只碰裸指针——丑细节反而隔离得更干净，BridgeGlue.swift 只剩 Data/String → 指针+长度的转换。控制面顺序定为：`add_header`/`set_body` 先组装，`transport_start` 最后发送（Swift 侧组装 pending URLRequest 后 resume），无需额外的"组装完成"信号。
+
+实施中核实的事实：
+
+- **head 与首块数据同行**：hyper 对未知长度响应在首个 body frame 就绪前不冲刷，URLSession 的 `didReceive response` 也随首批字节到达——"head 先到、body 卡住"的场景无法用"延迟首块"构造，测试改用"大块先行 + 尾块延迟"；小间隔分块可能被 URLSession 合并成一个 data 事件（512KiB 强制独立交付）
+- **head 后取消需要独立观察者**：core 无 runtime（monet-rustls 靠 tokio pump 任务全程盯 token），urlsession 在 head 交付时起一个停靠线程盯 CancelToken，终态事件 drop 掉 shutdown sender 让线程退出；monet-cronet 目前只有 head 前取消 + body-drop 检测，此处对齐的是 rustls 语义
+- **无 header/body 的请求也必须能启动**：Swift 侧 start 用 get-or-create 拿请求盒（最初 guard 住"必须先有组装"导致裸 GET 静默不发）
+- **测试自带超时**：`wait_for(step, fut)` 辅助函数（futures_timer，10s），挂住会变成带步骤名的明确失败——排查本轮问题全靠它定位
+
+已知残留（M2 pinning 部分）：challenge → 查询 core pins → Swift SecTrustEvaluate + SPKI 比对的链路未实现；自签证书集成测试按计划留 `#[ignore]` 手跑。

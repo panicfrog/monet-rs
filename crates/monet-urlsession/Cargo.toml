@@ -1,6 +1,6 @@
 [package]
 name = "monet-urlsession"
-description = "Native iOS transport (URLSession via Swift shim + cxx) for monet-core."
+description = "Native iOS/macOS transport (URLSession via Swift shim + cxx) for monet-core."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,11 +8,22 @@ publish = false
 
 [dependencies]
 monet-core = { path = "../monet-core" }
+bytes.workspace = true
 cxx = "1"
+futures-channel.workspace = true
+futures-lite.workspace = true
 
 [build-dependencies]
 cxx-build = "1"
 cc = "1"
+
+[dev-dependencies]
+futures-timer = "3"
+http-body = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["server", "http1", "tokio"] }
+tokio = { version = "1", features = ["rt", "net", "time"] }
 
 [lints]
 workspace = true
