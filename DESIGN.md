@@ -76,11 +76,20 @@ trait ResponseHook { async fn on_response(&self, res: &mut Response) -> Result<(
 - JS 侧 hook：monet-rn 层把注册的 JS 回调（经 CallInvoker marshal 回 JS 线程）适配成同一 trait，与 Rust hook 共享一条链
 - 同一 hook 逻辑对 RN 和将来的 Dart 生效
 
-### 实施路径：原生 transport 优先
+### 实施路径：原生栈活着处用原生，死了处用 Rust（2026-11 修订）
 
-`Transport` 的**原生实现是首要目标**：Android 走 Cronet C API FFI，iOS 走 Swift shim 调 URLSession。`monet-core` 与原生 transport 并行开发，`Transport` trait 的接口设计直接以原生 API 的能力为约束（回调式、流式 body、取消语义）。
+初始决策是"原生 transport 优先"（Android Cronet C API、iOS URLSession）。**2026-11 发现官方 Cronet 二进制分发已实质停止后修订**：原生优先的前提是原生栈有人维护——Apple 的 URLSession 活着（Apple 永续维护，无天花板）→ iOS 维持原生；Android 的原生栈死了（embedded 停 143 无安全更新、GMS 不覆盖国内）→ **Android 转向纯 Rust**。
 
-纯 Rust 实现（hyper + rustls + quinn）是**备选/兜底 transport**：用于开发期 core 层的单测基线、不支持原生栈的环境（如桌面/服务端测试），以及原生绑定受阻时的临时替代。它不是架构前提，不得反向侵蚀 core 的接口设计——core 面向 trait 编程，不为 hyper 的便利性妥协。
+| 端 | HTTP transport | 说明 |
+|---|---|---|
+| Android（v1 主力） | **monet-rustls**：hyper + h2 + rustls | 静态编入 App 已有的 Rust staticlib（~+2-3MB，**小于** libcronet.so 的 4-7MB/ABI）；TLS/pin 复用 monet-ws 的 verifier（platform-verifier / webpki-roots / pin walk-up）；DNS 走系统 resolver；H3（quinn + h3）挂实验性 feature——h3 还在 0.0.x（2025-05 后未发版），H2 路线成熟先行 |
+| Android（可选增强） | monet-cronet-jni | GMS 轨道（见双轨决策），将来按需 |
+| Android（遗留选项） | monet-cronet | 已建成已测试；想钉 143 embedded `.so` 的 App 仍可用，非默认 |
+| iOS | URLSession（Swift shim + cxx） | 原生栈健在，维持 |
+
+诚实的缺口记录（Cronet 白送、Rust 要自建的）：Happy Eyeballs / DNS 竞速启发式（v1 不做）；h3 语义层不成熟。已核实无碍的：quinn 客户端连接迁移**功能上支持**（主动迁移与 NAT 重绑定可用，quinn-rs issue #1803/#2778 已关闭；仍开着的 #2184/#716 是隐私加固与服务端迁移，不影响客户端）。
+
+core 约束不变：面向 trait 编程，`Transport` 接口不为 hyper 便利性妥协；这使 Android 从 Cronet 切到 Rust 是**加一个 crate 的配置变更**，而不是架构迁移——这正是本轮修订成本低的原因。
 
 ## 可行性核实结论（2026-11 调研）
 
@@ -89,19 +98,24 @@ trait ResponseHook { async fn on_response(&self, res: &mut Response) -> Result<(
 | Android / Cronet | 官方二进制发行版自带 C API（`cronet_c.h` + `libcronet.so`），为 FFI 消费者设计；bindgen 生成 Rust 声明。**已核实**（cronet-embedded 143.7445.0 AAR 符号表）：C API 有完整 pinning（`Cronet_PublicKeyPins_*` + `EngineParams_public_key_pins_add` + local-trust-anchor bypass 开关），共 259 个 `Cronet_*` 符号；**Java API 与 C API 均无 WebSocket**（Java `newWebSocket` 已从上游移除）。nitro-fetch 用的是 Java API（Kotlin 调 `CronetEngine.Builder`），其 WebSocket 另起炉灶（见下）。我们维持 **C API 直连 Rust**：pinning 齐全、无 JNI hop、回调在 native 线程直接进 Rust；Java API 相对优势（RequestFinishedInfo/telemetry）不值得多一层 Kotlin+JNI。⚠ **上游风险（2026-11 发现）：Cronet C API 已从 Chromium 146 起被上游移除**（146+ 发行包不再含 `include/`，源码树 `components/cronet/native/` 已删除）。monet-cronet-sys 钉 143.7445.0（头文件 143→145 逐字节相同），升级天花板 145.0.7569.0；再往后的迁移路径：SagerNet fork（仍携带 C API）或改走 JNI 调 Java API | ✅ 直接可行；无广泛维护的现成 sys crate（crates.io 有小众 `cronet` crate），需自维护薄绑定。版本需 ≥143.7445.0（AGP9 namespace 检查，nitro build.gradle 注释） |
 | iOS / URLSession | **不使用 objc2**（决策 2026-11：delegate 状态机、autoreleasepool、生命周期管理用 Rust 重写 ObjC delegate 的代价过高；nitro-fetch 的对应实现是纯 Swift，已验证）。采用 Swift shim：Swift 独占 URLSession delegate 状态机，暴露窄回调面（`transport_execute(req, {on_response_head, on_chunk, on_done/on_error})`）。**桥接已决策：Swift↔C++ interop + cxx**（jsi-rs 的 RN 集成本就是 cxx，复用同一边界与构建机制，零新增桥接技术；swift-bridge 已评估未采用——0.1.x 无稳定承诺，且会在同一二进制引入第二套桥接体系） | ✅ 可行；delegate 回调 → Swift async 已由 nitro 的 `NitroBufferedTaskDelegate` 验证，我们只需把出口从 JSI 换成桥接回调 |
 
-## Android transport 双轨决策（2026-11，基于目标市场含中国大陆）
+## Android transport 决策史（2026-11，三轮演进）
 
-目标 App 市场含国内（大量无 GMS 设备），据此定**双轨**，由 `Transport` trait 保证两轨是配置选择而非架构分叉：
+1. **初版**：Cronet C API 直连为默认（原生优先哲学）
+2. **修订一（双轨）**：发现官方分发停止后，改为 monet-cronet（embedded `.so`）默认 + monet-cronet-jni（GMS）增强
+3. **修订二（现行）**：既然国内必须为网络栈付体积，而 embedded Cronet 是**不再维护的** 4-7MB——那不如把这体积花在**自己维护的** Rust 栈上（hyper+h2+rustls 静态编入，反而更小）。Android 默认 transport 改为 monet-rustls；Cronet 相关全部降级为可选（embedded 轨道保留、GMS 轨道按需）
+
+由 `Transport` trait 保证各轨是配置选择而非架构分叉：
 
 | 轨道 | 状态 | 适用 |
 |---|---|---|
-| **monet-cronet（默认）**：C API 直连 + embedded `.so`（143.7445.0 AAR） | ✅ 已实现 | 任何设备可跑（含国内）；版本自控，缺点是每 ABI 4-7MB 且钉在 ≤145 |
-| **monet-cronet-jni（后续增强）**：Java API + provider 模型 | 未开工 | GMS 设备走 `play-services-cronet`（零 `.so`、版本由 Google 经 GMS Dynamite 模块更新，绕开 145 天花板）；非 GMS 设备仍需 embedded `.so` 兜底 |
+| **monet-rustls（默认）**：hyper + h2 + rustls | 规划中 | 全设备；版本随 cargo 更新，无天花板，体积最优 |
+| monet-cronet：C API 直连 + embedded `.so` | ✅ 已实现 | 想钉 143 embedded 的 App；遗留选项 |
+| monet-cronet-jni：Java API + provider 模型 | 未开工 | GMS 设备增强（play-services-cronet） |
 
 决策依据的核实事实（2026-11）：
 - 官方 Cronet 二进制分发已实质停止：Google Maven 上 143.7445.0 是最后一个真 AAR（500.x 全是空壳，无 `.so`）；GCS Release 包停在 145.0.7569.0（146 起整个目录消失）；chromium/cronet GitHub 无 releases。**Java API 与 C API 的二进制停在同一个地方**——切换 JNI 并不解决天花板，天花板是分发问题
 - `play-services-cronet` 18.1.1 是唯一仍被 Google 持续更新的 Cronet 二进制渠道：AAR 零原生代码，纯 Java 适配层（`PlayServicesCronetProvider`/`CronetProviderInstaller`），真实现住在 GMS 的 **Dynamite 模块**里，设备级共享、随 GMS 更新——但仅 GMS 设备可用，且 Cronet 是动态模块（首用可能触发下载），线上版本碎片化
-- 结论：国内市场必须保 embedded `.so` 轨道；GMS 轨道作为海外增强，不阻塞 v1
+- 结论（修订二后）：国内默认走 monet-rustls（不依赖任何 Cronet 二进制）；GMS 轨道作为海外增强，embedded 轨道降级为遗留选项
 
 
 
