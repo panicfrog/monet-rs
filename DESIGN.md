@@ -110,7 +110,7 @@ core 约束不变：面向 trait 编程，`Transport` 接口不为 hyper 便利�
 
 | 轨道 | 状态 | 适用 |
 |---|---|---|
-| **monet-rustls（默认）**：hyper + h2 + rustls | 规划中 | 全设备；版本随 cargo 更新，无天花板，体积最优 |
+| **monet-rustls（默认）**：hyper + h2 + rustls | ✅ 已实现（redirect 跟随 + head 超时已对齐 iOS 语义；`cargo ndk --target arm64-v8a build` 交叉编译已验证，NDK 27） | 全设备；版本随 cargo 更新，无天花板，体积最优 |
 | monet-cronet：C API 直连 + embedded `.so` | ✅ 已实现 | 想钉 143 embedded 的 App；遗留选项 |
 | monet-cronet-jni：Java API + provider 模型 | 未开工 | GMS 设备增强（play-services-cronet） |
 
@@ -132,7 +132,7 @@ core 约束不变：面向 trait 编程，`Transport` 接口不为 hyper 便利�
 | Android | **纯 Rust（tokio-tungstenite + rustls）** | Cronet 无 WS，且不为此引入 Kotlin 层。pin 校验用 rustls 自定义 `ServerCertVerifier`，与 HTTP 共享 core 同一套 pin 逻辑 |
 | 兜底/桌面/测试 | 同一份 tokio-tungstenite + rustls | 与 hyper+rustls 兜底 transport 角色完全对称 |
 
-代价：WS 两份实现（iOS 原生 + Rust），行为可能有细微差异——缓解方式与 HTTP transport 相同：core 针对 trait 写一致性测试套件，两个实现跑同一套（这也是整个架构的核心赌注）。待验证：`URLSessionWebSocketTask` 的 permessage-deflate 支持情况（历史上长期缺失，tokio-tungstenite 支持）。
+代价：WS 两份实现（iOS 原生 + Rust），行为可能有细微差异——缓解方式与 HTTP transport 相同：core 针对 trait 写一致性测试套件，两个实现跑同一套（这也是整个架构的核心赌注）。**套件已落地（2026-11）**：`monet-conformance` crate（HTTP 路由服务器 + WS 脚本 echo 服务器 + 按 trait 驱动的检查集），monet-rustls / monet-ws / monet-urlsession 各自在集成测试中挂载同一套——首轮即抓到真实分歧（tungstenite 对子协议未回选严格判败，URLSession 路线宽松）并修正了一处误判（hyper 对未知长度响应立即冲刷 head，此前以为与首块同行——那是 URLSession 攒事件）。iOS 的 WS 主路径为 NWConnection + 手写 RFC 6455 帧（对齐 nitro；URLSessionWebSocketTask 会把 close 1012-1014 映射成 1005 且丢 reason，详见 docs/plans/2026-11-monet-urlsession.md 的 M3 修订）。待验证：permessage-deflate 的跨实现差异（v1 双侧均不支持，URLSession 同样不支持）。
 
 **已知坑**：Android 上 rustls 读系统信任库（`/system/etc/security/cacerts` + conscrypt APEX）与 `network_security_config.xml` 的兼容性需要验证；兜底方案是内嵌 Mozilla CA bundle（webpki-roots，即 nitro 的同款做法），后续再补系统 CA 支持。
 
