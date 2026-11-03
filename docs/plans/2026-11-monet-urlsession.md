@@ -95,6 +95,8 @@ crates/monet-urlsession/
 - **M4 iOS 交叉编译**：`cargo build -p monet-urlsession --target aarch64-apple-ios`（build.rs iPhone SDK 分支）；真机留到 monet-rn
 - 每步 workspace 测试全绿 + clippy/fmt/doc 干净 + 单独 commit（英文无署名）
 
+**全部完成（2026-11-03）**：M0-M4 依次入库；M4 交叉编译首跑即过（cxx → modulemap → swiftc(iPhone SDK, arm64-apple-ios17.0) → cc trampoline → link，`Finished dev profile in 17.85s`）。真机/模拟器验证与 RN 集成（monet-rn、jsi-turbo）按既定路线留待下一阶段。
+
 ## M2 实施记录（HTTP 部分，2026-11）
 
 数据面落地与计划的差异：Swift 不直接构造 `rust::Slice`（C++ 类模板，跨 interop 构造无先例），改由 build.rs 在 modulemap 的 `rust_bridge.h` 里生成指针版 inline 包装（`monet_on_chunk(id, ptr, len)` 等），Swift 只碰裸指针——丑细节反而隔离得更干净，BridgeGlue.swift 只剩 Data/String → 指针+长度的转换。控制面顺序定为：`add_header`/`set_body` 先组装，`transport_start` 最后发送（Swift 侧组装 pending URLRequest 后 resume），无需额外的"组装完成"信号。
