@@ -772,6 +772,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "monet-conformance"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures-channel",
+ "futures-lite",
+ "futures-timer",
+ "futures-util",
+ "http-body",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "monet-core",
+ "tokio",
+ "tokio-tungstenite",
+]
+
+[[package]]
 name = "monet-core"
 version = "0.1.0"
 dependencies = [
@@ -815,6 +833,7 @@ dependencies = [
  "hyper",
  "hyper-rustls",
  "hyper-util",
+ "monet-conformance",
  "monet-core",
  "monet-tls",
  "tokio",
@@ -848,6 +867,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "monet-conformance",
  "monet-core",
  "tokio",
  "tokio-tungstenite",
@@ -861,6 +881,7 @@ dependencies = [
  "futures-channel",
  "futures-lite",
  "futures-util",
+ "monet-conformance",
  "monet-core",
  "monet-tls",
  "tokio",

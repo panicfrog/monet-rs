@@ -23,6 +23,7 @@ tokio = { version = "1", features = ["rt", "sync", "net"] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 
 [dev-dependencies]
+monet-conformance = { path = "../monet-conformance" }
 tokio = { version = "1", features = ["rt", "macros", "net"] }
 
 [lints]

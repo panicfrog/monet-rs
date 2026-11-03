@@ -18,6 +18,7 @@ cxx-build = "1"
 cc = "1"
 
 [dev-dependencies]
+monet-conformance = { path = "../monet-conformance" }
 base64.workspace = true
 futures-timer = "3"
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
