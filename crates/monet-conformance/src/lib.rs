@@ -23,7 +23,9 @@
 //! Deliberate divergences are expressed by which checks a crate runs, and
 //! recorded in its test file — the suite itself takes no sides.
 
+pub mod battery;
 pub mod http;
+pub mod tls;
 pub mod ws;
 
 /// Every wait inside the suite is bounded: a hung implementation fails

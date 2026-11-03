@@ -50,8 +50,19 @@ struct SeenQueue {
 }
 
 impl HttpServer {
-    /// Spawns the server on a loopback port.
+    /// Spawns the plain-HTTP server on a loopback port.
     pub fn spawn() -> HttpServer {
+        Self::spawn_with(|stream| async move { Ok::<_, std::io::Error>(stream) })
+    }
+
+    /// Spawns the server with a custom accept step wrapping each TCP
+    /// stream (the TLS scenarios hand in a handshake).
+    pub(crate) fn spawn_with<Accept, Fut, S>(accept: Accept) -> HttpServer
+    where
+        Accept: Fn(tokio::net::TcpStream) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = std::io::Result<S>> + Send,
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
+    {
         let (addr_tx, addr_rx) = mpsc::channel();
         let (seen_tx, seen_rx) = mpsc::channel();
         std::thread::Builder::new()
@@ -68,6 +79,10 @@ impl HttpServer {
                         let (stream, _) = match listener.accept().await {
                             Ok(pair) => pair,
                             Err(_) => break,
+                        };
+                        let io = match accept(stream).await {
+                            Ok(io) => io,
+                            Err(_) => continue,
                         };
                         let seen_tx = seen_tx.clone();
                         let service = service_fn(move |req: HyperRequest<Incoming>| {
@@ -96,7 +111,7 @@ impl HttpServer {
                             }
                         });
                         let _ = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
-                            .serve_connection(TokioIo::new(stream), service)
+                            .serve_connection(TokioIo::new(io), service)
                             .await;
                     }
                 });
@@ -115,6 +130,15 @@ impl HttpServer {
     /// The URL for a route.
     pub fn url(&self, path: &str) -> Url {
         self.base.join(path).unwrap()
+    }
+
+    /// The URL for a route addressed through a different scheme and host
+    /// — the TLS checks connect as `https://localhost` (monet-core's pin
+    /// config takes hostnames, not IPs) against the same loopback
+    /// listener.
+    pub fn url_on(&self, scheme: &str, host: &str, path: &str) -> Url {
+        let port = self.base.port_or_known_default().unwrap_or(80);
+        Url::parse(&format!("{scheme}://{host}:{port}{path}")).unwrap()
     }
 
     /// The observation for the request that hit `path`, skipping (and

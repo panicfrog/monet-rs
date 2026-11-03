@@ -1,0 +1,24 @@
+[package]
+name = "monet-demo"
+description = "The on-device battery driver: same checks on a host test and inside the Android demo app."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["lib", "cdylib"]
+
+[dependencies]
+monet-core = { path = "../monet-core" }
+monet-conformance = { path = "../monet-conformance" }
+monet-rustls = { path = "../monet-rustls" }
+monet-tls = { path = "../monet-tls", default-features = false }
+monet-ws = { path = "../monet-ws" }
+base64.workspace = true
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+
+[lints]
+workspace = true
