@@ -107,3 +107,17 @@ crates/monet-urlsession/
 - **测试自带超时**：`wait_for(step, fut)` 辅助函数（futures_timer，10s），挂住会变成带步骤名的明确失败——排查本轮问题全靠它定位
 
 M2 pinning 部分随后落地：Rust 侧 `pin.rs` 全局注册 PinConfig（`UrlsessionTransport::with_pins`；shim 是进程级单例，注册随之全局，last-wins），数据面新增 `pins_for_host(host, out) -> usize`（Swift 提供 64×32 字节缓冲，0 = 未钉、走系统默认处理）；Swift 侧 `PinningShim.swift` 只做机械部分——异步 SecTrustEvaluate + 从 DER 证书直接切出 SubjectPublicKeyInfo 做 SHA-256 比对（nitro `CertificatePinning.swift` 同款），拒绝的 challenge 会以 -999 完成任务，didCompleteWithError 据此重映射为证书错误而非 Cancelled。host 匹配语义（walk-up/includeSubdomains/过期）只在 monet-core 一份，与 Rust transports 完全一致。Rust 侧查询服务有单元测试；Swift 侧 SecTrust 链路的集成验证需要受信证书，按计划留待真机阶段（monet-rn）。
+
+## M3 修订：WebSocket 改走 NWConnection + 手写帧（对齐 nitro，2026-11）
+
+原计划用 `URLSessionWebSocketTask`（nitro 的 Info.plist fallback）。用户定调改为对齐 nitro 主路径：**Network.framework `NWConnection` + 手写 RFC 6455 帧**。动机（nitro `NWWebSocketConnection.hpp` 注释原文为证）：URLSessionWebSocketTask 会把 1012/1013/1014 映射成 1005 并丢掉 reason，原始 close 帧不可达——monet-core 的 `CloseFrame` 契约要求 code/reason 精确往返（一致性测试赌注所在），fallback 路线直接违背这一点。NWConnection 仍是 Apple 原生栈（Network.framework），"原生优先"原则不变，只是从"系统做协议"换成"系统做传输、我们做协议"。
+
+蓝本：`packages/react-native-nitro-websockets/ios/NWStreamWebSocketConnection.mm`（~1400 行 Obj-C++）。移植到 Swift 的范围与裁剪：
+
+**移植（v1 全量）**：手写 Upgrade 握手（Sec-WebSocket-Key + SHA1/GUID 校验 Accept、协议回显校验、严格 101/Connection/Upgrade 校验）；帧解析状态机（分片、控制帧规则、服务端帧不得带 mask、16MB 上限、text 消息 UTF-8 校验）；掩码写帧（7/16/64 位长度）；自动 pong；完整关闭握手（双向、5s 关闭超时、60s 握手超时、1006 不洁关闭语义、code 合法域校验）；wss 走 `sec_protocol_options_set_verify_block` 注入 pinning（复用 PinningShim，verify block 异步完成兼容）。
+
+**裁剪（v1 不做，记录在案）**：permessage-deflate（不主动 offer；服务器强行协商 → 1002 拒绝，符合 RFC；URLSessionWebSocketTask 同样不支持，无回退损失）；redirect 跟随（3xx 视为失败；monet-ws/tokio-tungstenite 同样不跟随）；cookie/UA 注入（自定义 headers 支持，系统 cookie 留待前端层）。
+
+**桥接面（沿用 M2 模式）**：控制面 `ws_add_header`/`ws_open`/`ws_send`/`ws_send_ping`/`ws_send_pong`/`ws_close`/`ws_cancel`（trampoline → `@_expose`）；数据面 `on_ws_open`/`on_ws_message(id, is_binary, data)`/`on_ws_ping`/`on_ws_pong`/`on_ws_close(id, code, reason, was_clean, error)`（错误切片空 = 无错误；open 前 failure 用它解析 connect future）。Rust 侧 `src/ws.rs`：WS 注册表 + 每连接一个停靠 pump 线程消费 user_to_network（无 runtime，同 M2 watcher 模式；终态事件 drop shutdown sender 回收——pump 内是 poll_fn 三路轮询，oneshot 只能 await 一次）。
+
+M3 已落地（2026-11，本地 tokio-tungstenite echo 服务器 7 项测试全绿）：text/binary 往返、子协议头到达、**服务端 1012+reason 精确往返**（NWConnection 路线的决定性验证，URLSessionWebSocketTask 在此会报 1005 且丢 reason）、客户端 close(4321) 代码/reason 到达服务端、ping 同时呈现给用户且被自动 pong、token 预取消 fail-fast、连接拒绝映射 Transport 错误。handshake/关闭均为 60s/5s 双超时（世代计数防陈旧定时器）。

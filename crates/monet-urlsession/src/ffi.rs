@@ -27,6 +27,7 @@
 
 use crate::pin;
 use crate::registry;
+use crate::ws;
 
 // ---- data plane: Swift calls these through the generated header ----
 
@@ -70,6 +71,36 @@ fn pins_for_host(host: &[u8], out: &mut [u8]) -> usize {
     pin::hashes_for_host(host, out)
 }
 
+// ---- data plane: WebSocket events ----
+
+/// The handshake completed; resolves the connect future with the stream.
+fn on_ws_open(id: u64) {
+    ws::on_ws_open(id);
+}
+
+/// Delivers one text (`is_binary == false`) or binary message.
+fn on_ws_message(id: u64, is_binary: bool, data: &[u8]) {
+    ws::on_ws_message(id, is_binary, data);
+}
+
+/// Surfaces a received ping (the shim already echoed a pong).
+fn on_ws_ping(id: u64, data: &[u8]) {
+    ws::on_ws_ping(id, data);
+}
+
+/// Surfaces a received pong.
+fn on_ws_pong(id: u64, data: &[u8]) {
+    ws::on_ws_pong(id, data);
+}
+
+/// Terminal event. Before open, `error` carries the failure and the
+/// connect future resolves with it; after open, `code != 0` means a clean
+/// close (code + reason round-trip exactly), `code == 0` an abnormal
+/// shutdown surfaced as `WsMessage::Close(None)`.
+fn on_ws_close(id: u64, code: u16, reason: &[u8], was_clean: bool, error: &[u8]) {
+    ws::on_ws_close(id, code, reason, was_clean, error);
+}
+
 #[allow(unsafe_code)]
 #[cxx::bridge]
 pub mod bridge {
@@ -82,6 +113,11 @@ pub mod bridge {
         fn on_done(id: u64);
         fn on_error(id: u64, code: i32, message: &[u8]);
         fn pins_for_host(host: &[u8], out: &mut [u8]) -> usize;
+        fn on_ws_open(id: u64);
+        fn on_ws_message(id: u64, is_binary: bool, data: &[u8]);
+        fn on_ws_ping(id: u64, data: &[u8]);
+        fn on_ws_pong(id: u64, data: &[u8]);
+        fn on_ws_close(id: u64, code: u16, reason: &[u8], was_clean: bool, error: &[u8]);
     }
 
     // ---- control plane: C++ (trampoline) implementations, Rust callers ----
@@ -97,5 +133,12 @@ pub mod bridge {
             timeout_ms: u64,
         );
         fn transport_cancel(id: u64);
+        fn ws_add_header(id: u64, name: &[u8], value: &[u8]);
+        fn ws_open(id: u64, url: &[u8]);
+        fn ws_send(id: u64, is_binary: bool, data: &[u8]);
+        fn ws_send_ping(id: u64, data: &[u8]);
+        fn ws_send_pong(id: u64, data: &[u8]);
+        fn ws_close(id: u64, code: u16, reason: &[u8]);
+        fn ws_cancel(id: u64);
     }
 }

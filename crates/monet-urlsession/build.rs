@@ -69,6 +69,25 @@ fn main() {
              ::std::uint8_t *out, ::std::size_t out_capacity) noexcept {{\n\
              \x20 return pins_for_host(rust::Slice<const ::std::uint8_t>(host, host_len), \n\
              \x20                       rust::Slice<::std::uint8_t>(out, out_capacity));\n\
+             }}\n\
+             inline void monet_on_ws_message(\
+             ::std::uint64_t id, bool is_binary, const ::std::uint8_t *data, ::std::size_t len) noexcept {{\n\
+             \x20 on_ws_message(id, is_binary, rust::Slice<const ::std::uint8_t>(data, len));\n\
+             }}\n\
+             inline void monet_on_ws_ping(\
+             ::std::uint64_t id, const ::std::uint8_t *data, ::std::size_t len) noexcept {{\n\
+             \x20 on_ws_ping(id, rust::Slice<const ::std::uint8_t>(data, len));\n\
+             }}\n\
+             inline void monet_on_ws_pong(\
+             ::std::uint64_t id, const ::std::uint8_t *data, ::std::size_t len) noexcept {{\n\
+             \x20 on_ws_pong(id, rust::Slice<const ::std::uint8_t>(data, len));\n\
+             }}\n\
+             inline void monet_on_ws_close(\
+             ::std::uint64_t id, ::std::uint16_t code, \
+             const ::std::uint8_t *reason, ::std::size_t reason_len, \
+             bool was_clean, const ::std::uint8_t *error, ::std::size_t error_len) noexcept {{\n\
+             \x20 on_ws_close(id, code, rust::Slice<const ::std::uint8_t>(reason, reason_len), \n\
+             \x20                 was_clean, rust::Slice<const ::std::uint8_t>(error, error_len));\n\
              }}\n",
             rel = bridge_header_rel.display()
         ),

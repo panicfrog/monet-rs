@@ -843,12 +843,14 @@ dependencies = [
  "futures-channel",
  "futures-lite",
  "futures-timer",
+ "futures-util",
  "http-body",
  "http-body-util",
  "hyper",
  "hyper-util",
  "monet-core",
  "tokio",
+ "tokio-tungstenite",
 ]
 
 [[package]]

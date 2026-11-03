@@ -23,9 +23,8 @@ enum PinningShim {
   }
 
   /// Trust evaluation can block (e.g. fetching an intermediate), so it
-  /// runs off the session's serial delegate queue, which also delivers
-  /// streaming chunks.
-  private static let evaluationQueue = DispatchQueue(
+  /// runs off any transport's serial queue.
+  static let evaluationQueue = DispatchQueue(
     label: "monet.urlsession.pinning", qos: .userInitiated, attributes: .concurrent)
 
   /// Upper bound on hashes a challenge asks for (the bridge call fills

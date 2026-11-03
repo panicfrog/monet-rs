@@ -34,3 +34,35 @@ void transport_start(
 void transport_cancel(std::uint64_t id) {
   MonetUrlsessionBridge::monetTransportCancel(id);
 }
+
+void ws_add_header(
+    std::uint64_t id,
+    rust::Slice<const std::uint8_t> name,
+    rust::Slice<const std::uint8_t> value) {
+  MonetUrlsessionBridge::monetWsAddHeader(
+      id, name.data(), name.size(), value.data(), value.size());
+}
+
+void ws_open(std::uint64_t id, rust::Slice<const std::uint8_t> url) {
+  MonetUrlsessionBridge::monetWsOpen(id, url.data(), url.size());
+}
+
+void ws_send(std::uint64_t id, bool is_binary, rust::Slice<const std::uint8_t> data) {
+  MonetUrlsessionBridge::monetWsSend(id, is_binary, data.data(), data.size());
+}
+
+void ws_send_ping(std::uint64_t id, rust::Slice<const std::uint8_t> data) {
+  MonetUrlsessionBridge::monetWsSendPing(id, data.data(), data.size());
+}
+
+void ws_send_pong(std::uint64_t id, rust::Slice<const std::uint8_t> data) {
+  MonetUrlsessionBridge::monetWsSendPong(id, data.data(), data.size());
+}
+
+void ws_close(std::uint64_t id, std::uint16_t code, rust::Slice<const std::uint8_t> reason) {
+  MonetUrlsessionBridge::monetWsClose(id, code, reason.data(), reason.size());
+}
+
+void ws_cancel(std::uint64_t id) {
+  MonetUrlsessionBridge::monetWsCancel(id);
+}

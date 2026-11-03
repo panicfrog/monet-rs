@@ -20,11 +20,13 @@ cc = "1"
 [dev-dependencies]
 base64.workspace = true
 futures-timer = "3"
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 http-body = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["server", "http1", "tokio"] }
-tokio = { version = "1", features = ["rt", "net", "time"] }
+tokio = { version = "1", features = ["rt", "macros", "net", "time"] }
+tokio-tungstenite = "0.30"
 
 [lints]
 workspace = true

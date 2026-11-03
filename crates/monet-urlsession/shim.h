@@ -25,3 +25,21 @@ void transport_start(
     std::uint64_t timeout_ms);
 
 void transport_cancel(std::uint64_t id);
+
+// Control plane, WebSocket: same assemble-then-start ordering as HTTP
+// (add_header first, open sends). ws_close with code 0 sends a close
+// frame without a payload; ws_cancel force-cancels the connection.
+
+void ws_add_header(std::uint64_t id, rust::Slice<const std::uint8_t> name, rust::Slice<const std::uint8_t> value);
+
+void ws_open(std::uint64_t id, rust::Slice<const std::uint8_t> url);
+
+void ws_send(std::uint64_t id, bool is_binary, rust::Slice<const std::uint8_t> data);
+
+void ws_send_ping(std::uint64_t id, rust::Slice<const std::uint8_t> data);
+
+void ws_send_pong(std::uint64_t id, rust::Slice<const std::uint8_t> data);
+
+void ws_close(std::uint64_t id, std::uint16_t code, rust::Slice<const std::uint8_t> reason);
+
+void ws_cancel(std::uint64_t id);

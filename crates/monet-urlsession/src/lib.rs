@@ -14,6 +14,7 @@
 mod ffi;
 mod pin;
 mod registry;
+mod ws;
 
 pub use ffi::bridge;
 
@@ -25,7 +26,8 @@ use monet_core::error::{Error, Result};
 use monet_core::pin::PinConfig;
 use monet_core::request::Request;
 use monet_core::response::Response;
-use monet_core::transport::{BoxFuture, Transport};
+use monet_core::transport::{BoxFuture, Transport, WebSocketTransport};
+use monet_core::ws::WebSocketStream;
 
 /// A [`Transport`] over URLSession via the Swift shim.
 ///
@@ -142,4 +144,10 @@ async fn buffer_body(mut body: Body) -> Result<Vec<u8>> {
         buf.extend_from_slice(&chunk?);
     }
     Ok(buf)
+}
+
+impl WebSocketTransport for UrlsessionTransport {
+    fn connect(&self, req: Request, cancel: CancelToken) -> BoxFuture<Result<WebSocketStream>> {
+        ws::connect(req, cancel)
+    }
 }
