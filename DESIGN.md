@@ -91,6 +91,8 @@ trait ResponseHook { async fn on_response(&self, res: &mut Response) -> Result<(
 
 core 约束不变：面向 trait 编程，`Transport` 接口不为 hyper 便利性妥协；这使 Android 从 Cronet 切到 Rust 是**加一个 crate 的配置变更**，而不是架构迁移——这正是本轮修订成本低的原因。
 
+**再次明确（2026-11）**："原生优先"是总原则，Android 走纯 Rust 是**被迫的例外**（原生栈死了），不是偏好。**iOS 的 monet-urlsession 是生产集成的前置条件，不是事后优化**——纯 Rust 双平台仅限开发期与测试，不作为 iOS 的上线形态。
+
 ## 可行性核实结论（2026-11 调研）
 
 | 平台 | 路径 | 结论 |
