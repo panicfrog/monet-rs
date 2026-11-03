@@ -1,0 +1,22 @@
+[package]
+name = "monet-core"
+description = "Cross-platform networking core for monet-rs: types, transports, hooks, and pinning shared by every frontend."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+base64.workspace = true
+bytes.workspace = true
+futures-channel.workspace = true
+futures-core.workspace = true
+indexmap.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+futures-lite.workspace = true
+
+[lints]
+workspace = true
