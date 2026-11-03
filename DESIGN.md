@@ -116,6 +116,7 @@ core 约束不变：面向 trait 编程，`Transport` 接口不为 hyper 便利�
 - 官方 Cronet 二进制分发已实质停止：Google Maven 上 143.7445.0 是最后一个真 AAR（500.x 全是空壳，无 `.so`）；GCS Release 包停在 145.0.7569.0（146 起整个目录消失）；chromium/cronet GitHub 无 releases。**Java API 与 C API 的二进制停在同一个地方**——切换 JNI 并不解决天花板，天花板是分发问题
 - `play-services-cronet` 18.1.1 是唯一仍被 Google 持续更新的 Cronet 二进制渠道：AAR 零原生代码，纯 Java 适配层（`PlayServicesCronetProvider`/`CronetProviderInstaller`），真实现住在 GMS 的 **Dynamite 模块**里，设备级共享、随 GMS 更新——但仅 GMS 设备可用，且 Cronet 是动态模块（首用可能触发下载），线上版本碎片化
 - 结论（修订二后）：国内默认走 monet-rustls（不依赖任何 Cronet 二进制）；GMS 轨道作为海外增强，embedded 轨道降级为遗留选项
+- 追加核实（2026-11）：SagerNet cronet-go fork 活跃（v150.0.7871.63-2）但**只发桌面构建，无 Android 资产**——"国内用持续维护的 Cronet"的任何变体（fork 或官方源码自编译）都要求我们自己承担 Android 二进制生产（数 GiB Chromium 构建 + CI 养护）再叠加 JNI 层；仅在 143 embedded 上加 JNI 则与已建成的 C API transport 同天花板、纯增复杂度。后备路径触发条件：应用流量重度依赖 H3/QUIC 且 h3 crate 不堪用，或愿意养 Cronet 构建 CI。注意若建 monet-cronet-jni，它可同时服务 embedded（国内）与 GMS（海外）provider
 
 
 
