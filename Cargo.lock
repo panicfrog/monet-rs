@@ -234,6 +234,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "monet-cronet-sys"
+version = "0.1.0"
+
+[[package]]
 name = "parking"
 version = "2.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
