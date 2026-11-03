@@ -1,10 +1,12 @@
 //! TLS trust and pinning for every monet-rs rustls transport.
 //!
-//! Two trust sources (feature-switched): the platform verifier (Android
-//! system CAs + network_security_config) or the embedded Mozilla bundle.
-//! Whichever is active, pinned hosts additionally require a matching SPKI
-//! hash in the presented chain — the same semantics as monet-core's pin
-//! walk-up, enforced in one place instead of nitro-fetch's three copies.
+//! Three trust sources: the platform verifier (Android system CAs +
+//! network_security_config, feature-switched), the embedded Mozilla
+//! bundle (the default), or an explicit set of custom DER roots (private
+//! CAs, tests). Whichever is active, pinned hosts additionally require a
+//! matching SPKI hash in the presented chain — the same semantics as
+//! monet-core's pin walk-up, enforced in one place instead of
+//! nitro-fetch's three copies.
 
 use std::sync::Arc;
 
@@ -26,6 +28,11 @@ pub enum TlsTrust {
     /// `platform-verifier`). On Android, the embedder must have initialized
     /// it (see the crate docs) before connections start.
     PlatformVerifier,
+    /// Exactly these DER-encoded root certificates — nothing else. For
+    /// private/enterprise CAs and for tests that issue their own CA;
+    /// callers who want the public web on top should stay on
+    /// [`TlsTrust::WebpkiRoots`], which this replaces entirely.
+    CustomRoots(Vec<Vec<u8>>),
     /// Embedded Mozilla CA bundle (feature `webpki-roots`, the default).
     #[default]
     WebpkiRoots,
@@ -110,28 +117,35 @@ impl ServerCertVerifier for PinningVerifier {
 /// Builds a rustls client config: chosen trust source, optionally wrapped
 /// with the pin policy.
 pub fn client_config(trust: &TlsTrust, pins: &PinConfig) -> Result<Arc<ClientConfig>> {
-    let want_platform = matches!(trust, TlsTrust::PlatformVerifier);
-
-    #[allow(unused_mut)]
-    let mut base: Option<Arc<dyn ServerCertVerifier>> = None;
-    if want_platform {
-        #[cfg(feature = "platform-verifier")]
-        {
-            let verifier = rustls_platform_verifier::Verifier::new().map_err(|e| {
-                Error::transport(format!("monet-tls: platform verifier unavailable: {e}"))
-            })?;
-            base = Some(Arc::new(verifier));
+    let base: Arc<dyn ServerCertVerifier> = match trust {
+        TlsTrust::CustomRoots(der_roots) => {
+            let mut roots = RootCertStore::empty();
+            for der in der_roots {
+                roots
+                    .add(rustls::pki_types::CertificateDer::from(der.clone()))
+                    .map_err(|e| {
+                        Error::transport(format!("monet-tls: invalid custom root: {e}"))
+                    })?;
+            }
+            rustls::client::WebPkiServerVerifier::builder(Arc::new(roots))
+                .build()
+                .map_err(|e| Error::transport(format!("monet-tls: custom-roots verifier: {e}")))?
         }
-        #[cfg(not(feature = "platform-verifier"))]
-        {
-            return Err(Error::transport(
-                "monet-tls: built without the `platform-verifier` feature",
-            ));
+        TlsTrust::PlatformVerifier => {
+            #[cfg(feature = "platform-verifier")]
+            {
+                Arc::new(rustls_platform_verifier::Verifier::new().map_err(|e| {
+                    Error::transport(format!("monet-tls: platform verifier unavailable: {e}"))
+                })?)
+            }
+            #[cfg(not(feature = "platform-verifier"))]
+            {
+                return Err(Error::transport(
+                    "monet-tls: built without the `platform-verifier` feature",
+                ));
+            }
         }
-    }
-    let base = match base {
-        Some(base) => base,
-        None => {
+        TlsTrust::WebpkiRoots => {
             #[cfg(feature = "webpki-roots")]
             {
                 let mut roots = RootCertStore::empty();
@@ -166,4 +180,36 @@ pub fn client_config(trust: &TlsTrust, pins: &PinConfig) -> Result<Arc<ClientCon
             .with_custom_certificate_verifier(verifier)
             .with_no_client_auth(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn custom_roots_build_a_verifier() {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let ca = rcgen::CertificateParams::new(vec![])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let config = client_config(
+            &TlsTrust::CustomRoots(vec![ca.der().to_vec()]),
+            &PinConfig::default(),
+        );
+        assert!(config.is_ok());
+    }
+
+    #[test]
+    fn custom_roots_reject_garbage_der() {
+        let err = client_config(
+            &TlsTrust::CustomRoots(vec![vec![0xDE, 0xAD]]),
+            &PinConfig::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::Transport { message: ref m, .. } if m.contains("custom root")),
+            "got: {err:?}"
+        );
+    }
 }

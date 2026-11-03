@@ -23,5 +23,8 @@ rustls-platform-verifier = { version = "0.7", optional = true }
 sha2 = "0.10"
 webpki-roots = { version = "1", optional = true }
 
+[dev-dependencies]
+rcgen = "0.13"
+
 [lints]
 workspace = true

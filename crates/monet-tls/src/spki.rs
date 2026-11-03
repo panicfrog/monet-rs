@@ -7,9 +7,14 @@
 /// Returns the DER-encoded SPKI (tag + length + value) of `cert`, or `None`
 /// when the certificate is not shaped as expected.
 pub fn spki_der(cert: &[u8]) -> Option<&[u8]> {
-    // Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signature }
-    let (tag, tbs, rest) = tlv(cert)?;
+    // Certificate ::= SEQUENCE { tbsCertificate SEQUENCE, signatureAlgorithm,
+    // signature } — descend into the TBS before walking fields.
+    let (tag, content, rest) = tlv(cert)?;
     if tag != 0x30 || !rest.is_empty() {
+        return None;
+    }
+    let (tbs_tag, tbs, _) = tlv(content)?;
+    if tbs_tag != 0x30 {
         return None;
     }
     let mut cursor = tbs;
@@ -82,7 +87,7 @@ mod tests {
             0x30,
             &[0x06, 0x07, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01],
         );
-        let tbs = [
+        let tbs_content = [
             tlv(0xA0, &[]),
             tlv(0x02, &[0x01]),
             tlv(0x30, &[]),
@@ -92,6 +97,7 @@ mod tests {
             spki.clone(),
         ]
         .concat();
+        let tbs = tlv(0x30, &tbs_content);
         // Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signature }
         let content = [
             tbs,
@@ -107,6 +113,26 @@ mod tests {
     fn extracts_spki() {
         let (cert, spki) = fixture();
         assert_eq!(spki_der(&cert), Some(spki.as_slice()));
+    }
+
+    #[test]
+    fn extracts_spki_from_a_real_certificate() {
+        // rcgen emits certificates with the full X.509 shape (version
+        // wrapper, extensions, long-form lengths). This is the case the
+        // hand-rolled walker must not miss: an earlier version never
+        // descended into the TBS SEQUENCE and failed every real
+        // certificate — pinning would have rejected everything.
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let ca = rcgen::CertificateParams::new(vec![])
+            .unwrap()
+            .self_signed(&ca_key)
+            .unwrap();
+        let leaf_key = rcgen::KeyPair::generate().unwrap();
+        let leaf = rcgen::CertificateParams::new(vec!["127.0.0.1".into()])
+            .unwrap()
+            .signed_by(&leaf_key, &ca, &ca_key)
+            .unwrap();
+        assert!(spki_der(leaf.der().as_ref()).is_some());
     }
 
     #[test]

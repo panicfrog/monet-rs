@@ -288,11 +288,27 @@ async fn send_once(
     {
         Step::Done(Ok(response)) => Ok(response),
         Step::Done(Err(e)) => Err(Error::transport(format!(
-            "monet-rustls: request failed: {e}"
+            "monet-rustls: request failed: {}",
+            error_chain(&e)
         ))),
         Step::TimedOut => Err(Error::transport("monet-rustls: request timed out")),
         Step::Cancelled => Err(Error::Cancelled),
     }
+}
+
+/// Flattens an error and its whole source chain into one message —
+/// hyper-util's top-level Display ("client error (Connect)") hides the
+/// rustls reason (including the pin-rejection marker), which callers
+/// branch on.
+fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(error) = source {
+        message.push_str(": ");
+        message.push_str(&error.to_string());
+        source = error.source();
+    }
+    message
 }
 
 /// Maps a hyper response onto the core shape and starts the body pump.
