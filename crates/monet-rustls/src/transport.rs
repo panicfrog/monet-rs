@@ -38,6 +38,10 @@ pub struct MonetRustlsConfig {
     pub pins: PinConfig,
     /// Advertise HTTP/2 over ALPN. Enabled by default.
     pub http2: bool,
+    /// Deadline for receiving the response head, in milliseconds (the
+    /// URLSession/iOS transport's `timeoutInterval` equivalent). `None`
+    /// waits indefinitely, like hyper itself.
+    pub timeout_ms: Option<u64>,
 }
 
 impl Default for MonetRustlsConfig {
@@ -46,6 +50,7 @@ impl Default for MonetRustlsConfig {
             trust: TlsTrust::default(),
             pins: PinConfig::default(),
             http2: true,
+            timeout_ms: None,
         }
     }
 }
@@ -54,6 +59,7 @@ impl Default for MonetRustlsConfig {
 pub struct MonetRustlsTransport {
     handle: tokio::runtime::Handle,
     client: HttpClient,
+    timeout_ms: Option<u64>,
     // Dropping this unparks the runtime thread, shutting it down.
     _shutdown: oneshot::Sender<()>,
 }
@@ -93,6 +99,7 @@ impl MonetRustlsTransport {
         Ok(MonetRustlsTransport {
             handle,
             client,
+            timeout_ms: config.timeout_ms,
             _shutdown,
         })
     }
@@ -102,6 +109,7 @@ impl Transport for MonetRustlsTransport {
     fn execute(&self, req: Request, cancel: CancelToken) -> BoxFuture<Result<Response>> {
         let handle = self.handle.clone();
         let client = self.client.clone();
+        let timeout_ms = self.timeout_ms;
         Box::pin(async move {
             if cancel.is_cancelled() {
                 return Err(Error::Cancelled);
@@ -109,7 +117,8 @@ impl Transport for MonetRustlsTransport {
             let (done_tx, done_rx) = oneshot::channel::<Result<Response>>();
             let spawn_handle = handle.clone();
             handle.spawn(async move {
-                let _ = done_tx.send(run_execute(client, req, cancel, spawn_handle).await);
+                let _ =
+                    done_tx.send(run_execute(client, req, cancel, spawn_handle, timeout_ms).await);
             });
             done_rx
                 .await
@@ -151,55 +160,147 @@ fn spawn_runtime() -> Result<(tokio::runtime::Handle, oneshot::Sender<()>)> {
     Ok((handle, shutdown_tx))
 }
 
+/// Upper bound on redirect hops (nitro-fetch's policy).
+const MAX_REDIRECTS: usize = 20;
+
 async fn run_execute(
     client: HttpClient,
     req: Request,
     cancel: CancelToken,
     handle: tokio::runtime::Handle,
+    timeout_ms: Option<u64>,
 ) -> Result<Response> {
-    let method = HyperMethod::from_bytes(req.method.as_str().as_bytes())
-        .map_err(|e| Error::transport(format!("monet-rustls: method: {e}")))?;
-    let uri: Uri = req
-        .url
-        .as_str()
-        .parse()
-        .map_err(|e| Error::transport(format!("monet-rustls: URI: {e}")))?;
+    let mut url = req.url;
+    let mut method = req.method;
+    // The stream can only be sent once: hop 0 gets it, later hops are
+    // bodyless (see the 307/308 note below).
+    let mut body = Some(req.body);
+    let mut headers = req.headers;
 
-    let mut builder = HyperRequest::builder().method(method).uri(uri);
-    let headers = builder
-        .headers_mut()
-        .expect("fresh request builder has headers");
-    for (name, value) in req.headers.iter_flattened() {
-        let name = HeaderName::from_bytes(name.as_bytes())
-            .map_err(|e| Error::transport(format!("monet-rustls: header name: {e}")))?;
-        let value = HeaderValue::from_str(value)
-            .map_err(|e| Error::transport(format!("monet-rustls: header value: {e}")))?;
-        headers.append(name, value);
+    for _ in 0..=MAX_REDIRECTS {
+        let hyper_method = HyperMethod::from_bytes(method.as_str().as_bytes())
+            .map_err(|e| Error::transport(format!("monet-rustls: method: {e}")))?;
+        let uri: Uri = url
+            .as_str()
+            .parse()
+            .map_err(|e| Error::transport(format!("monet-rustls: URI: {e}")))?;
+
+        let mut builder = HyperRequest::builder().method(hyper_method).uri(uri);
+        let builder_headers = builder
+            .headers_mut()
+            .expect("fresh request builder has headers");
+        for (name, value) in headers.iter_flattened() {
+            let name = HeaderName::from_bytes(name.as_bytes())
+                .map_err(|e| Error::transport(format!("monet-rustls: header name: {e}")))?;
+            let value = HeaderValue::from_str(value)
+                .map_err(|e| Error::transport(format!("monet-rustls: header value: {e}")))?;
+            builder_headers.append(name, value);
+        }
+
+        let stream = body.take().unwrap_or_else(Body::empty);
+        let request = builder
+            .body(request_body(stream))
+            .map_err(|e| Error::transport(format!("monet-rustls: request build: {e}")))?;
+
+        let response = send_once(&client, request, &cancel, timeout_ms).await?;
+
+        // Redirect following (WHATWG-flavored, like the other transports):
+        // 301/302/303 switch to GET, dropping the body; 307/308 preserve
+        // the method but a consumed stream cannot be replayed, so bodied
+        // methods get the 3xx response delivered instead of a doomed
+        // retry. Authorization never crosses an origin change.
+        let status = response.status();
+        if ![301u16, 302, 303, 307, 308].contains(&status.as_u16()) {
+            return Ok(into_response(response, &handle, cancel));
+        }
+        let Some(location) = response
+            .headers()
+            .get("location")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+        else {
+            return Ok(into_response(response, &handle, cancel));
+        };
+        let next = url.join(&location).map_err(|e| {
+            Error::transport(format!("monet-rustls: redirect location {location:?}: {e}"))
+        })?;
+        let cross_origin = next.host() != url.host()
+            || next.port_or_known_default() != url.port_or_known_default()
+            || next.scheme() != url.scheme();
+        if cross_origin {
+            headers.remove("authorization");
+        }
+        let preserve_method = status.as_u16() == 307 || status.as_u16() == 308;
+        if preserve_method
+            && method != monet_core::Method::Get
+            && method != monet_core::Method::Head
+        {
+            // The body (if any) was already consumed; deliver as-is.
+            return Ok(into_response(response, &handle, cancel));
+        }
+        if !preserve_method
+            && method != monet_core::Method::Get
+            && method != monet_core::Method::Head
+        {
+            // 301/302/303: fetch semantics switch bodied methods to GET.
+            method = monet_core::Method::Get;
+        }
+        url = next;
     }
+    Err(Error::transport(
+        "monet-rustls: too many redirects (> {MAX_REDIRECTS})",
+    ))
+}
 
-    let request = builder
-        .body(request_body(req.body))
-        .map_err(|e| Error::transport(format!("monet-rustls: request build: {e}")))?;
-
+/// One request/response exchange: cancel race plus the optional head
+/// timeout.
+async fn send_once(
+    client: &HttpClient,
+    request: HyperRequest<BoxRequestBody>,
+    cancel: &CancelToken,
+    timeout_ms: Option<u64>,
+) -> Result<hyper::Response<Incoming>> {
     enum Step<T> {
         Done(T),
         Cancelled,
+        TimedOut,
     }
-    let response = match race(async { Step::Done(client.request(request).await) }, async {
+    let with_deadline = async {
+        match timeout_ms {
+            Some(ms) => {
+                match tokio::time::timeout(std::time::Duration::from_millis(ms), async {
+                    Step::Done(client.request(request).await)
+                })
+                .await
+                {
+                    Ok(step) => step,
+                    Err(_elapsed) => Step::TimedOut,
+                }
+            }
+            None => Step::Done(client.request(request).await),
+        }
+    };
+    match race(with_deadline, async {
         cancel.cancelled().await;
         Step::Cancelled
     })
     .await
     {
-        Step::Done(Ok(response)) => response,
-        Step::Done(Err(e)) => {
-            return Err(Error::transport(format!(
-                "monet-rustls: request failed: {e}"
-            )));
-        }
-        Step::Cancelled => return Err(Error::Cancelled),
-    };
+        Step::Done(Ok(response)) => Ok(response),
+        Step::Done(Err(e)) => Err(Error::transport(format!(
+            "monet-rustls: request failed: {e}"
+        ))),
+        Step::TimedOut => Err(Error::transport("monet-rustls: request timed out")),
+        Step::Cancelled => Err(Error::Cancelled),
+    }
+}
 
+/// Maps a hyper response onto the core shape and starts the body pump.
+fn into_response(
+    response: hyper::Response<Incoming>,
+    handle: &tokio::runtime::Handle,
+    cancel: CancelToken,
+) -> Response {
     let mut headers_out = monet_core::HeaderMap::new();
     for (name, value) in response.headers().iter() {
         let value = String::from_utf8_lossy(value.as_bytes()).into_owned();
@@ -209,8 +310,7 @@ async fn run_execute(
 
     let (body, sender) = body_channel();
     handle.spawn(pump_body(response.into_body(), sender, cancel));
-
-    Ok(Response::new(status, headers_out, body))
+    Response::new(status, headers_out, body)
 }
 
 /// Bridges our streaming request body into a hyper body: each chunk becomes

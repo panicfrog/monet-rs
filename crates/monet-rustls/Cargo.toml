@@ -27,6 +27,7 @@ hyper-util = { version = "0.1", features = ["client-legacy", "server", "http1", 
 tokio = { version = "1", features = ["rt", "sync", "net"] }
 
 [dev-dependencies]
+monet-conformance = { path = "../monet-conformance" }
 tokio = { version = "1", features = ["rt", "net"] }
 
 [lints]
