@@ -89,7 +89,21 @@ trait ResponseHook { async fn on_response(&self, res: &mut Response) -> Result<(
 | Android / Cronet | 官方二进制发行版自带 C API（`cronet_c.h` + `libcronet.so`），为 FFI 消费者设计；bindgen 生成 Rust 声明。**已核实**（cronet-embedded 143.7445.0 AAR 符号表）：C API 有完整 pinning（`Cronet_PublicKeyPins_*` + `EngineParams_public_key_pins_add` + local-trust-anchor bypass 开关），共 259 个 `Cronet_*` 符号；**Java API 与 C API 均无 WebSocket**（Java `newWebSocket` 已从上游移除）。nitro-fetch 用的是 Java API（Kotlin 调 `CronetEngine.Builder`），其 WebSocket 另起炉灶（见下）。我们维持 **C API 直连 Rust**：pinning 齐全、无 JNI hop、回调在 native 线程直接进 Rust；Java API 相对优势（RequestFinishedInfo/telemetry）不值得多一层 Kotlin+JNI。⚠ **上游风险（2026-11 发现）：Cronet C API 已从 Chromium 146 起被上游移除**（146+ 发行包不再含 `include/`，源码树 `components/cronet/native/` 已删除）。monet-cronet-sys 钉 143.7445.0（头文件 143→145 逐字节相同），升级天花板 145.0.7569.0；再往后的迁移路径：SagerNet fork（仍携带 C API）或改走 JNI 调 Java API | ✅ 直接可行；无广泛维护的现成 sys crate（crates.io 有小众 `cronet` crate），需自维护薄绑定。版本需 ≥143.7445.0（AGP9 namespace 检查，nitro build.gradle 注释） |
 | iOS / URLSession | **不使用 objc2**（决策 2026-11：delegate 状态机、autoreleasepool、生命周期管理用 Rust 重写 ObjC delegate 的代价过高；nitro-fetch 的对应实现是纯 Swift，已验证）。采用 Swift shim：Swift 独占 URLSession delegate 状态机，暴露窄回调面（`transport_execute(req, {on_response_head, on_chunk, on_done/on_error})`）。**桥接已决策：Swift↔C++ interop + cxx**（jsi-rs 的 RN 集成本就是 cxx，复用同一边界与构建机制，零新增桥接技术；swift-bridge 已评估未采用——0.1.x 无稳定承诺，且会在同一二进制引入第二套桥接体系） | ✅ 可行；delegate 回调 → Swift async 已由 nitro 的 `NitroBufferedTaskDelegate` 验证，我们只需把出口从 JSI 换成桥接回调 |
 
-## WebSocket（独立于 HTTP transport）
+## Android transport 双轨决策（2026-11，基于目标市场含中国大陆）
+
+目标 App 市场含国内（大量无 GMS 设备），据此定**双轨**，由 `Transport` trait 保证两轨是配置选择而非架构分叉：
+
+| 轨道 | 状态 | 适用 |
+|---|---|---|
+| **monet-cronet（默认）**：C API 直连 + embedded `.so`（143.7445.0 AAR） | ✅ 已实现 | 任何设备可跑（含国内）；版本自控，缺点是每 ABI 4-7MB 且钉在 ≤145 |
+| **monet-cronet-jni（后续增强）**：Java API + provider 模型 | 未开工 | GMS 设备走 `play-services-cronet`（零 `.so`、版本由 Google 经 GMS Dynamite 模块更新，绕开 145 天花板）；非 GMS 设备仍需 embedded `.so` 兜底 |
+
+决策依据的核实事实（2026-11）：
+- 官方 Cronet 二进制分发已实质停止：Google Maven 上 143.7445.0 是最后一个真 AAR（500.x 全是空壳，无 `.so`）；GCS Release 包停在 145.0.7569.0（146 起整个目录消失）；chromium/cronet GitHub 无 releases。**Java API 与 C API 的二进制停在同一个地方**——切换 JNI 并不解决天花板，天花板是分发问题
+- `play-services-cronet` 18.1.1 是唯一仍被 Google 持续更新的 Cronet 二进制渠道：AAR 零原生代码，纯 Java 适配层（`PlayServicesCronetProvider`/`CronetProviderInstaller`），真实现住在 GMS 的 **Dynamite 模块**里，设备级共享、随 GMS 更新——但仅 GMS 设备可用，且 Cronet 是动态模块（首用可能触发下载），线上版本碎片化
+- 结论：国内市场必须保 embedded `.so` 轨道；GMS 轨道作为海外增强，不阻塞 v1
+
+
 
 **事实**：Cronet（Java API 和 C API）现在都**没有** WebSocket——旧的 `ExperimentalCronetEngine.newWebSocket` 已从上游移除（2026-11 从 143.7445.0 的 api.txt 与 `.so` 符号表核实）。nitro-fetch 因此把 WS 做成独立伴生包 `react-native-nitro-websockets`：C++ libwebsockets + mbedTLS（vendored 源码，Android/iOS 同一份），TLS 用构建时内嵌的 Mozilla CA bundle，pin 校验在握手完成后、headers 发出前（为拿完整 peer chain 甚至 include 了 LWS 私有头）。
 
