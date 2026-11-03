@@ -5,12 +5,8 @@
 //! there); iOS cross-compiles with the same build script. See
 //! `docs/plans/2026-11-monet-urlsession.md` for the design record.
 
+#![allow(unsafe_code)] // FFI boundary: this crate bridges Rust and Swift.
+
 mod ffi;
 
-/// Data-plane entry point for the M1 spike: Swift calls this through the
-/// generated cxx header.
-fn monet_pong(id: u64) -> u64 {
-    id
-}
-
-pub use ffi::ffi;
+pub use ffi::bridge;

@@ -7,5 +7,5 @@
 #include "MonetUrlsessionBridge-Swift.h"
 
 uint64_t monet_swift_ping(uint64_t id) {
-    return MonetUrlsessionBridge::monetSwiftPing(id: id);
+    return MonetUrlsessionBridge::monetSwiftPing(id);
 }
