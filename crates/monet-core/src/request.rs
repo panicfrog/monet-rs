@@ -38,8 +38,8 @@ impl Request {
     }
 
     /// Replaces the body with a single complete chunk (builder style).
-    pub fn with_body_bytes(mut self, bytes: impl Into<Bytes>) -> Self {
-        self.body = Body::from_bytes(bytes);
+    pub fn with_body_bytes(mut self, bytes: impl AsRef<[u8]>) -> Self {
+        self.body = Body::from_bytes(Bytes::copy_from_slice(bytes.as_ref()));
         self
     }
 

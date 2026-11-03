@@ -76,6 +76,12 @@ impl Date {
         let day = s[8..10].parse::<u32>().ok()?;
         Date::from_ymd(year, month, day)
     }
+
+    /// Milliseconds since the Unix epoch at this date's UTC midnight — the
+    /// shape Cronet's `expiration_date` expects (java.util.Date semantics).
+    pub fn unix_time_millis(&self) -> i64 {
+        self.days * 86_400_000
+    }
 }
 
 fn is_leap(year: i32) -> bool {
