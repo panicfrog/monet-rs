@@ -12,13 +12,14 @@ crate-type = ["lib", "cdylib"]
 [dependencies]
 monet-core = { path = "../monet-core" }
 monet-conformance = { path = "../monet-conformance" }
-monet-rustls = { path = "../monet-rustls" }
-monet-tls = { path = "../monet-tls", default-features = false }
-monet-ws = { path = "../monet-ws" }
+monet-rustls = { path = "../monet-rustls", features = ["platform-verifier"] }
+monet-tls = { path = "../monet-tls", features = ["platform-verifier"] }
+monet-ws = { path = "../monet-ws", features = ["platform-verifier"] }
 base64.workspace = true
 
 [target.'cfg(target_os = "android")'.dependencies]
-jni = "0.21"
+jni = "0.22"
+rustls-platform-verifier = "0.7"
 
 [lints]
 workspace = true

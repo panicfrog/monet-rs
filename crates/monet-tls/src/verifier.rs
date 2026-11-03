@@ -134,9 +134,14 @@ pub fn client_config(trust: &TlsTrust, pins: &PinConfig) -> Result<Arc<ClientCon
         TlsTrust::PlatformVerifier => {
             #[cfg(feature = "platform-verifier")]
             {
-                Arc::new(rustls_platform_verifier::Verifier::new().map_err(|e| {
-                    Error::transport(format!("monet-tls: platform verifier unavailable: {e}"))
-                })?)
+                Arc::new(
+                    rustls_platform_verifier::Verifier::new(ring_crypto::default_provider().into())
+                        .map_err(|e| {
+                            Error::transport(format!(
+                                "monet-tls: platform verifier unavailable: {e}"
+                            ))
+                        })?,
+                )
             }
             #[cfg(not(feature = "platform-verifier"))]
             {

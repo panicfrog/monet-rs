@@ -1,4 +1,35 @@
-/target
+# Rust — the build tree. Cargo.lock stays TRACKED (committed for
+# reproducible builds since the first commit).
+/target/
+**/*.rs.bk
 Cargo.lock.bak
-*.swp
+
+# Swift / Xcode (monet-urlsession's cxx artifacts land under target/, but
+# local experiments shouldn't leak either)
+DerivedData/
+.build/
+xcuserdata/
+*.xcarchive/
+*.xcodeproj/
+
+# Gradle / Android (platform/android-demo)
+.gradle/
+build/
+**/jniLibs/
+local.properties
+captures/
+.externalNativeBuild/
+.cxx/
+obj/
+*.apk
+*.aab
+*.hprof
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# macOS / editor noise
 .DS_Store
+*.swp

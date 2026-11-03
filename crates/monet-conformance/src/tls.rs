@@ -33,6 +33,15 @@ impl LocalCa {
         }
     }
 
+    /// Builds on a pre-existing CA (DER certificate + PKCS#8 key) — for
+    /// fixture CAs that must be trusted somewhere outside this process
+    /// too, like an Android `network_security_config` trust anchor.
+    pub fn from_pkcs8(ca_der: Vec<u8>, ca_key_pkcs8: &[u8]) -> LocalCa {
+        LocalCa {
+            cert: ServerCert::from_pkcs8(ca_der, ca_key_pkcs8),
+        }
+    }
+
     /// The DER root for [`monet_tls::TlsTrust::CustomRoots`].
     pub fn der(&self) -> Vec<u8> {
         self.cert.ca_der.clone()
@@ -93,6 +102,32 @@ mod private {
                 .expect("CA params")
                 .self_signed(&ca_key)
                 .expect("self-signed CA");
+            let ca_der = ca.der().to_vec();
+            Self::mint(ca, ca_key, ca_der)
+        }
+
+        pub fn from_pkcs8(ca_der: Vec<u8>, ca_key_pkcs8: &[u8]) -> ServerCert {
+            let ca_key = rcgen::KeyPair::from_pkcs8_der_and_sign_algo(
+                &rustls::pki_types::PrivatePkcs8KeyDer::from(ca_key_pkcs8),
+                &rcgen::PKCS_ECDSA_P256_SHA256,
+            )
+            .expect("fixture CA key parses as PKCS#8 P-256");
+            // Reconstruct an issuer from the certificate (same subject,
+            // same key): leaves minted below chain to the original DER.
+            let ca = rcgen::CertificateParams::from_ca_cert_der(&CertificateDer::from(
+                ca_der.clone(),
+            ))
+            .expect("fixture CA certificate parses")
+            .self_signed(&ca_key)
+            .expect("issuer reconstructs");
+            Self::mint(ca, ca_key, ca_der)
+        }
+
+        fn mint(
+            ca: rcgen::Certificate,
+            ca_key: rcgen::KeyPair,
+            ca_der: Vec<u8>,
+        ) -> ServerCert {
             let leaf_key = rcgen::KeyPair::generate().expect("generate leaf key");
             let leaf = rcgen::CertificateParams::new(vec!["127.0.0.1".into(), "localhost".into()])
                 .expect("leaf params")
@@ -102,7 +137,7 @@ mod private {
             let spki = monet_tls::spki::spki_der(leaf_der.as_ref())
                 .expect("leaf exposes SubjectPublicKeyInfo");
             ServerCert {
-                ca_der: ca.der().to_vec(),
+                ca_der,
                 leaf_spki_sha256: Sha256::digest(spki).into(),
                 leaf_key: PrivateKeyDer::Pkcs8(leaf_key.serialize_der().into()),
                 leaf_der,

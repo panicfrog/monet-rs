@@ -122,6 +122,65 @@ pub fn format_battery(reports: &[CheckReport]) -> String {
     battery::format(reports)
 }
 
+/// The platform-verifier battery (Android only): the transports trusting
+/// the platform store, verified against a CA the app itself anchors via
+/// `network_security_config` — the full path (JNI init, Android trust
+/// API, NSC) exercised inside one process.
+#[cfg(target_os = "android")]
+pub fn run_platform_battery() -> Vec<CheckReport> {
+    use monet_conformance::tls::LocalCa;
+
+    const CA_DER: &[u8] = include_bytes!("fixtures/ca.der");
+    const CA_KEY: &[u8] = include_bytes!("fixtures/ca.pkcs8.key");
+    let mut reports = Vec::new();
+
+    // The fixture CA is what the app's NSC trusts; leaves minted from it
+    // must pass the platform verifier.
+    let anchored = LocalCa::from_pkcs8(CA_DER.to_vec(), CA_KEY);
+    let platform = {
+        let config = MonetRustlsConfig {
+            trust: TlsTrust::PlatformVerifier,
+            ..MonetRustlsConfig::default()
+        };
+        MonetRustlsTransport::new(config)
+    };
+    match platform {
+        Ok(platform) => {
+            reports.push(battery::check("platform:nsc_trusted_ca", || {
+                monet_conformance::tls::https_get_with_trusted_ca(&platform, &anchored);
+            }));
+        }
+        Err(err) => {
+            reports.push(CheckReport {
+                name: "platform:nsc_trusted_ca",
+                failure: Some(format!("transport construction failed: {err}")),
+            });
+        }
+    }
+
+    // A CA minted at runtime is anchored nowhere: the platform verifier
+    // must reject it (trust is not advisory).
+    let runtime_ca = LocalCa::generate();
+    match MonetRustlsTransport::new(MonetRustlsConfig {
+        trust: TlsTrust::PlatformVerifier,
+        ..MonetRustlsConfig::default()
+    }) {
+        Ok(platform) => {
+            reports.push(battery::check("platform:runtime_ca_rejects", || {
+                monet_conformance::tls::https_untrusted_ca_rejects(&platform, &runtime_ca);
+            }));
+        }
+        Err(err) => {
+            reports.push(CheckReport {
+                name: "platform:runtime_ca_rejects",
+                failure: Some(format!("transport construction failed: {err}")),
+            });
+        }
+    }
+
+    reports
+}
+
 /// A pin entry for `host` whose hash matches nothing in the minted
 /// chain: the base64 of 32 zero bytes.
 fn mismatched_pins(host: &str) -> PinConfig {
