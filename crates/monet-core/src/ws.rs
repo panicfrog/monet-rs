@@ -9,6 +9,7 @@
 
 use bytes::Bytes;
 use futures_channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
+use std::fmt;
 
 use crate::error::{Error, Result};
 
@@ -41,6 +42,12 @@ pub enum WsMessage {
 pub struct WebSocketStream {
     incoming: UnboundedReceiver<WsMessage>,
     outgoing: UnboundedSender<WsMessage>,
+}
+
+impl fmt::Debug for WebSocketStream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WebSocketStream").finish_non_exhaustive()
+    }
 }
 
 /// The transport-facing half of an open WebSocket.
