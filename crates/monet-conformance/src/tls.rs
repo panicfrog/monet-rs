@@ -19,6 +19,7 @@ use tokio_rustls::TlsAcceptor;
 use crate::http::HttpServer;
 use crate::tls::private::ServerCert;
 use crate::wait_for;
+use base64::Engine as _;
 
 /// A CA and a server certificate for `127.0.0.1`, minted on construction.
 pub struct LocalCa {
@@ -81,6 +82,24 @@ pub fn spawn_https_server(ca: &LocalCa) -> HttpServer {
     })
 }
 
+/// PEM ("-----BEGIN PRIVATE KEY-----…") or raw PKCS#8 DER → DER.
+fn pkcs8_der(input: &[u8]) -> Vec<u8> {
+    if input.starts_with(b"-----") {
+        let text = String::from_utf8_lossy(input);
+        let encoded: String = text
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect();
+        // A malformed fixture surfaces as a parse failure downstream
+        // (the caller's expect), not a panic here.
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded.as_bytes())
+            .unwrap_or_default()
+    } else {
+        input.to_vec()
+    }
+}
+
 mod private {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
     use sha2::{Digest, Sha256};
@@ -98,17 +117,24 @@ mod private {
     impl ServerCert {
         pub fn generate() -> ServerCert {
             let ca_key = rcgen::KeyPair::generate().expect("generate CA key");
-            let ca = rcgen::CertificateParams::new(vec![])
-                .expect("CA params")
-                .self_signed(&ca_key)
-                .expect("self-signed CA");
+            let mut ca_params = rcgen::CertificateParams::new(vec![]).expect("CA params");
+            // CA:TRUE, unconstrained — Android PKIX validates the chain
+            // element against BasicConstraints; without it the leaf chain
+            // is rejected even when the CA is a trust anchor (rustls's
+            // webpki path does not check the anchor, so only the platform
+            // verifier surfaces this).
+            ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            let ca = ca_params.self_signed(&ca_key).expect("self-signed CA");
             let ca_der = ca.der().to_vec();
             Self::mint(ca, ca_key, ca_der)
         }
 
         pub fn from_pkcs8(ca_der: Vec<u8>, ca_key_pkcs8: &[u8]) -> ServerCert {
+            // Fixture keys ship as PEM (openssl's default) or DER — accept
+            // both, so a hand-generated fixture cannot panic the battery.
+            let key_der = super::pkcs8_der(ca_key_pkcs8);
             let ca_key = rcgen::KeyPair::from_pkcs8_der_and_sign_algo(
-                &rustls::pki_types::PrivatePkcs8KeyDer::from(ca_key_pkcs8),
+                &rustls::pki_types::PrivatePkcs8KeyDer::from(key_der),
                 &rcgen::PKCS_ECDSA_P256_SHA256,
             )
             .expect("fixture CA key parses as PKCS#8 P-256");
@@ -124,8 +150,17 @@ mod private {
 
         fn mint(ca: rcgen::Certificate, ca_key: rcgen::KeyPair, ca_der: Vec<u8>) -> ServerCert {
             let leaf_key = rcgen::KeyPair::generate().expect("generate leaf key");
-            let leaf = rcgen::CertificateParams::new(vec!["127.0.0.1".into(), "localhost".into()])
-                .expect("leaf params")
+            let mut leaf_params =
+                rcgen::CertificateParams::new(vec!["127.0.0.1".into(), "localhost".into()])
+                    .expect("leaf params");
+            // An explicit subject distinct from the issuer: PKIX treats a
+            // subject==issuer leaf as self-signed and rejects the chain
+            // (rustls's webpki path tolerates it, so only the platform
+            // verifier surfaces the difference).
+            leaf_params
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, "monet-test-leaf");
+            let leaf = leaf_params
                 .signed_by(&leaf_key, &ca, &ca_key)
                 .expect("leaf signed by CA");
             let leaf_der = leaf.der().clone();
@@ -247,4 +282,111 @@ pub fn wss_echo_with_trusted_ca(t: &dyn monet_core::transport::WebSocketTranspor
         .unwrap();
     let echoed = wait_for("wss echo", stream.next_message()).unwrap();
     assert_eq!(echoed, Some(WsMessage::Text("encrypted hello".into())));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A PEM fixture key must load exactly like a DER one: leaves minted
+    /// from it chain to the CA certificate (regression: the Android
+    /// platform battery fed openssl's PEM output to a DER-only parser
+    /// and panicked on device).
+    #[test]
+    fn from_pkcs8_accepts_pem_and_der_keys() {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let ca = rcgen::CertificateParams::new(vec![])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let pem = pkcs8_pem_from_der(&key.serialize_der());
+        let from_pem = LocalCa::from_pkcs8(ca.der().to_vec(), pem.as_bytes());
+        let from_der = LocalCa::from_pkcs8(ca.der().to_vec(), &key.serialize_der());
+        assert_eq!(from_pem.der(), from_der.der());
+    }
+
+    /// Wraps DER in a PEM envelope the way openssl does (64-column
+    /// base64, BEGIN/END guards) — the fixture format.
+    pub(crate) fn pkcs8_pem_from_der(der: &[u8]) -> String {
+        use base64::Engine as _;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(der);
+        let mut pem = String::from("-----BEGIN PRIVATE KEY-----\n");
+        for chunk in encoded.as_bytes().chunks(64) {
+            pem.push_str(std::str::from_utf8(chunk).unwrap());
+            pem.push('\n');
+        }
+        pem.push_str("-----END PRIVATE KEY-----\n");
+        pem
+    }
+}
+
+#[cfg(test)]
+mod regenerate {
+    use super::tests::pkcs8_pem_from_der;
+
+    /// Regenerates the demo app's fixture CA with the same toolchain the
+    /// runtime uses (openssl-generated PKCS#8 trips rcgen's ring parser
+    /// with WrongAlgorithm). Run on demand:
+    /// `cargo test -p monet-conformance --lib -- --ignored --nocapture`
+    /// then copy the printed artifacts into crates/monet-demo/src/fixtures/
+    /// and platform/android-demo/app/src/main/res/raw/.
+    #[test]
+    #[ignore]
+    fn print_fixture_ca() {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut ca_params =
+            rcgen::CertificateParams::new(vec!["localhost".into(), "127.0.0.1".into()]).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca = ca_params.self_signed(&key).unwrap();
+        println!("--- ca.der (hex) ---");
+        println!("{}", hex(ca.der()));
+        println!("--- ca.pkcs8.key (PEM) ---");
+        println!("{}", pkcs8_pem_from_der(&key.serialize_der()));
+        println!("--- ca.pem ---");
+        println!("{}", ca.pem());
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02X}")).collect()
+    }
+}
+
+#[cfg(test)]
+mod leaf_probe {
+    use super::pkcs8_der;
+
+    /// Prints a leaf (base64 DER) signed by the fixture CA for the
+    /// on-device verification probe:
+    /// `cargo test -p monet-conformance --lib leaf_probe -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn print_fixture_leaf() {
+        let ca_der = std::fs::read("../../crates/monet-demo/src/fixtures/ca.der").unwrap();
+        let ca_key = std::fs::read("../../crates/monet-demo/src/fixtures/ca.pkcs8.key").unwrap();
+        let key_der = pkcs8_der(&ca_key);
+        let ca_key = rcgen::KeyPair::from_pkcs8_der_and_sign_algo(
+            &rustls::pki_types::PrivatePkcs8KeyDer::from(key_der),
+            &rcgen::PKCS_ECDSA_P256_SHA256,
+        )
+        .unwrap();
+        let ca = rcgen::CertificateParams::from_ca_cert_der(
+            &rustls::pki_types::CertificateDer::from(ca_der.clone()),
+        )
+        .unwrap()
+        .self_signed(&ca_key)
+        .unwrap();
+        let leaf_key = rcgen::KeyPair::generate().unwrap();
+        let mut leaf_params =
+            rcgen::CertificateParams::new(vec!["localhost".into(), "127.0.0.1".into()]).unwrap();
+        leaf_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "monet-test-leaf");
+        let leaf = leaf_params.signed_by(&leaf_key, &ca, &ca_key).unwrap();
+        let b64: String = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode(leaf.der())
+        };
+        println!("--- leaf (base64 DER) ---");
+        println!("{b64}");
+    }
 }

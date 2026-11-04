@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 monet-core = { path = "../monet-core" }
 monet-tls = { path = "../monet-tls", default-features = false }
+base64.workspace = true
 bytes.workspace = true
 futures-channel.workspace = true
 futures-lite.workspace = true

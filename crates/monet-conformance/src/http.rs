@@ -112,7 +112,14 @@ impl HttpServer {
                                     body: body.to_vec(),
                                 });
                                 Ok::<_, std::convert::Infallible>(
-                                    respond(parts.uri.path(), body.to_vec(), &gate).await,
+                                    respond(
+                                        parts.method.as_str(),
+                                        parts.uri.path(),
+                                        &parts.headers,
+                                        body.to_vec(),
+                                        &gate,
+                                    )
+                                    .await,
                                 )
                             }
                         });
@@ -176,7 +183,9 @@ impl HttpServer {
 /// Answers one route. `request_body` is the body the check sent — the
 /// echo route reflects it. `gate` is the concurrency gate (see `/fast`).
 async fn respond(
+    method: &str,
     path: &str,
+    request_headers: &hyper::HeaderMap,
     request_body: Vec<u8>,
     gate: &std::sync::Arc<tokio::sync::Notify>,
 ) -> HyperResponse<BoxBody<Bytes, std::convert::Infallible>> {
@@ -202,7 +211,29 @@ async fn respond(
         }
         // The echo route answers with the request body so the check can
         // verify it survived the transport.
-        "/echo" => ok(StatusCode::OK, boxed(Full::new(Bytes::from(request_body)))),
+        "/echo" => {
+            // Reflect what the server saw (method, headers, body) so
+            // transports can be probed end-to-end without the observation
+            // queue; the POST check still asserts via seen_for.
+            let mut reflection = format!("{{\"method\":\"{method}\",\"headers\":[");
+            let mut first = true;
+            for (name, value) in request_headers {
+                if !first {
+                    reflection.push(',');
+                }
+                first = false;
+                reflection.push_str(&format!(
+                    "\"{}:{}\"",
+                    name,
+                    String::from_utf8_lossy(value.as_bytes())
+                ));
+            }
+            reflection.push_str(&format!(
+                "],\"body\":\"{}\"}}",
+                String::from_utf8_lossy(&request_body)
+            ));
+            ok(StatusCode::OK, boxed(Full::new(Bytes::from(reflection))))
+        }
         "/redirect" => {
             let mut response = ok(
                 StatusCode::FOUND,
@@ -359,7 +390,17 @@ pub fn post_reaches_server(t: &dyn Transport, server: &HttpServer) {
         "post echo body",
         response.body.map(|c| c.unwrap()).collect::<Vec<_>>(),
     );
-    assert_eq!(body.concat(), br#"{"conformance":"post"}"#.to_vec());
+    // /echo reflects the request as JSON (method, headers, body); the
+    // observation queue below stays the authoritative header assertion.
+    let reflection = String::from_utf8_lossy(&body.concat()).into_owned();
+    assert!(
+        reflection.contains(r#""method":"POST""#),
+        "method not reflected: {reflection}"
+    );
+    assert!(
+        reflection.contains("conformance"),
+        "body not reflected: {reflection}"
+    );
 
     let seen = server.seen_for("/echo");
     assert_eq!(seen.method, "POST");
@@ -504,7 +545,9 @@ pub fn held_body_does_not_block_new_requests(t: &dyn Transport, server: &HttpSer
 /// finish before the remaining chunks are fed, which happens only below.
 pub fn slow_upload_does_not_block_new_requests(t: &dyn Transport, server: &HttpServer) {
     let (body, feed) = monet_core::body::channel();
-    let mut request = Request::new(Method::Post, server.url("/upload"));
+    let mut request = Request::new(Method::Post, server.url("/upload"))
+        .with_header("content-type", "application/octet-stream")
+        .unwrap();
     request.body = body;
     feed.send_chunk("part-").unwrap();
 

@@ -24,6 +24,25 @@ impl CheckReport {
     pub fn passed(&self) -> bool {
         self.failure.is_none()
     }
+
+    /// `true` when the check is a documented skip (a manual-verdict item:
+    /// the check cannot run in this environment by design, with the
+    /// reason in the message). Convention: the failure message starts
+    /// with `skipped:`.
+    pub fn skipped(&self) -> bool {
+        self.failure
+            .as_ref()
+            .is_some_and(|message| message.starts_with("skipped:"))
+    }
+}
+
+/// Records a documented skip — a check that cannot run in this
+/// environment (see [`CheckReport::skipped`]).
+pub fn skip(name: &'static str, reason: &str) -> CheckReport {
+    CheckReport {
+        name,
+        failure: Some(format!("skipped: {reason}")),
+    }
 }
 
 /// Runs `body`, converting a panic into a failed [`CheckReport`].
@@ -38,19 +57,26 @@ where
 }
 
 /// Renders a report set, one line per check:
-/// `name: OK` or `name: FAILED — message`.
+/// `name: OK`, `name: SKIP — reason`, or `name: FAILED — message`.
 pub fn format(reports: &[CheckReport]) -> String {
     let mut out = String::new();
     for report in reports {
         match &report.failure {
             None => out.push_str(&format!("{}: OK\n", report.name)),
+            Some(message) if report.skipped() => {
+                out.push_str(&format!("{}: SKIP — {message}\n", report.name));
+            }
             Some(message) => {
                 out.push_str(&format!("{}: FAILED — {message}\n", report.name));
             }
         }
     }
     let passed = reports.iter().filter(|r| r.passed()).count();
-    out.push_str(&format!("{passed}/{} passed", reports.len()));
+    let skipped = reports.iter().filter(|r| r.skipped()).count();
+    out.push_str(&format!("{passed}/{} passed", reports.len() - skipped));
+    if skipped > 0 {
+        out.push_str(&format!(" ({skipped} skipped)"));
+    }
     out
 }
 
