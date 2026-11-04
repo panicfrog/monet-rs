@@ -1,0 +1,22 @@
+[package]
+name = "monet-httpengine"
+description = "Android platform HTTP transport (android.net.http.HttpEngine, API 34+) for monet-core."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+monet-core = { path = "../monet-core" }
+bytes.workspace = true
+futures-channel.workspace = true
+futures-lite.workspace = true
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.22"
+
+[dev-dependencies]
+futures-timer = "3"
+
+[lints]
+workspace = true

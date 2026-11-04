@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Two roles, one file:
+  - The fixture CA anchors TLS trust app-wide for the platform-verifier
+    battery. It must live in <base-config>: the verifier calls
+    checkServerTrusted without endpoint context, and Conscrypt only
+    applies <domain-config> anchors when the domain is known — so a
+    domain-scoped anchor would never be seen. The system CAs stay
+    trusted alongside it.
+  - Cleartext is permitted for loopback only: the conformance servers
+    are plain HTTP on 127.0.0.1, and the platform Cronet (unlike our
+    Rust transports) enforces NSC's cleartext policy.
+-->
+<network-security-config>
+    <base-config>
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="@raw/monet_fixture_ca" />
+        </trust-anchors>
+    </base-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">localhost</domain>
+    </domain-config>
+</network-security-config>

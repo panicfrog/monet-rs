@@ -855,6 +855,7 @@ dependencies = [
 name = "monet-conformance"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "bytes",
  "futures-channel",
  "futures-lite",
@@ -910,14 +911,29 @@ name = "monet-demo"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "bytes",
+ "futures-lite",
  "jni",
  "monet-conformance",
  "monet-core",
+ "monet-httpengine",
  "monet-rustls",
  "monet-tls",
  "monet-urlsession",
  "monet-ws",
  "rustls-platform-verifier",
+]
+
+[[package]]
+name = "monet-httpengine"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures-channel",
+ "futures-lite",
+ "futures-timer",
+ "jni",
+ "monet-core",
 ]
 
 [[package]]

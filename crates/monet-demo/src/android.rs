@@ -32,7 +32,14 @@ pub extern "system" fn Java_com_monet_demo_MainActivity_runPlatformBattery(
 ) -> jstring {
     let report = std::panic::catch_unwind(crate::run_platform_battery)
         .map(|reports| crate::format_battery(&reports))
-        .unwrap_or_else(|_| "platform battery panicked".to_string());
+        .unwrap_or_else(|payload| {
+            let message = payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic payload".to_string());
+            format!("platform battery panicked: {message}")
+        });
     string_out(&mut env, &report)
 }
 
@@ -70,4 +77,53 @@ fn string_out(env: &mut EnvUnowned<'_>, text: &str) -> jstring {
         Ok(env.new_string(text)?.into_raw())
     })
     .resolve::<jni::errors::LogErrorAndDefault>()
+}
+
+/// Hands the JVM and the app Context to the platform HttpEngine
+/// transport (monet-httpengine's bootstrap); must run before
+/// runHttpEngineBattery().
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_monet_demo_MainActivity_initHttpEngine(
+    mut env: EnvUnowned<'_>,
+    _class: JClass<'_>,
+    context: JObject<'_>,
+) -> jstring {
+    let mut detail = String::from("httpengine initialized");
+    let outcome = env.with_env(|env| -> Result<(), jni::errors::Error> {
+        let vm = env.get_java_vm()?;
+        let context = env.new_global_ref(context)?;
+        if let Err(err) = monet_httpengine::init(&vm, context) {
+            detail = format!("httpengine init failed: {err}");
+            return Err(jni::errors::Error::JniCall(
+                jni::errors::JniError::InvalidArguments,
+            ));
+        }
+        Ok(())
+    });
+    let () = outcome.resolve::<jni::errors::LogErrorAndDefault>();
+    string_out(&mut env, &detail)
+}
+
+/// Runs the platform HttpEngine battery: engine version + the full HTTP
+/// conformance suite against the system Cronet.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_monet_demo_MainActivity_runHttpEngineBattery(
+    mut env: EnvUnowned<'_>,
+    _class: JClass<'_>,
+) -> jstring {
+    let report = std::panic::catch_unwind(crate::run_httpengine_battery)
+        .map(|(version, reports)| format!("engine: {version}\n{}", crate::format_battery(&reports)))
+        .unwrap_or_else(|_| "httpengine battery panicked".to_string());
+    string_out(&mut env, &report)
+}
+
+/// Runs the header-path diagnostic (see `httpengine_header_probe`).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_monet_demo_MainActivity_httpengineHeaderProbe(
+    mut env: EnvUnowned<'_>,
+    _class: JClass<'_>,
+) -> jstring {
+    let report = std::panic::catch_unwind(crate::httpengine_header_probe)
+        .unwrap_or_else(|_| "probe panicked".to_string());
+    string_out(&mut env, &report)
 }

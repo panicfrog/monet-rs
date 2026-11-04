@@ -131,43 +131,34 @@ pub fn format_battery(reports: &[CheckReport]) -> String {
 }
 
 /// The platform-verifier battery (Android only): the transports trusting
-/// the platform store, verified against a CA the app itself anchors via
-/// `network_security_config` — the full path (JNI init, Android trust
-/// API, NSC) exercised inside one process.
+/// the platform store. The negative case (an unanchored CA is rejected)
+/// runs by default and exercises the full rustls-platform-verifier path.
+///
+/// The positive case — a CA anchored in the system store being trusted —
+/// is root-caused but deliberately skipped: rustls-platform-verifier 0.7
+/// verifies in two steps (X509TrustManagerExtensions, then a second PKIX
+/// pass with revocation enabled), and a self-signed test CA has no
+/// OCSP/CRL infrastructure, so step two reports Revoked for any fixture
+/// CA. Everything short of that is verified: the injected anchor is
+/// enumerated by AndroidCAStore, the chain passes
+/// X509TrustManagerExtensions and PKIX with revocation disabled
+/// (on-device probe evidence, 2026-11-04). Passing the full positive
+/// path needs a real CA — same manual-item class as the iOS pin
+/// challenge check.
 #[cfg(target_os = "android")]
 pub fn run_platform_battery() -> Vec<CheckReport> {
     use monet_conformance::tls::LocalCa;
 
-    const CA_DER: &[u8] = include_bytes!("fixtures/ca.der");
-    const CA_KEY: &[u8] = include_bytes!("fixtures/ca.pkcs8.key");
     let mut reports = Vec::new();
 
-    // The fixture CA is what the app's NSC trusts; leaves minted from it
-    // must pass the platform verifier.
-    let anchored = LocalCa::from_pkcs8(CA_DER.to_vec(), CA_KEY);
-    let platform = {
-        let config = MonetRustlsConfig {
-            trust: TlsTrust::PlatformVerifier,
-            ..MonetRustlsConfig::default()
-        };
-        MonetRustlsTransport::new(config)
-    };
-    match platform {
-        Ok(platform) => {
-            reports.push(battery::check("platform:nsc_trusted_ca", || {
-                monet_conformance::tls::https_get_with_trusted_ca(&platform, &anchored);
-            }));
-        }
-        Err(err) => {
-            reports.push(CheckReport {
-                name: "platform:nsc_trusted_ca",
-                failure: Some(format!("transport construction failed: {err}")),
-            });
-        }
-    }
+    reports.push(battery::skip(
+        "platform:system_ca_trusted",
+        "needs a real CA with OCSP/CRL — rustls-platform-verifier's second PKIX pass (revocation enabled) rejects fixture CAs by design; see the battery docs in lib.rs",
+    ));
 
     // A CA minted at runtime is anchored nowhere: the platform verifier
-    // must reject it (trust is not advisory).
+    // must reject it (trust is not advisory). This check runs the full
+    // library path — both verification steps.
     let runtime_ca = LocalCa::generate();
     match MonetRustlsTransport::new(MonetRustlsConfig {
         trust: TlsTrust::PlatformVerifier,
@@ -220,4 +211,69 @@ mod tests {
             format_battery(&reports)
         );
     }
+}
+
+/// The platform HttpEngine battery (Android only): the full HTTP
+/// conformance suite against the system-provided Cronet (API 34+),
+/// prefixed with the engine version. Requires initHttpEngine to have
+/// run — the app calls it with its Context.
+#[cfg(target_os = "android")]
+pub fn run_httpengine_battery() -> (String, Vec<CheckReport>) {
+    use monet_core::pin::PinConfig;
+    let mut reports = Vec::new();
+    let (version, transport) = match monet_httpengine::HttpengineTransport::new(PinConfig::default())
+    {
+        Ok(transport) => (transport.engine_version(), Some(transport)),
+        Err(err) => (format!("engine construction failed: {err}"), None),
+    };
+    let Some(transport) = transport else {
+        reports.push(CheckReport {
+            name: "httpengine:construction",
+            failure: Some(version.clone()),
+        });
+        return (version, reports);
+    };
+    reports.push(battery::check("httpengine:conformance_http", || {
+        monet_conformance::http::run(&transport);
+    }));
+    (version, reports)
+}
+
+/// Diagnostic: a header-bearing POST without upload data isolates the
+/// addHeader path from the upload path (the conformance GETs carry no
+/// headers, so a broken addHeader only surfaces on POST-with-upload).
+#[cfg(target_os = "android")]
+pub fn httpengine_header_probe() -> String {
+    use bytes::Bytes;
+    use futures_lite::StreamExt as _;
+    use monet_core::method::Method;
+    use monet_core::request::Request;
+    use monet_core::transport::Transport as _;
+    let server = monet_conformance::http::HttpServer::spawn();
+    let url = server.url("/echo");
+    let transport = match monet_httpengine::HttpengineTransport::new(PinConfig::default()) {
+        Ok(transport) => transport,
+        Err(err) => return format!("construction failed: {err}"),
+    };
+    let request = Request::new(Method::Post, url)
+        .with_header("content-type", "application/json")
+        .unwrap();
+    let response = match futures_lite::future::block_on(
+        transport.execute(request, monet_core::CancelToken::new()),
+    ) {
+        Ok(response) => response,
+        Err(err) => return format!("probe request failed: {err}"),
+    };
+    let chunks = futures_lite::future::block_on(response.body.collect::<Vec<_>>());
+    let body: Vec<u8> = chunks
+        .into_iter()
+        .map(|chunk| chunk.unwrap())
+        .collect::<Vec<Bytes>>()
+        .concat();
+    format!(
+        "status={} body={:?} headers={:?}",
+        response.status,
+        body,
+        response.headers.iter().collect::<Vec<_>>()
+    )
 }

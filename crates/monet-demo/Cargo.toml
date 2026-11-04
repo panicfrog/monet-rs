@@ -17,8 +17,11 @@ monet-rustls = { path = "../monet-rustls", features = ["platform-verifier"] }
 monet-tls = { path = "../monet-tls", features = ["platform-verifier"] }
 monet-ws = { path = "../monet-ws", features = ["platform-verifier"] }
 base64.workspace = true
+bytes.workspace = true
+futures-lite.workspace = true
 
 [target.'cfg(target_os = "android")'.dependencies]
+monet-httpengine = { path = "../monet-httpengine" }
 jni = "0.22"
 rustls-platform-verifier = "0.7"
 

@@ -40,3 +40,9 @@ val cargoBuild by tasks.registering(Exec::class) {
 tasks.matching { it.name.startsWith("preBuild") }.configureEach {
     dependsOn(cargoBuild)
 }
+
+dependencies {
+    // The JVM component of rustls-platform-verifier (matches the native
+    // crate via the rustls-platform-verifier-android version-sync crate).
+    implementation(files("libs/rustls-platform-verifier-0.2.0.aar"))
+}
