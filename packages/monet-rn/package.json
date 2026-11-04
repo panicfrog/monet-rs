@@ -1,0 +1,24 @@
+{
+  "name": "monet-rn",
+  "version": "0.1.0",
+  "description": "monet for React Native: native transports behind a Rust TurboModule (URLSession on iOS, hyper+rustls on Android) behind a WHATWG-fetch-compatible TS layer.",
+  "license": "MIT",
+  "main": "generated/rust-turbo/Monet.ts",
+  "files": [
+    "src/",
+    "ts/",
+    "vendor/",
+    "scripts/",
+    "Cargo.toml"
+  ],
+  "scripts": {
+    "sync-vendor": "./scripts/sync-vendor.sh"
+  },
+  "rust-turbo": {
+    "crate": ".",
+    "crateName": "monet-rn",
+    "modules": [
+      "Monet"
+    ]
+  }
+}

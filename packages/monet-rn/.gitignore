@@ -1,0 +1,4 @@
+# macro-generated TypeScript (rebuilt from the Rust sources)
+/generated/
+# rsynced from crates/ by scripts/sync-vendor.sh (regenerate before building the app)
+/vendor/

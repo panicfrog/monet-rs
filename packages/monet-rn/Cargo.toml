@@ -1,0 +1,75 @@
+# The monet React Native module package: one #[RustTurboModule("Monet")]
+# wrapping monet-core's Client over the platform's native stack (URLSession
+# on iOS, hyper+rustls + tungstenite on Android).
+[package]
+name = "monet-rn"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[lib]
+# consumed by the app's aggregate library (built by react-native-rust-turbo)
+crate-type = ["lib"]
+
+# standalone on purpose: the framework crates below resolve through the
+# consumer app's node_modules, which only exists there — keeping this crate
+# out of the repo workspace avoids resolving them here.
+# GENERATED-BY sync-vendor.sh (workspace section) — do not edit: the vendored crates inherit their
+# `x.workspace = true` against these tables (copied verbatim from the repo
+# root) when cargo binds them to this crate's [workspace] — see the script
+# header for the two binding contexts.
+[workspace]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+base64 = "0.22"
+bytes = "1"
+futures-channel = "0.3"
+futures-core = "0.3"
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+futures-lite = "2"
+indexmap = "2"
+serde_json = "1"
+thiserror = "2"
+url = "2"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[dependencies]
+# the framework crates come from the core package's rust/ dir (a sibling
+# in node_modules) — one copy in the cargo graph
+jsi = { path = "../react-native-rust-turbo/rust/jsi", default-features = false, features = ["macros", "serde"] }
+jsi-turbo = { path = "../react-native-rust-turbo/rust/jsi-turbo" }
+linkme = "0.3"
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+
+# The monet crates ship vendored (vendor/ — rsynced from the repo's crates/
+# by scripts/sync-vendor.sh; crates/ stays the single source of truth where
+# the host tests and conformance batteries run). Path deps must stay inside
+# this package: the aggregate build resolves them from node_modules.
+monet-core = { path = "vendor/monet-core" }
+
+# The smol-family executor drives the top-level futures. Every monet
+# transport exposes runtime-agnostic BoxFutures (rustls/ws keep private
+# tokio runtimes, urlsession has none), so this is the only executor needed.
+async-global-executor = "2"
+futures-lite = "2"
+
+[target.'cfg(any(target_os = "ios", target_os = "macos"))'.dependencies]
+# the native stack: URLSession HTTP, NWConnection WebSocket, system trust
+monet-urlsession = { path = "vendor/monet-urlsession" }
+
+[target.'cfg(target_os = "android")'.dependencies]
+# the pure-Rust stack: hyper+h2+rustls HTTP, tokio-tungstenite WebSocket,
+# the Android system trust store via rustls-platform-verifier
+monet-rustls = { path = "vendor/monet-rustls" }
+monet-ws = { path = "vendor/monet-ws" }

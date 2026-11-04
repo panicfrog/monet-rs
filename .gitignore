@@ -11,6 +11,11 @@ DerivedData/
 xcuserdata/
 *.xcarchive/
 *.xcodeproj/
+# ...except the RN demo app's Xcode project — it is source, not a local
+# experiment. Re-include the directory first, then its contents (gitignore
+# cannot re-include files under an excluded directory).
+!platform/rn-demo/ios/MonetDemo.xcodeproj/
+!platform/rn-demo/ios/MonetDemo.xcodeproj/**
 
 # Gradle / Android (platform/android-demo)
 .gradle/
