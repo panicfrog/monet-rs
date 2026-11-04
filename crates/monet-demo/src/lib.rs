@@ -193,6 +193,9 @@ fn mismatched_pins(host: &str) -> PinConfig {
 #[cfg(target_os = "android")]
 mod android;
 
+#[cfg(any(target_os = "ios", target_os = "macos"))]
+mod apple;
+
 #[cfg(test)]
 mod tests {
     use super::*;

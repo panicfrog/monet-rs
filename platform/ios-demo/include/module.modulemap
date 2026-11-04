@@ -1,0 +1,4 @@
+module monet_demo {
+    header "monet_demo.h"
+    export *
+}

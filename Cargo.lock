@@ -915,6 +915,7 @@ dependencies = [
  "monet-core",
  "monet-rustls",
  "monet-tls",
+ "monet-urlsession",
  "monet-ws",
  "rustls-platform-verifier",
 ]
