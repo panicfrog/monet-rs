@@ -46,6 +46,14 @@ pub fn run_battery() -> Vec<CheckReport> {
     reports.push(battery::check("http:cancel_after_head_aborts_body", || {
         http(monet_conformance::http::cancel_after_head_aborts_body)
     }));
+    reports.push(battery::check(
+        "http:held_body_does_not_block_new_requests",
+        || http(monet_conformance::http::held_body_does_not_block_new_requests),
+    ));
+    reports.push(battery::check(
+        "http:slow_upload_does_not_block_new_requests",
+        || http(monet_conformance::http::slow_upload_does_not_block_new_requests),
+    ));
 
     // ---- TLS: trust roots and pin policy over a fresh CA ----
     let ca = monet_conformance::tls::LocalCa::generate();

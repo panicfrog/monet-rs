@@ -12,7 +12,7 @@
 // Exported symbols are the whole point of this module.
 #![allow(unsafe_code)]
 
-use std::ffi::{c_char, CString};
+use std::ffi::{CString, c_char};
 
 use monet_conformance::{battery, http, ws};
 use monet_urlsession::UrlsessionTransport;
@@ -48,7 +48,12 @@ pub fn run_battery_apple() -> Vec<battery::CheckReport> {
     let mut reports = Vec::new();
     let server = http::HttpServer::spawn();
 
-    http_check(&mut reports, "http:get_plain_body", &server, http::get_plain_body);
+    http_check(
+        &mut reports,
+        "http:get_plain_body",
+        &server,
+        http::get_plain_body,
+    );
     http_check(
         &mut reports,
         "http:get_chunked_content",
@@ -79,16 +84,35 @@ pub fn run_battery_apple() -> Vec<battery::CheckReport> {
         &server,
         http::cancel_after_head_aborts_body,
     );
+    http_check(
+        &mut reports,
+        "http:held_body_does_not_block_new_requests",
+        &server,
+        http::held_body_does_not_block_new_requests,
+    );
+    http_check(
+        &mut reports,
+        "http:slow_upload_does_not_block_new_requests",
+        &server,
+        http::slow_upload_does_not_block_new_requests,
+    );
     reports.push(battery::check("http:connection_refused", || {
         let transport = UrlsessionTransport::new();
         http::connection_refused_maps_to_transport_error(&transport);
     }));
-    reports.push(battery::check("http:timeout_maps_to_transport_error", || {
-        let transport = UrlsessionTransport::new().with_timeout_ms(100);
-        http::timeout_maps_to_transport_error(&transport, &server);
-    }));
+    reports.push(battery::check(
+        "http:timeout_maps_to_transport_error",
+        || {
+            let transport = UrlsessionTransport::new().with_timeout_ms(100);
+            http::timeout_maps_to_transport_error(&transport, &server);
+        },
+    ));
 
-    ws_check(&mut reports, "ws:round_trips", ws::text_and_binary_round_trip);
+    ws_check(
+        &mut reports,
+        "ws:round_trips",
+        ws::text_and_binary_round_trip,
+    );
     ws_check(
         &mut reports,
         "ws:close_code_fidelity",
@@ -118,10 +142,8 @@ pub fn run_battery_apple() -> Vec<battery::CheckReport> {
 /// [`monet_demo_free_string`].
 #[unsafe(no_mangle)]
 pub extern "C" fn monet_demo_run_battery() -> *mut c_char {
-    let text = std::panic::catch_unwind(|| {
-        crate::format_battery(&run_battery_apple())
-    })
-    .unwrap_or_else(|_| "battery panicked".to_string());
+    let text = std::panic::catch_unwind(|| crate::format_battery(&run_battery_apple()))
+        .unwrap_or_else(|_| "battery panicked".to_string());
     CString::into_raw(CString::new(text).expect("battery report has no NUL bytes"))
 }
 

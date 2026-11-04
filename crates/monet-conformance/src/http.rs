@@ -65,6 +65,10 @@ impl HttpServer {
     {
         let (addr_tx, addr_rx) = mpsc::channel();
         let (seen_tx, seen_rx) = mpsc::channel();
+        // The concurrency gate: `/held`'s tail is released only once `/fast`
+        // has been seen — the held-download check builds its deadlock-proof
+        // on it (see `held_body_does_not_block_new_requests`).
+        let gate = std::sync::Arc::new(tokio::sync::Notify::new());
         std::thread::Builder::new()
             .name("monet-conformance-http".into())
             .spawn(move || {
@@ -85,8 +89,10 @@ impl HttpServer {
                             Err(_) => continue,
                         };
                         let seen_tx = seen_tx.clone();
+                        let gate = gate.clone();
                         let service = service_fn(move |req: HyperRequest<Incoming>| {
                             let seen_tx = seen_tx.clone();
+                            let gate = gate.clone();
                             async move {
                                 let (parts, body) = req.into_parts();
                                 let body = body.collect().await.unwrap().to_bytes();
@@ -106,13 +112,19 @@ impl HttpServer {
                                     body: body.to_vec(),
                                 });
                                 Ok::<_, std::convert::Infallible>(
-                                    respond(parts.uri.path(), body.to_vec()).await,
+                                    respond(parts.uri.path(), body.to_vec(), &gate).await,
                                 )
                             }
                         });
-                        let _ = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
-                            .serve_connection(TokioIo::new(io), service)
-                            .await;
+                        // Each connection is served concurrently: the
+                        // concurrency checks hold one connection open
+                        // mid-body while a second request needs another.
+                        tokio::spawn(async move {
+                            let _ =
+                                hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+                                    .serve_connection(TokioIo::new(io), service)
+                                    .await;
+                        });
                     }
                 });
             })
@@ -162,10 +174,11 @@ impl HttpServer {
 }
 
 /// Answers one route. `request_body` is the body the check sent — the
-/// echo route reflects it.
+/// echo route reflects it. `gate` is the concurrency gate (see `/fast`).
 async fn respond(
     path: &str,
     request_body: Vec<u8>,
+    gate: &std::sync::Arc<tokio::sync::Notify>,
 ) -> HyperResponse<BoxBody<Bytes, std::convert::Infallible>> {
     match path {
         "/plain" => ok(
@@ -238,6 +251,46 @@ async fn respond(
                 boxed(http_body_util::StreamBody::new(stream)),
             )
         }
+        // The concurrency-gate routes. `/fast` answers immediately and
+        // releases `/held`'s tail; both exist only for the concurrency
+        // checks, so their paths stay unique to those checks.
+        "/fast" => {
+            gate.notify_one();
+            ok(
+                StatusCode::OK,
+                boxed(Full::new(Bytes::from_static(b"fast"))),
+            )
+        }
+        // Head plus a big first chunk right away (big so transports that
+        // coalesce small chunks still deliver it on its own), then the
+        // tail held until `/fast` is seen — mid-body, held open.
+        "/held" => {
+            let gate = std::sync::Arc::clone(gate);
+            let stream = futures_lite::stream::iter(0..2).then(move |i| {
+                let gate = std::sync::Arc::clone(&gate);
+                async move {
+                    if i > 0 {
+                        gate.notified().await;
+                    }
+                    Ok(Frame::data(Bytes::from(if i == 0 {
+                        vec![b'a'; 512 * 1024]
+                    } else {
+                        b"omega".to_vec()
+                    })))
+                }
+            });
+            ok(
+                StatusCode::OK,
+                boxed(http_body_util::StreamBody::new(stream)),
+            )
+        }
+        // Answers only after the whole upload arrived (every request body
+        // is collected above before responding) — an upload endpoint whose
+        // response itself proves the request finished.
+        "/upload" => ok(
+            StatusCode::OK,
+            boxed(Full::new(Bytes::from_static(b"uploaded"))),
+        ),
         _ => ok(StatusCode::NOT_FOUND, boxed(Full::new(Bytes::new()))),
     }
 }
@@ -404,6 +457,91 @@ pub fn timeout_maps_to_transport_error(t: &dyn Transport, server: &HttpServer) {
     assert!(matches!(err, Error::Transport { .. }), "got: {err:?}");
 }
 
+/// While a download's body is held open (`/held`'s tail is released only
+/// when `/fast` is seen), a second request must complete: an in-flight
+/// transfer never blocks new requests from going out. If the transport
+/// serialized requests, this check would time out — the held tail cannot
+/// arrive before `/fast` is seen, and `/fast` cannot be seen before this
+/// very request goes out.
+pub fn held_body_does_not_block_new_requests(t: &dyn Transport, server: &HttpServer) {
+    let held = wait_for(
+        "held response head",
+        t.execute(get(server.url("/held")), CancelToken::new()),
+    )
+    .unwrap();
+    assert_eq!(held.status, 200);
+    let mut body = held.body;
+    let first = wait_for("held first chunk", body.next()).unwrap().unwrap();
+    assert!(!first.is_empty(), "no data arrived with the head");
+
+    // While the tail is held open, a second request completes.
+    let fast = wait_for(
+        "fast response head",
+        t.execute(get(server.url("/fast")), CancelToken::new()),
+    )
+    .unwrap();
+    assert_eq!(fast.status, 200);
+    let fast_body = wait_for(
+        "fast body",
+        fast.body.map(|c| c.unwrap()).collect::<Vec<_>>(),
+    );
+    assert_eq!(fast_body.concat(), b"fast".to_vec());
+
+    // The tail is released only by the `/fast` request above — it arrives
+    // now and the held download completes.
+    let rest = wait_for("held tail", body.map(|c| c.unwrap()).collect::<Vec<_>>());
+    let all: Vec<u8> = first.iter().copied().chain(rest.concat()).collect();
+    assert_eq!(all.len(), 512 * 1024 + b"omega".len());
+    assert_eq!(&all[all.len() - 5..], b"omega");
+}
+
+/// While an upload is in flight — its body fed slowly, so the request
+/// cannot possibly have finished — a second request must complete. The
+/// streaming transports have the upload on the wire; the buffered-upload
+/// transports hold the request while draining it; either way the
+/// in-flight request must not block new ones. If the transport
+/// serialized requests, this check would time out: the upload cannot
+/// finish before the remaining chunks are fed, which happens only below.
+pub fn slow_upload_does_not_block_new_requests(t: &dyn Transport, server: &HttpServer) {
+    let (body, feed) = monet_core::body::channel();
+    let mut request = Request::new(Method::Post, server.url("/upload"));
+    request.body = body;
+    feed.send_chunk("part-").unwrap();
+
+    std::thread::scope(|scope| {
+        let upload =
+            scope.spawn(|| wait_for("upload outcome", t.execute(request, CancelToken::new())));
+        // Let the request reach the wire (or the drain start).
+        std::thread::sleep(Duration::from_millis(150));
+
+        let plain = wait_for(
+            "second response head",
+            t.execute(get(server.url("/plain")), CancelToken::new()),
+        )
+        .unwrap();
+        assert_eq!(plain.status, 200);
+        let plain_body = wait_for(
+            "second body",
+            plain.body.map(|c| c.unwrap()).collect::<Vec<_>>(),
+        );
+        assert_eq!(plain_body.concat(), b"plain".to_vec());
+
+        feed.send_chunk("two").unwrap();
+        feed.complete();
+        let uploaded = upload.join().unwrap().unwrap();
+        assert_eq!(uploaded.status, 200);
+        let uploaded_body = wait_for(
+            "uploaded body",
+            uploaded.body.map(|c| c.unwrap()).collect::<Vec<_>>(),
+        );
+        assert_eq!(uploaded_body.concat(), b"uploaded".to_vec());
+    });
+
+    let seen = server.seen_for("/upload");
+    assert_eq!(seen.method, "POST");
+    assert_eq!(seen.body, b"part-two".to_vec());
+}
+
 /// The core battery: everything except the two checks that need their
 /// own transport configuration (`connection_refused…` works on any
 /// instance but takes no server; `timeout…` needs a timeout-configured
@@ -415,6 +553,8 @@ pub fn run_suite(t: &dyn Transport, server: &HttpServer) {
     redirect_followed_by_default(t, server);
     pre_cancelled_fails_fast(t, server);
     cancel_after_head_aborts_body(t, server);
+    held_body_does_not_block_new_requests(t, server);
+    slow_upload_does_not_block_new_requests(t, server);
 }
 
 /// Convenience: spawn a server and run the core battery plus the
