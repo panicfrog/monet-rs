@@ -108,7 +108,8 @@ fn main() {
     let swift_files = collect_swift_sources(&manifest_dir.join("swift"));
     assert!(!swift_files.is_empty(), "no Swift sources found in swift/");
 
-    let mut swiftc = swiftc_command(&target_os);
+    let target_triple = env::var("TARGET").unwrap_or_default();
+    let mut swiftc = swiftc_command(&target_triple);
     swiftc
         .arg("-parse-as-library")
         .arg("-emit-library")
@@ -169,29 +170,39 @@ fn collect_swift_sources(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Resolves `swiftc` (host build) or the SDK-wrapped cross invocation.
-fn swiftc_command(target_os: &str) -> Command {
+/// Resolves `swiftc` (host build) or the SDK-wrapped cross invocation.
+/// Device and simulator builds are distinguished by the full target
+/// triple, not CARGO_CFG_TARGET_OS (both report "ios").
+fn swiftc_command(target: &str) -> Command {
     let mut command = Command::new("xcrun");
-    match target_os {
-        "macos" => {
-            command.arg("swiftc");
-        }
-        "ios" => {
-            let sdk = String::from_utf8(
-                Command::new("xcrun")
-                    .args(["--sdk", "iphoneos", "--show-sdk-path"])
-                    .output()
-                    .expect("xcrun iphoneos sdk")
-                    .stdout,
-            )
-            .expect("utf8 sdk path")
-            .trim()
-            .to_string();
-            command.args(["--sdk", "iphoneos", "swiftc"]);
-            command.arg("-target").arg("arm64-apple-ios17.0");
-            command.arg("-sdk").arg(sdk);
-        }
-        _ => unreachable!(),
+    if target.contains("-apple-darwin") || target == "aarch64-apple-macos" {
+        command.arg("swiftc");
+        return command;
     }
+    let (sdk_name, llvm_target) =
+        if target.ends_with("-sim") || target.starts_with("x86_64-apple-ios") {
+            let arch = target.split('-').next().unwrap_or("arm64");
+            let sim_arch = if arch == "aarch64" { "arm64" } else { arch };
+            (
+                "iphonesimulator",
+                format!("{sim_arch}-apple-ios17.0-simulator"),
+            )
+        } else {
+            ("iphoneos", "arm64-apple-ios17.0".to_string())
+        };
+    let sdk = String::from_utf8(
+        Command::new("xcrun")
+            .args(["--sdk", sdk_name, "--show-sdk-path"])
+            .output()
+            .unwrap_or_else(|e| panic!("xcrun {sdk_name} sdk: {e}"))
+            .stdout,
+    )
+    .expect("utf8 sdk path")
+    .trim()
+    .to_string();
+    command.args(["--sdk", sdk_name, "swiftc"]);
+    command.arg("-target").arg(llvm_target);
+    command.arg("-sdk").arg(sdk);
     command
 }
 
