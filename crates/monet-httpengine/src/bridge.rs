@@ -32,7 +32,7 @@ fn requests() -> &'static RequestMap {
 type Policy = jni::errors::ThrowRuntimeExAndDefault;
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_monet_demo_httpengine_HttpEngineBridge_onStarted(
+pub extern "system" fn native_on_started(
     mut env: EnvUnowned<'_>,
     _class: JClass<'_>,
     id: jlong,
@@ -94,7 +94,7 @@ pub extern "system" fn Java_com_monet_demo_httpengine_HttpEngineBridge_onStarted
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_monet_demo_httpengine_HttpEngineBridge_onReadCompleted(
+pub extern "system" fn native_on_read_completed(
     mut env: EnvUnowned<'_>,
     _class: JClass<'_>,
     id: jlong,
@@ -136,7 +136,7 @@ pub extern "system" fn Java_com_monet_demo_httpengine_HttpEngineBridge_onReadCom
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_monet_demo_httpengine_HttpEngineBridge_onRedirect(
+pub extern "system" fn native_on_redirect(
     mut env: EnvUnowned<'_>,
     _class: JClass<'_>,
     _id: jlong,
@@ -160,7 +160,7 @@ pub extern "system" fn Java_com_monet_demo_httpengine_HttpEngineBridge_onRedirec
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_monet_demo_httpengine_HttpEngineBridge_onSucceeded(
+pub extern "system" fn native_on_succeeded(
     _env: EnvUnowned<'_>,
     _class: JClass<'_>,
     id: jlong,
@@ -172,7 +172,7 @@ pub extern "system" fn Java_com_monet_demo_httpengine_HttpEngineBridge_onSucceed
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_monet_demo_httpengine_HttpEngineBridge_onFailed(
+pub extern "system" fn native_on_failed(
     mut env: EnvUnowned<'_>,
     _class: JClass<'_>,
     id: jlong,
@@ -199,7 +199,7 @@ pub extern "system" fn Java_com_monet_demo_httpengine_HttpEngineBridge_onFailed(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_monet_demo_httpengine_HttpEngineBridge_onCanceled(
+pub extern "system" fn native_on_canceled(
     _env: EnvUnowned<'_>,
     _class: JClass<'_>,
     id: jlong,

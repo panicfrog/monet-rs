@@ -92,7 +92,11 @@ pub extern "system" fn Java_com_monet_demo_MainActivity_initHttpEngine(
     let outcome = env.with_env(|env| -> Result<(), jni::errors::Error> {
         let vm = env.get_java_vm()?;
         let context = env.new_global_ref(context)?;
-        if let Err(err) = monet_httpengine::init(&vm, context) {
+        if let Err(err) = monet_httpengine::init(
+            &vm,
+            context,
+            "com.monet.demo.httpengine.HttpEngineBridge",
+        ) {
             detail = format!("httpengine init failed: {err}");
             return Err(jni::errors::Error::JniCall(
                 jni::errors::JniError::InvalidArguments,

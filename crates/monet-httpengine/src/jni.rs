@@ -25,7 +25,14 @@ use crate::registry;
 
 /// The host app's bridge classes (the Kotlin side stays mechanical; see
 /// the plan doc). monet-rn will parameterize this via RegisterNatives.
-const BRIDGE_PKG: &str = "com.monet.demo.httpengine";
+/// The Kotlin bridge classes live with the embedder (the demo app,
+/// monet-rn); their names are resolved through the app class loader at
+/// setup time using this prefix, configured per embedder.
+static BRIDGE_PKG: OnceLock<String> = OnceLock::new();
+
+pub(crate) fn bridge_pkg() -> &'static str {
+    BRIDGE_PKG.get().map(String::as_str).unwrap_or("com.monet.demo.httpengine")
+}
 
 /// Minimum platform level with `android.net.http.HttpEngine`.
 const MIN_SDK: i32 = 34;
@@ -75,14 +82,28 @@ static READ_BUFFERS: LazyLock<Mutex<HashMap<u64, ReadBuffer>>> =
 
 /// Bootstrap: stores the JVM, the app Context, and the app class loader
 /// (bridge classes live in the app; platform classes are in the boot
-/// classpath). Mirrors rustls-platform-verifier's Android init.
-pub fn init(vm: &JavaVM, context: Global<JObject<'static>>) -> Result<()> {
+/// classpath), then binds the six native callbacks onto the host's
+/// bridge class via `RegisterNatives` — the class name is a parameter, so
+/// each embedder (the demo app, monet-rn) ships its own Kotlin bridge
+/// under its own package. Mirrors rustls-platform-verifier's Android
+/// init shape.
+pub fn init(
+    vm: &JavaVM,
+    context: Global<JObject<'static>>,
+    bridge_class: &str, // e.g. "com.monet.demo.httpengine.HttpEngineBridge"
+) -> Result<()> {
     if GLOBALS.get().is_some() {
         return Ok(());
     }
     let shared = SharedVm(vm.clone_handle());
-    let loader = shared
-        .scope(|env| -> JniResult<Global<JClassLoader<'static>>> {
+    // The bridge classes share the HttpEngineBridge's package.
+    let package = bridge_class
+        .rsplit_once('.')
+        .map(|(package, _)| package.to_string())
+        .unwrap_or_else(|| bridge_class.to_string());
+    let _ = BRIDGE_PKG.set(package);
+    let (loader, registered) = shared
+        .scope(|env| -> JniResult<(Global<JClassLoader<'static>>, ())> {
             let loader = env
                 .call_method(
                     &*context,
@@ -92,9 +113,57 @@ pub fn init(vm: &JavaVM, context: Global<JObject<'static>>) -> Result<()> {
                 )?
                 .l()?;
             let loader = env.cast_local::<JClassLoader>(loader)?;
-            Ok(env.new_global_ref(loader)?)
+            let loader = env.new_global_ref(loader)?;
+
+            // RegisterNatives: bind the neutral Rust symbols onto the
+            // host's Kotlin bridge class. The Kotlin side declares
+            // matching `external fun`s; the JVM finds them through this
+            // table instead of name mangling.
+            let name = env.new_string(bridge_class.replace('/', "."))?;
+            let class: JClass<'_> = loader.load_class(env, name)?;
+            use jni::NativeMethod;
+            // SAFETY: each fn_ptr matches its descriptor — static
+            // methods taking (EnvUnowned, JClass, jlong, JObject,
+            // JObject[, JObject]) exactly as bridge.rs declares them.
+            let methods = unsafe {
+                [
+                    NativeMethod::from_raw_parts(
+                        jni::jni_str!("onStarted"),
+                        jni::jni_str!("(JLandroid/net/http/UrlRequest;Landroid/net/http/UrlResponseInfo;)V"),
+                        crate::bridge::native_on_started as *mut std::ffi::c_void,
+                    ),
+                    NativeMethod::from_raw_parts(
+                        jni::jni_str!("onReadCompleted"),
+                        jni::jni_str!("(JLandroid/net/http/UrlRequest;Landroid/net/http/UrlResponseInfo;Ljava/nio/ByteBuffer;)V"),
+                        crate::bridge::native_on_read_completed as *mut std::ffi::c_void,
+                    ),
+                    NativeMethod::from_raw_parts(
+                        jni::jni_str!("onRedirect"),
+                        jni::jni_str!("(JLandroid/net/http/UrlRequest;Landroid/net/http/UrlResponseInfo;Ljava/lang/String;)V"),
+                        crate::bridge::native_on_redirect as *mut std::ffi::c_void,
+                    ),
+                    NativeMethod::from_raw_parts(
+                        jni::jni_str!("onSucceeded"),
+                        jni::jni_str!("(JLandroid/net/http/UrlRequest;Landroid/net/http/UrlResponseInfo;)V"),
+                        crate::bridge::native_on_succeeded as *mut std::ffi::c_void,
+                    ),
+                    NativeMethod::from_raw_parts(
+                        jni::jni_str!("onFailed"),
+                        jni::jni_str!("(JLandroid/net/http/UrlRequest;Landroid/net/http/UrlResponseInfo;Landroid/net/http/HttpException;)V"),
+                        crate::bridge::native_on_failed as *mut std::ffi::c_void,
+                    ),
+                    NativeMethod::from_raw_parts(
+                        jni::jni_str!("onCanceled"),
+                        jni::jni_str!("(JLandroid/net/http/UrlRequest;Landroid/net/http/UrlResponseInfo;)V"),
+                        crate::bridge::native_on_canceled as *mut std::ffi::c_void,
+                    ),
+                ]
+            };
+            unsafe { env.register_native_methods(&class, &methods) }?;
+            Ok((loader, ()))
         })
         .map_err(jni_err("init"))?;
+    let _ = registered;
     let _ = GLOBALS.set(Globals {
         vm: shared,
         context,
@@ -306,11 +375,11 @@ fn setup_and_start(
         .vm
         .scope(|env| -> JniResult<Global<JObject<'static>>> {
             let loader = &globals.loader;
-            let callback_name = env.new_string(format!("{BRIDGE_PKG}.MonetRequestCallback"))?;
+            let callback_name = env.new_string(format!("{}.MonetRequestCallback", bridge_pkg()))?;
             let callback_class: JClass<'_> = loader.load_class(env, callback_name)?;
             let callback =
                 env.new_object(&callback_class, jni::jni_sig!("(J)V"), &[(id as i64).into()])?;
-            let executor_name = env.new_string(format!("{BRIDGE_PKG}.MonetDirectExecutor"))?;
+            let executor_name = env.new_string(format!("{}.MonetDirectExecutor", bridge_pkg()))?;
             let executor_class: JClass<'_> = loader.load_class(env, executor_name)?;
             let executor = env.new_object(&executor_class, jni::jni_sig!("()V"), &[])?;
 
@@ -348,7 +417,7 @@ fn setup_and_start(
             }
 
             if !body.is_empty() {
-                let provider_name = env.new_string(format!("{BRIDGE_PKG}.MonetUploadProvider"))?;
+                let provider_name = env.new_string(format!("{}.MonetUploadProvider", bridge_pkg()))?;
                 let provider_class: JClass<'_> = loader.load_class(env, provider_name)?;
                 let array = env.new_byte_array(body.len())?;
                 array.set_region(env, 0, bytes_as_i8(&body))?;
