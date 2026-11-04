@@ -69,7 +69,26 @@ futures-lite = "2"
 monet-urlsession = { path = "vendor/monet-urlsession" }
 
 [target.'cfg(target_os = "android")'.dependencies]
-# the pure-Rust stack: hyper+h2+rustls HTTP, tokio-tungstenite WebSocket,
-# the Android system trust store via rustls-platform-verifier
-monet-rustls = { path = "vendor/monet-rustls" }
-monet-ws = { path = "vendor/monet-ws" }
+# The Android HTTP stack is a **deployment decision, expressed as cargo
+# features** (the app picks by minSdk at build time — see platform.rs):
+#
+# - `httpengine` (default): the platform HttpEngine — the system Cronet,
+#   framework API since 34, CTS-mandatory on every Android 14+ ROM, zero
+#   app-shipped binary. Apps with minSdk >= 34 want exactly this.
+# - `fallback-rustls` (optional): hyper+h2+rustls, for apps whose minSdk
+#   is below 34 — at runtime the engine is preferred and rustls serves
+#   the older devices. Disable on 34+ apps to keep hyper/h2 out of the
+#   binary entirely.
+# - `websocket` (default): monet-ws (tokio-tungstenite + rustls) —
+#   HttpEngine has no WebSocket surface, so this is independent of the
+#   HTTP choice.
+monet-httpengine = { path = "vendor/monet-httpengine", optional = true }
+monet-rustls = { path = "vendor/monet-rustls", optional = true }
+monet-ws = { path = "vendor/monet-ws", optional = true }
+log = "0.4"
+
+[features]
+default = ["httpengine", "websocket"]
+httpengine = ["dep:monet-httpengine"]
+fallback-rustls = ["dep:monet-rustls"]
+websocket = ["dep:monet-ws"]

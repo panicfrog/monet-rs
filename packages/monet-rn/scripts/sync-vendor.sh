@@ -24,7 +24,9 @@
 set -euo pipefail
 
 ROOT=${0:A:h}/../../..
-CRATES=(monet-core monet-tls monet-rustls monet-ws monet-urlsession)
+# The manifest edits below use paths relative to this package.
+cd ${0:A:h}/..
+CRATES=(monet-core monet-tls monet-rustls monet-ws monet-urlsession monet-httpengine)
 
 # ---- 1. rsync the crate sources, then strip [dev-dependencies] ----
 # The dev-deps reference crates that are not vendored (monet-conformance is

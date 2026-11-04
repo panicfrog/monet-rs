@@ -2,3 +2,4 @@
 /generated/
 # rsynced from crates/ by scripts/sync-vendor.sh (regenerate before building the app)
 /vendor/
+/target/

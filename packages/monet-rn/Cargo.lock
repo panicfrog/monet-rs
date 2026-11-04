@@ -1045,6 +1045,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "monet-httpengine"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures-channel",
+ "futures-lite",
+ "jni",
+ "monet-core",
+]
+
+[[package]]
 name = "monet-rn"
 version = "0.1.0"
 dependencies = [
@@ -1054,7 +1065,9 @@ dependencies = [
  "jsi",
  "jsi-turbo",
  "linkme",
+ "log",
  "monet-core",
+ "monet-httpengine",
  "monet-rustls",
  "monet-urlsession",
  "monet-ws",
