@@ -114,20 +114,15 @@ mod private {
             .expect("fixture CA key parses as PKCS#8 P-256");
             // Reconstruct an issuer from the certificate (same subject,
             // same key): leaves minted below chain to the original DER.
-            let ca = rcgen::CertificateParams::from_ca_cert_der(&CertificateDer::from(
-                ca_der.clone(),
-            ))
-            .expect("fixture CA certificate parses")
-            .self_signed(&ca_key)
-            .expect("issuer reconstructs");
+            let ca =
+                rcgen::CertificateParams::from_ca_cert_der(&CertificateDer::from(ca_der.clone()))
+                    .expect("fixture CA certificate parses")
+                    .self_signed(&ca_key)
+                    .expect("issuer reconstructs");
             Self::mint(ca, ca_key, ca_der)
         }
 
-        fn mint(
-            ca: rcgen::Certificate,
-            ca_key: rcgen::KeyPair,
-            ca_der: Vec<u8>,
-        ) -> ServerCert {
+        fn mint(ca: rcgen::Certificate, ca_key: rcgen::KeyPair, ca_der: Vec<u8>) -> ServerCert {
             let leaf_key = rcgen::KeyPair::generate().expect("generate leaf key");
             let leaf = rcgen::CertificateParams::new(vec!["127.0.0.1".into(), "localhost".into()])
                 .expect("leaf params")

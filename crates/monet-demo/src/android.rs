@@ -46,18 +46,19 @@ pub extern "system" fn Java_com_monet_demo_MainActivity_initPlatformVerifier(
     context: JObject<'_>,
 ) -> jstring {
     let mut message = String::new();
-    let outcome = env.with_env(|env| {
-        match rustls_platform_verifier::android::init_with_env(env, context) {
-            Ok(()) => {
-                message = "platform verifier initialized".to_string();
-                Ok(())
-            }
-            Err(err) => {
-                message = format!("platform verifier init failed: {err}");
-                Err(err)
-            }
-        }
-    });
+    let outcome =
+        env.with_env(
+            |env| match rustls_platform_verifier::android::init_with_env(env, context) {
+                Ok(()) => {
+                    message = "platform verifier initialized".to_string();
+                    Ok(())
+                }
+                Err(err) => {
+                    message = format!("platform verifier init failed: {err}");
+                    Err(err)
+                }
+            },
+        );
     let () = outcome.resolve::<jni::errors::LogErrorAndDefault>();
     string_out(&mut env, &message)
 }
