@@ -9,6 +9,8 @@
     "ts/",
     "vendor/",
     "scripts/",
+    "android/",
+    "react-native.config.js",
     "Cargo.toml"
   ],
   "scripts": {

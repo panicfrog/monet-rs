@@ -91,7 +91,9 @@ const CHECKS: Array<{name: string; run: (base: string) => Promise<void>}> = [
     run: async base => {
       const response = await fetch(`${base}/echo`, {
         method: 'POST',
-        headers: {'x-battery': 'post'},
+        // Cronet-based transports (the platform HttpEngine) reject
+        // uploads without a Content-Type; URLSession does not.
+        headers: {'x-battery': 'post', 'content-type': 'text/plain'},
         body: 'hello-monet',
       });
       const seen = JSON.parse(await response.text()) as {

@@ -24,6 +24,8 @@ use monet_core::pin::PinConfig;
 use crate::fetch::FetchRegistry;
 use crate::ws::WsRegistry;
 
+#[cfg(target_os = "android")]
+mod bootstrap;
 mod fetch;
 mod platform;
 /// The WebSocket channel: the registry lands with the fetch channel so

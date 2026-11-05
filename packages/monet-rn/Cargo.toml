@@ -86,6 +86,10 @@ monet-httpengine = { path = "vendor/monet-httpengine", optional = true }
 monet-rustls = { path = "vendor/monet-rustls", optional = true }
 monet-ws = { path = "vendor/monet-ws", optional = true }
 log = "0.4"
+# The bootstrap JNI entry (MonetBootstrap.nativeInit): present in every
+# configuration — a no-op without the httpengine feature — so the Java
+# side can call it unconditionally.
+jni = "0.22"
 
 [features]
 default = ["httpengine", "websocket"]

@@ -1,0 +1,48 @@
+// The monet-rn Android library: the HttpEngine Kotlin/Java bridge and
+// its bootstrap. Discovered and compiled into the app by RN autolinking
+// (the android/build.gradle presence is the signal); contributes no
+// resources of its own.
+
+def getExtOrDefault(name, fallback) {
+    def root = project.rootProject.ext
+    return root.has(name) ? root.get(name) : fallback
+}
+
+apply plugin: 'com.android.library'
+
+android {
+    namespace 'com.monet.rn'
+
+    compileSdkVersion getExtOrDefault('compileSdkVersion', 36)
+
+    defaultConfig {
+        minSdkVersion getExtOrDefault('minSdkVersion', 24)
+    }
+
+    if (rootProject.hasProperty("ndkPath")) {
+        ndkPath rootProject.ext.ndkPath
+    }
+    if (rootProject.hasProperty("ndkVersion")) {
+        ndkVersion rootProject.ext.ndkVersion
+    }
+}
+
+repositories {
+    google()
+    maven {
+        // React Native (JS, Obj-C sources, Android binaries) is installed from npm
+        url "$rootDir/../node_modules/react-native/android"
+    }
+    maven { url "https://repo.reactnative.dev/maven2" }
+    mavenCentral()
+}
+
+dependencies {
+    // MonetRnPackage implements ReactPackage; the React API comes from
+    // whatever RN version the app has installed (read from the app's
+    // node_modules, same as react-native-rust-turbo does — never pinned
+    // here).
+    def rnPackageJson = new File(rootProject.projectDir, "../node_modules/react-native/package.json")
+    def rnVersion = new groovy.json.JsonSlurper().parse(rnPackageJson).version
+    implementation "com.facebook.react:react-android:${rnVersion}"
+}
