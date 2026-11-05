@@ -70,6 +70,11 @@ pub struct HeaderKV {
 }
 
 #[derive(serde::Serialize, serde::Deserialize, jsi_turbo::TurboStruct, Debug)]
+// The generated TypeScript bindings spell fields in camelCase
+// (timeoutMs, followRedirects); the serde mapping must agree or every
+// multi-word field arrives as an unknown key (whose IgnoredAny value
+// would hit the deserializer's unsupported-type path).
+#[serde(rename_all = "camelCase")]
 pub struct FetchOptions {
     pub url: String,
     pub method: String,

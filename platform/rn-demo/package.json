@@ -14,7 +14,7 @@
     "monet-rn": "file:../../packages/monet-rn",
     "react": "19.3.0",
     "react-native": "0.88.1",
-    "react-native-rust-turbo": "^0.88.2",
+    "react-native-rust-turbo": "^0.88.3",
     "react-native-safe-area-context": "^5.5.2"
   },
   "devDependencies": {

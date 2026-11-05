@@ -8,7 +8,7 @@
 //! the error and reports `on_error(Cancelled)`. A terminal event marks
 //! the state finished; `body_done` = finished && queue drained.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -20,8 +20,9 @@ struct FetchState {
     /// The fetch's cancel token — cloned into the transport call; abort
     /// fires it.
     cancel: CancelToken,
-    /// Queued chunks waiting for `take_chunk`.
-    queue: Mutex<Vec<Vec<u8>>>,
+    /// Queued chunks waiting for `take_chunk` (FIFO — body order is
+    /// meaningful).
+    queue: Mutex<VecDeque<Vec<u8>>>,
     /// Set at termination (on_done / on_error fired).
     finished: bool,
 }
@@ -57,7 +58,7 @@ impl FetchRegistry {
             .unwrap()
             .insert(id, FetchState {
                 cancel: cancel.clone(),
-                queue: Mutex::new(Vec::new()),
+                queue: Mutex::new(VecDeque::new()),
                 finished: false,
             });
         (id as f64, cancel)
@@ -69,7 +70,7 @@ impl FetchRegistry {
         let mut states = self.inner.states.lock().unwrap();
         match states.get_mut(&f64_to_u64(id)) {
             Some(state) => {
-                state.queue.lock().unwrap().push(chunk);
+                state.queue.lock().unwrap().push_back(chunk);
                 true
             }
             None => false,
@@ -87,7 +88,7 @@ impl FetchRegistry {
         let states = self.inner.states.lock().unwrap();
         let state = states.get(&f64_to_u64(id))?;
         let mut queue = state.queue.lock().unwrap();
-        queue.pop().map(|chunk| JsiArrayBuffer::from_vec(chunk, rt))
+        queue.pop_front().map(|chunk| JsiArrayBuffer::from_vec(chunk, rt))
     }
 
     /// Marks the fetch terminated (the terminal callback has fired).

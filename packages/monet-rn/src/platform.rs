@@ -68,14 +68,13 @@ fn select_http(pins: &PinConfig) -> Result<Arc<dyn Transport>, String> {
     }
     #[cfg(any(target_os = "ios", target_os = "macos"))]
     {
+        // Construction is infallible (`new() -> Self`); pins are installed
+        // through the shim's process-global registry, last-wins.
+        let transport = monet_urlsession::UrlsessionTransport::new();
         if !pins.is_empty() {
-            return monet_urlsession::UrlsessionTransport::new()
-                .map(|transport| Arc::new(transport.with_pins(pins.clone())) as Arc<dyn Transport>)
-                .map_err(|e| e.to_string());
+            return Ok(Arc::new(transport.with_pins(pins.clone())) as Arc<dyn Transport>);
         }
-        monet_urlsession::UrlsessionTransport::new()
-            .map(|transport| Arc::new(transport) as Arc<dyn Transport>)
-            .map_err(|e| e.to_string())
+        Ok(Arc::new(transport) as Arc<dyn Transport>)
     }
     #[cfg(not(any(target_os = "android", target_os = "ios", target_os = "macos")))]
     {
@@ -105,9 +104,10 @@ pub fn ws_transport(pins: &PinConfig) -> anyhow::Result<Arc<dyn monet_core::WebS
     }
     #[cfg(any(target_os = "ios", target_os = "macos"))]
     {
-        let transport = monet_urlsession::UrlsessionTransport::new()
-            .map_err(|e| anyhow::anyhow!("urlsession construction: {e}"))?;
-        Ok(Arc::new(transport))
+        // One UrlsessionTransport instance serves both HTTP and WS (the
+        // same type implements both traits).
+        let transport = monet_urlsession::UrlsessionTransport::new();
+        Ok(Arc::new(transport) as Arc<dyn monet_core::WebSocketTransport>)
     }
     #[cfg(not(any(target_os = "android", target_os = "ios", target_os = "macos")))]
     {

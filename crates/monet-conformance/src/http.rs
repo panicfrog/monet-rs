@@ -39,6 +39,7 @@ pub struct Seen {
 /// A local hyper server exposing one route per check.
 pub struct HttpServer {
     base: Url,
+    addr: std::net::SocketAddr,
     /// The raw queue plus a backlog of observations other checks let
     /// behind — checks correlate by path, not by order.
     seen: Mutex<SeenQueue>,
@@ -52,7 +53,14 @@ struct SeenQueue {
 impl HttpServer {
     /// Spawns the plain-HTTP server on a loopback port.
     pub fn spawn() -> HttpServer {
-        Self::spawn_with(|stream| async move { Ok::<_, std::io::Error>(stream) })
+        Self::spawn_on("127.0.0.1:0")
+    }
+
+    /// Spawns the plain-HTTP server on the given address. The server bin
+    /// behind the JS battery binds `0.0.0.0:<port>` so emulators
+    /// (`10.0.2.2`) and LAN devices hit the same routes as the host.
+    pub fn spawn_on(addr: &str) -> HttpServer {
+        Self::spawn_inner(addr, |stream| async move { Ok::<_, std::io::Error>(stream) })
     }
 
     /// Spawns the server with a custom accept step wrapping each TCP
@@ -63,8 +71,22 @@ impl HttpServer {
         Fut: std::future::Future<Output = std::io::Result<S>> + Send,
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
     {
+        Self::spawn_inner("127.0.0.1:0", accept)
+    }
+
+    fn spawn_inner<Accept, Fut, S>(bind: &str, accept: Accept) -> HttpServer
+    where
+        Accept: Fn(tokio::net::TcpStream) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = std::io::Result<S>> + Send,
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
+    {
         let (addr_tx, addr_rx) = mpsc::channel();
         let (seen_tx, seen_rx) = mpsc::channel();
+        // Bind on the caller's side so a bad address (a port already in
+        // use, say) surfaces here with a clear panic location instead of
+        // a dropped-channel panic inside the server thread.
+        let std_listener = std::net::TcpListener::bind(bind).unwrap();
+        std_listener.set_nonblocking(true).unwrap();
         // The concurrency gate: `/held`'s tail is released only once `/fast`
         // has been seen — the held-download check builds its deadlock-proof
         // on it (see `held_body_does_not_block_new_requests`).
@@ -77,7 +99,7 @@ impl HttpServer {
                     .build()
                     .unwrap();
                 runtime.block_on(async move {
-                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
                     addr_tx.send(listener.local_addr().unwrap()).unwrap();
                     loop {
                         let (stream, _) = match listener.accept().await {
@@ -139,11 +161,18 @@ impl HttpServer {
         let addr = addr_rx.recv().unwrap();
         HttpServer {
             base: Url::parse(&format!("http://{addr}")).unwrap(),
+            addr,
             seen: Mutex::new(SeenQueue {
                 receiver: seen_rx,
                 backlog: std::collections::VecDeque::new(),
             }),
         }
+    }
+
+    /// The address the server actually bound (meaningful when the caller
+    /// asked for port 0).
+    pub fn local_addr(&self) -> std::net::SocketAddr {
+        self.addr
     }
 
     /// The URL for a route.

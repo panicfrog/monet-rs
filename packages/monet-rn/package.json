@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "monet for React Native: native transports behind a Rust TurboModule (URLSession on iOS, hyper+rustls on Android) behind a WHATWG-fetch-compatible TS layer.",
   "license": "MIT",
-  "main": "generated/rust-turbo/Monet.ts",
+  "main": "ts/index.ts",
   "files": [
     "src/",
     "ts/",
