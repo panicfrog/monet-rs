@@ -60,7 +60,10 @@ impl HttpServer {
     /// behind the JS battery binds `0.0.0.0:<port>` so emulators
     /// (`10.0.2.2`) and LAN devices hit the same routes as the host.
     pub fn spawn_on(addr: &str) -> HttpServer {
-        Self::spawn_inner(addr, |stream| async move { Ok::<_, std::io::Error>(stream) })
+        Self::spawn_inner(
+            addr,
+            |stream| async move { Ok::<_, std::io::Error>(stream) },
+        )
     }
 
     /// Spawns the server with a custom accept step wrapping each TCP

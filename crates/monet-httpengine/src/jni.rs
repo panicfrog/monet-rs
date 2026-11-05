@@ -31,7 +31,10 @@ use crate::registry;
 static BRIDGE_PKG: OnceLock<String> = OnceLock::new();
 
 pub(crate) fn bridge_pkg() -> &'static str {
-    BRIDGE_PKG.get().map(String::as_str).unwrap_or("com.monet.demo.httpengine")
+    BRIDGE_PKG
+        .get()
+        .map(String::as_str)
+        .unwrap_or("com.monet.demo.httpengine")
 }
 
 /// Minimum platform level with `android.net.http.HttpEngine`.

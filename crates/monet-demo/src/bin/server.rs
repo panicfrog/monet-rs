@@ -16,7 +16,9 @@ fn main() {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--addr" => {
-                bind = args.next().unwrap_or_else(|| usage_exit("--addr needs a value"))
+                bind = args
+                    .next()
+                    .unwrap_or_else(|| usage_exit("--addr needs a value"))
             }
             other => bind = other.to_string(),
         }
