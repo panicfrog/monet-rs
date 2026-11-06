@@ -69,8 +69,22 @@ impl HttpengineTransport {
     }
 }
 
-impl Transport for HttpengineTransport {
-    fn execute(&self, req: Request, cancel: CancelToken) -> BoxFuture<Result<Response>> {
+#[cfg(target_os = "android")]
+impl Drop for HttpengineTransport {
+    fn drop(&mut self) {
+        // Every engine's Cronet context holds a broadcast receiver the
+        // system keeps strongly referenced until shutdown() — dropping
+        // without it leaks one per engine and the process dies at the
+        // 1000-receiver cap. Safe by construction: embedders share one
+        // transport behind an Arc, so this runs only after the last
+        // in-flight request's pump has let go of its clone. (Not on
+        // EngineHandle: execute() duplicates it per request, and those
+        // must never shut the engine down mid-flight.)
+        jni::shutdown_engine(&self.engine);
+    }
+}
+
+impl Transport for HttpengineTransport {    fn execute(&self, req: Request, cancel: CancelToken) -> BoxFuture<Result<Response>> {
         #[cfg(target_os = "android")]
         {
             jni::execute(&self.engine, req, cancel)

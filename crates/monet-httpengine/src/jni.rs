@@ -180,6 +180,27 @@ pub struct EngineHandle {
     engine: Global<JObject<'static>>,
 }
 
+/// Releases the engine's native resources. The engine's Cronet context
+/// holds a broadcast receiver the system keeps strongly referenced until
+/// `shutdown()` — without this call every engine ever built leaks one
+/// permanently, and the process dies at the 1000-receiver cap. Errors
+/// are dropped (and the global ref still releases with the handle): a
+/// failed shutdown must not crash the embedder.
+pub fn shutdown_engine(engine: &EngineHandle) {
+    let Some(globals) = GLOBALS.get() else {
+        return;
+    };
+    let _ = globals.vm.scope(|env| -> JniResult<()> {
+        env.call_method(
+            &*engine.engine,
+            jni::jni_str!("shutdown"),
+            jni::jni_sig!("()V"),
+            &[],
+        )?;
+        Ok(())
+    });
+}
+
 /// The engine's version string (e.g. "121.0.6167.71").
 pub fn engine_version(_engine: &EngineHandle) -> String {
     let Some(globals) = GLOBALS.get() else {

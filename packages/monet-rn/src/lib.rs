@@ -36,21 +36,23 @@ mod platform;
 /// JS object's (NativeState): drop = disconnect.
 mod ws;
 
-/// The module state: one Client over the platform-selected transport,
-/// rebuilt when configuration changes, plus the fetch registry shared
-/// with the pump tasks. WebSocket connections carry their own state —
-/// no registry needed (see ws.rs).
+/// The module state: one shared transport (behind the client for future
+/// hook plumbing, and directly for the fetch pumps — one engine, one
+/// connection pool, one lifecycle), rebuilt when configuration changes,
+/// plus the fetch registry. WebSocket connections carry their own state
+/// — no registry needed (see ws.rs).
 pub struct Monet {
+    transport: RwLock<Arc<dyn monet_core::Transport>>,
     client: RwLock<Arc<Client>>,
     fetches: FetchRegistry,
 }
 
 impl Monet {
     pub fn create() -> anyhow::Result<Self> {
+        let transport = platform::http_transport(&PinConfig::default());
         Ok(Monet {
-            client: RwLock::new(Arc::new(Client::new(platform::http_transport(
-                &PinConfig::default(),
-            )))),
+            client: RwLock::new(Arc::new(Client::new(transport.clone()))),
+            transport: RwLock::new(transport),
             fetches: FetchRegistry::new(),
         })
     }
@@ -58,9 +60,13 @@ impl Monet {
     /// Rebuilds the transport + client after a configuration change
     /// (pins). iOS pins live in the Swift shim (process-global,
     /// last-wins); Android pins go into the transport configs, so a
-    /// rebuild re-installs them there.
+    /// rebuild re-installs them there. In-flight fetches keep the old
+    /// transport alive through their Arc clones; it shuts down (engine
+    /// `shutdown()` on Android) once the last one finishes.
     fn rebuild(&self, pins: &PinConfig) -> anyhow::Result<()> {
-        let client = Client::new(platform::http_transport(pins));
+        let transport = platform::http_transport(pins);
+        let client = Client::new(transport.clone());
+        *self.transport.write().unwrap() = transport;
         *self.client.write().unwrap() = Arc::new(client);
         Ok(())
     }
@@ -215,9 +221,17 @@ impl Monet {
         // client is only needed for hook plumbing (empty in v1), so the
         // pump drives the transport directly — cancellation stays
         // transport-level, which the Client pipeline doesn't expose.
-        let transport = platform::http_transport(&PinConfig::default());
+        // The transport is the module's shared one: a per-fetch engine
+        // would leak a Cronet broadcast receiver each time (the process
+        // dies at the 1000-receiver cap) and pool no connections across
+        // fetches. The Arc clone keeps it alive until this pump ends.
+        let transport = self.transport.read().unwrap().clone();
         let execute = transport.execute(request, cancel);
         async_global_executor::spawn(async move {
+            // Hold the Arc for the pump's lifetime: a pin-config rebuild
+            // swaps the module's transport, and the old engine's
+            // shutdown() must wait until this pump is done with it.
+            let _keep_engine = transport;
             match execute.await {
                 Ok(response) => {
                     let status = f64::from(response.status);
