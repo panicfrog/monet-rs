@@ -26,19 +26,58 @@ import {
   View,
 } from 'react-native';
 
-import {fetch, getMonet, MonetError} from 'monet-rn';
+import {fetch, getMonet, MonetError, MonetWebSocket} from 'monet-rn';
 
 type CheckStatus = 'pending' | 'pass' | 'fail';
 type CheckState = {name: string; status: CheckStatus; detail: string};
 
 const DEFAULT_BASE =
   Platform.OS === 'android' ? 'http://10.0.2.2:8964' : 'http://127.0.0.1:8964';
+const DEFAULT_WS_BASE =
+  Platform.OS === 'android' ? 'ws://10.0.2.2:8965' : 'ws://127.0.0.1:8965';
 const CHECK_TIMEOUT_MS = 10_000;
 
 function assert(condition: unknown, message: string): void {
   if (!condition) {
     throw new Error(message);
   }
+}
+
+/** Resolves when the socket's onopen fires (or rejects on error). */
+function waitForOpen(ws: MonetWebSocket): Promise<void> {
+  return new Promise((resolve, reject) => {
+    ws.onopen = () => resolve();
+    ws.onerror = (event: {kind: string; message: string}) =>
+      reject(new MonetError(event.kind, event.message));
+  });
+}
+
+/** Resolves with the next message event (text or binary). */
+function nextMessage(
+  ws: MonetWebSocket,
+): Promise<{data: string | ArrayBuffer; isBinary: boolean}> {
+  return new Promise((resolve, reject) => {
+    ws.onmessage = event => {
+      ws.onmessage = null;
+      resolve(event);
+    };
+    ws.onerror = (event: {kind: string; message: string}) =>
+      reject(new MonetError(event.kind, event.message));
+  });
+}
+
+/** Resolves with the close event. */
+function waitForClose(
+  ws: MonetWebSocket,
+): Promise<{code: number; reason: string; wasClean: boolean}> {
+  return new Promise((resolve, reject) => {
+    ws.onclose = event => {
+      ws.onclose = null;
+      resolve(event);
+    };
+    ws.onerror = (event: {kind: string; message: string}) =>
+      reject(new MonetError(event.kind, event.message));
+  });
 }
 
 async function withTimeout<T>(work: Promise<T>, label: string): Promise<T> {
@@ -165,6 +204,76 @@ const CHECKS: Array<{name: string; run: (base: string) => Promise<void>}> = [
         return;
       }
       throw new Error('a fetch to a closed port unexpectedly resolved');
+    },
+  },
+  // ---- WebSocket checks (names mirror monet-conformance/src/ws.rs) ----
+  {
+    name: 'ws:round_trips',
+    run: async _base => {
+      const ws = new MonetWebSocket(`${DEFAULT_WS_BASE}/echo`);
+      try {
+        await waitForOpen(ws);
+        // Text round-trip: send first, then wait for the echo.
+        ws.send('hello-ws');
+        const text = await nextMessage(ws);
+        assert(
+          text.data === 'hello-ws',
+          `text echo ${JSON.stringify(text.data)}, expected "hello-ws"`,
+        );
+        // Binary round-trip.
+        const payload = new Uint8Array([0, 1, 2, 254, 255]);
+        ws.send(payload.buffer);
+        const binary = await nextMessage(ws);
+        assert(
+          binary.data instanceof ArrayBuffer,
+          `expected ArrayBuffer, got ${typeof binary.data}`,
+        );
+        const echoed = new Uint8Array(binary.data as ArrayBuffer);
+        assert(
+          echoed.length === payload.length &&
+            echoed.every((byte, i) => byte === payload[i]),
+          `binary echo ${Array.from(echoed)}, expected ${Array.from(payload)}`,
+        );
+      } finally {
+        ws.close(1000, 'done');
+        await waitForClose(ws);
+      }
+    },
+  },
+  {
+    name: 'ws:close_code_fidelity',
+    run: async _base => {
+      const ws = new MonetWebSocket(`${DEFAULT_WS_BASE}/close-1012`);
+      const close = await waitForClose(ws);
+      assert(
+        close.code === 1012,
+        `close code ${close.code}, expected 1012`,
+      );
+      assert(
+        close.reason === 'service restart',
+        `close reason ${JSON.stringify(close.reason)}, expected "service restart"`,
+      );
+      assert(close.wasClean, 'the close was not clean');
+    },
+  },
+  {
+    name: 'ws:ping_surfaced',
+    run: async _base => {
+      const ws = new MonetWebSocket(`${DEFAULT_WS_BASE}/ping`);
+      try {
+        await waitForOpen(ws);
+        // The server sends a ping; the transport answers it and surfaces
+        // it to the user.
+        const ping = await nextMessage(ws);
+        assert(
+          ping.isBinary,
+          `expected the ping to surface as binary, got isBinary=${ping.isBinary}`,
+        );
+        // The close semantics after a ping/pong exchange are handled by
+        // the close_code_fidelity test; this check is about surfacing.
+      } finally {
+        ws.abort();
+      }
     },
   },
 ];

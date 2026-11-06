@@ -11,6 +11,12 @@ export { fetch } from './fetch';
 export type { MonetRequestInit } from './fetch';
 export { MonetError, MonetHeaders, MonetResponse } from './response';
 export type { ErrorEvent, HeadEvent } from './response';
+export { MonetWebSocket } from './websocket';
+export type {
+  MonetWsCloseEvent,
+  MonetWsErrorEvent,
+  MonetWsMessageEvent,
+} from './websocket';
 
 import { getMonet } from '../generated/rust-turbo/Monet';
 
