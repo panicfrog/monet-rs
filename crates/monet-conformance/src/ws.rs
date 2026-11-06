@@ -63,81 +63,7 @@ fn spawn_server(script: Script, connections: usize) -> (Url, mpsc::Receiver<Seen
                     let script = script.clone();
                     let seen_tx = seen_tx.clone();
                     let served = tokio::spawn(async move {
-                        // Negotiate the subprotocol like a well-behaved
-                        // server: strict clients (tungstenite) fail the
-                        // handshake if a protocol was requested but none
-                        // is selected in the response.
-                        // (result_large_err: the error type is
-                        // tungstenite's callback signature, never built.)
-                        #[allow(clippy::result_large_err)]
-                        let mut ws = tokio_tungstenite::accept_hdr_async(
-                            stream,
-                            |request: &tokio_tungstenite::tungstenite::http::Request<()>,
-                             mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
-                                let offered = request
-                                    .headers()
-                                    .get("sec-websocket-protocol")
-                                    .and_then(|value| value.to_str().ok())
-                                    .unwrap_or_default();
-                                if offered.split(',').any(|token| token.trim() == "chat") {
-                                    response.headers_mut().insert(
-                                        "sec-websocket-protocol",
-                                        "chat".parse().unwrap(),
-                                    );
-                                }
-                                Ok(response)
-                            },
-                        )
-                        .await
-                        .unwrap();
-                        let _ = seen_tx.send(Seen::Connected);
-                        match script {
-                            Script::Echo => {
-                                while let Some(Ok(message)) = ws.next().await {
-                                    match message {
-                                        Message::Text(text) => {
-                                            ws.send(Message::Text(text)).await.unwrap();
-                                        }
-                                        Message::Binary(bytes) => {
-                                            ws.send(Message::Binary(bytes)).await.unwrap();
-                                        }
-                                        Message::Close(frame) => {
-                                            let (code, reason) = frame
-                                                .map(|f| {
-                                                    (u16::from(f.code), f.reason.to_string())
-                                                })
-                                                .unwrap_or((1005, String::new()));
-                                            let _ = seen_tx.send(Seen::Closed(code, reason));
-                                            let _ = ws.close(None).await;
-                                            return;
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            }
-                            Script::ServerClose(code, reason) => {
-                                use tokio_tungstenite::tungstenite::protocol::CloseFrame;
-                                use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
-                                ws.send(Message::Close(Some(CloseFrame {
-                                    code: CloseCode::from(code),
-                                    reason: reason.into(),
-                                })))
-                                .await
-                                .unwrap();
-                            }
-                            Script::PingThenReport => {
-                                ws.send(Message::Ping(bytes::Bytes::from_static(b"probe")))
-                                    .await
-                                    .unwrap();
-                                while let Some(Ok(message)) = ws.next().await {
-                                    if let Message::Pong(_) = message {
-                                        let _ = seen_tx.send(Seen::Ponged);
-                                        let _ = ws.close(None).await;
-                                        return;
-                                    }
-                                }
-                            }
-                        }
+                        let _ = serve_scripted(stream, script, &seen_tx).await;
                     });
                     let _ = served.await;
                 }
@@ -146,6 +72,192 @@ fn spawn_server(script: Script, connections: usize) -> (Url, mpsc::Receiver<Seen
         .unwrap();
     let addr = addr_rx.recv().unwrap();
     (Url::parse(&format!("ws://{addr}/socket")).unwrap(), seen_rx)
+}
+
+/// Serves one scripted connection (shared by the check servers above),
+/// reporting the observation events the checks assert on.
+#[allow(clippy::result_large_err)]
+async fn serve_scripted(
+    stream: tokio::net::TcpStream,
+    script: Script,
+    seen_tx: &mpsc::Sender<Seen>,
+) -> Result<(), tokio_tungstenite::tungstenite::Error> {
+    // Negotiate the subprotocol like a well-behaved server: strict
+    // clients (tungstenite) fail the handshake if a protocol was
+    // requested but none is selected in the response.
+    let mut ws = tokio_tungstenite::accept_hdr_async(
+        stream,
+        |request: &tokio_tungstenite::tungstenite::http::Request<()>,
+         mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+            let offered = request
+                .headers()
+                .get("sec-websocket-protocol")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default();
+            if offered.split(',').any(|token| token.trim() == "chat") {
+                response
+                    .headers_mut()
+                    .insert("sec-websocket-protocol", "chat".parse().unwrap());
+            }
+            Ok(response)
+        },
+    )
+    .await?;
+    let _ = seen_tx.send(Seen::Connected);
+    match script {
+        Script::Echo => {
+            while let Some(Ok(message)) = ws.next().await {
+                match message {
+                    Message::Text(text) => {
+                        ws.send(Message::Text(text)).await?;
+                    }
+                    Message::Binary(bytes) => {
+                        ws.send(Message::Binary(bytes)).await?;
+                    }
+                    Message::Close(frame) => {
+                        let (code, reason) = frame
+                            .map(|f| (u16::from(f.code), f.reason.to_string()))
+                            .unwrap_or((1005, String::new()));
+                        let _ = seen_tx.send(Seen::Closed(code, reason));
+                        let _ = ws.close(None).await;
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Script::ServerClose(code, reason) => {
+            use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+            use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+            let close = CloseFrame {
+                code: CloseCode::from(code),
+                reason: reason.into(),
+            };
+            ws.send(Message::Close(Some(close))).await?;
+        }
+        Script::PingThenReport => {
+            ws.send(Message::Ping(bytes::Bytes::from_static(b"probe")))
+                .await?;
+            while let Some(Ok(message)) = ws.next().await {
+                if let Message::Pong(_) = message {
+                    let _ = seen_tx.send(Seen::Ponged);
+                    let _ = ws.close(None).await;
+                    return Ok(());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A long-lived, externally reachable WebSocket echo server for the JS
+/// battery (the `server` bin): every accepted connection behaves by its
+/// URL path — `/echo` mirrors messages, `/close-1012` closes with the
+/// fidelity-check code, `/ping` sends a probe. Multi-connection (each
+/// battery check opens its own socket); no observation queue (the JS
+/// battery asserts from the client side).
+pub struct PathEchoServer {
+    addr: std::net::SocketAddr,
+}
+
+impl PathEchoServer {
+    /// Binds `addr` (the `server` bin passes `0.0.0.0:<port>`); the
+    /// accept loop runs on a private tokio thread like every other
+    /// conformance server.
+    pub fn spawn_on(addr: &str) -> PathEchoServer {
+        let bound_addr = addr.to_string();
+        let (addr_tx, addr_rx) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("monet-ws-battery-server".into())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async move {
+                    let listener = match tokio::net::TcpListener::bind(&bound_addr).await {
+                        Ok(listener) => listener,
+                        Err(e) => panic!("bind ws battery server {bound_addr}: {e}"),
+                    };
+                    addr_tx.send(listener.local_addr().unwrap()).unwrap();
+                    loop {
+                        let (stream, _) = match listener.accept().await {
+                            Ok(pair) => pair,
+                            Err(_) => break,
+                        };
+                        tokio::spawn(async move {
+                            let _ = serve_by_path(stream).await;
+                        });
+                    }
+                });
+            })
+            .expect("spawn ws battery thread");
+        PathEchoServer {
+            addr: addr_rx.recv().expect("bound address"),
+        }
+    }
+
+    /// The port actually bound (for the printed battery URLs).
+    pub fn port(&self) -> u16 {
+        self.addr.port()
+    }
+}
+
+/// Reads the handshake request's path (tungstenite's callback sees it
+/// before the upgrade completes) and serves the matching behavior.
+#[allow(clippy::result_large_err)]
+async fn serve_by_path(
+    stream: tokio::net::TcpStream,
+) -> Result<(), tokio_tungstenite::tungstenite::Error> {
+    let mut path = String::new();
+    let mut ws = tokio_tungstenite::accept_hdr_async(
+        stream,
+        |request: &tokio_tungstenite::tungstenite::http::Request<()>,
+         response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+            path = request.uri().path().to_string();
+            Ok(response)
+        },
+    )
+    .await?;
+    match path.as_str() {
+        "/close-1012" => {
+            use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+            use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+            let close = CloseFrame {
+                code: CloseCode::from(1012),
+                reason: "service restart".into(),
+            };
+            ws.send(Message::Close(Some(close))).await?;
+        }
+        "/ping" => {
+            ws.send(Message::Ping(bytes::Bytes::from_static(b"probe")))
+                .await?;
+            // The client checks the surfaced ping then aborts; no server
+            // close needed (the close-after-ping semantics are a
+            // tokstenite protocol-layer subtlety the close_code_fidelity
+            // route covers separately).
+            while let Some(Ok(_)) = ws.next().await {}
+        }
+        _ => {
+            // /echo (and anything unrecognized): mirror messages.
+            while let Some(Ok(message)) = ws.next().await {
+                match message {
+                    Message::Text(text) => {
+                        ws.send(Message::Text(text)).await?;
+                    }
+                    Message::Binary(bytes) => {
+                        ws.send(Message::Binary(bytes)).await?;
+                    }
+                    Message::Close(_) => {
+                        let _ = ws.close(None).await;
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Drains the handshake notification before an observation check reads
