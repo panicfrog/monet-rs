@@ -1,9 +1,100 @@
-// MonetWebSocket: the EventTarget-style WebSocket over the Rust
-// TurboModule's ws_* channel (callback-signal + zero-copy-pull — the
-// same protocol as the fetch layer). The class wiring lives entirely
-// here; the native side only fires callbacks.
+// MonetWebSocket: the EventTarget-style WebSocket over the native
+// connection object (callback-signal + zero-copy-pull — the same protocol
+// as the fetch layer). The class wiring lives entirely here; the native
+// side only fires callbacks.
 
 import { getMonet } from '../generated/rust-turbo/Monet';
+import type { MonetWsConnection } from '../generated/rust-turbo/structs/MonetWsConnection';
+import { utf8Decode, utf8Encode } from './utf8';
+
+/**
+ * Event routing for sockets, in two phases.
+ *
+ * The native side holds the four event callbacks for the connection's
+ * lifetime, and a JSI function handle is a strong GC root in Hermes (the
+ * runtime pins every C++-held function in its native-roots list) — so
+ * those closures must not capture the socket itself, or the object could
+ * never be collected. They are built at MODULE level (see
+ * makeDispatchers): an arrow defined in the constructor would close over
+ * `this` lexically — the instance — even if its body never mentions it,
+ * which is exactly the immortality the NativeState teardown exists to
+ * avoid. The closures capture only the correlation id; each event
+ * resolves the socket through these maps.
+ *
+ * CONNECTING sockets are held STRONGLY (`connecting`). The common
+ * `await open` pattern keeps the socket alive only through the suspended
+ * async frame, whose rooting runs through the very promise the socket's
+ * onopen must settle — a cycle with no GC root (the native side's future
+ * call is invisible to the collector), so a GC during the handshake
+ * would collect the socket mid-connect and the open would never arrive.
+ *
+ * Once the connection is established the entry turns WEAK
+ * (`liveSockets`) — the user's scope holds a socket they are using — so
+ * dropping it without close()/abort() stays collectable. The connection
+ * object rides the JS wrapper's NativeState: when the collector reclaims
+ * the wrapper, the connection's Rust `Drop` fires the cancel token and
+ * ends the pump. On Hermes that GC-driven path is an eventually guarantee
+ * (NativeState finalizers run on the old-generation sweep, not promptly),
+ * so the deterministic release paths are the explicit `close()` handshake
+ * and `abort()` — the Drop is the backstop, arriving whenever the
+ * collector gets to it. The pump's terminal event (which always fires,
+ * even after that cancellation) is what removes a socket's entry here.
+ */
+const connecting = new Map<number, MonetWebSocket>();
+const liveSockets = new Map<number, WeakRef<MonetWebSocket>>();
+let nextSocketId = 1;
+
+/** Resolves the socket a native signal belongs to. */
+function resolveLive(socketId: number): MonetWebSocket | null {
+  const strong = connecting.get(socketId);
+  if (strong !== undefined) {
+    return strong;
+  }
+  return liveSockets.get(socketId)?.deref() ?? null;
+}
+
+/**
+ * The four native event callbacks, built at module level ON PURPOSE: a
+ * plain module function's `this` is undefined, so the arrows below
+ * capture nothing but the correlation id (arrows in the constructor
+ * would capture the instance — see the liveSockets docs).
+ */
+function makeDispatchers(socketId: number) {
+  return {
+    onOpen: () => {
+      const ws = resolveLive(socketId);
+      if (ws !== null) {
+        ws.handleOpen();
+      }
+    },
+    onMessage: (event: {isBinary: boolean}) => {
+      const ws = resolveLive(socketId);
+      if (ws !== null) {
+        ws.handleMessageSignal(event);
+      }
+    },
+    onClose: (event: {code: number; reason: string; wasClean: boolean}) => {
+      const ws = resolveLive(socketId);
+      if (ws !== null) {
+        ws.handleClose(event);
+      } else {
+        // Terminal for a socket that already went away: its Drop
+        // disconnected the transport; just retire the entry.
+        connecting.delete(socketId);
+        liveSockets.delete(socketId);
+      }
+    },
+    onError: (event: {kind: string; message: string}) => {
+      const ws = resolveLive(socketId);
+      if (ws !== null) {
+        ws.handleError(event);
+      } else {
+        connecting.delete(socketId);
+        liveSockets.delete(socketId);
+      }
+    },
+  };
+}
 
 /** One message event: the data (text or binary) and its type. */
 export interface MonetWsMessageEvent {
@@ -32,13 +123,21 @@ type OpenHandler = () => void;
 /**
  * A WebSocket connection. WHATWG WebSocket-compatible surface (open
  * fires on handshake, message/close/error as events; send/close/ping as
- * methods) over the native channel. The `close` event's code and reason
- * round-trip exactly — the fidelity that motivated the iOS transport's
- * hand-rolled framing.
+ * methods) over the native connection object. The `close` event's code
+ * and reason round-trip exactly — the fidelity that motivated the iOS
+ * transport's hand-rolled framing. Releasing is explicit and
+ * deterministic — `close()` for the handshake, `abort()` for an immediate
+ * disconnect. A socket dropped without either is not leaked: nothing on
+ * the JS side retains it, and the connection's Rust `Drop` (the JS
+ * wrapper's NativeState) disconnects whenever the collector reclaims the
+ * wrapper — Hermes runs that finalizer on the old-generation sweep, so
+ * treat it as a backstop, not a prompt close.
  */
 export class MonetWebSocket {
-  /** The native connection id (0 until ws_connect returns). */
-  private connId: number = -1;
+  /** The native connection object (its lifetime is this object's). */
+  private conn: MonetWsConnection;
+  /** The correlation id the native-held event closures capture. */
+  private socketId: number;
   private _readyState: number = 0; // CONNECTING
 
   // Event handlers (EventTarget-style property assignment).
@@ -60,7 +159,7 @@ export class MonetWebSocket {
   private _closed = false;
 
   // The isBinary flags from on_message signals, paired FIFO with
-  // ws_take_message pulls.
+  // takeMessage pulls.
   private pendingFlags: boolean[] = [];
 
   get onopen(): OpenHandler | null {
@@ -122,39 +221,29 @@ export class MonetWebSocket {
         headers.push({name, value});
       }
     }
-    this.connId = monet.wsConnect(
+    // A JS-side correlation id, allocated before the call so the
+    // native-held closures capture a plain number and nothing else (see
+    // the liveSockets docs — the dispatchers must come from module
+    // scope, not from this constructor's lexical `this`). No callback
+    // can run before wsConnect returns — they all marshal through the
+    // JS thread's queue, and the constructor holds that thread — so
+    // publishing the entry afterwards is race-free.
+    const socketId = nextSocketId++;
+    const dispatchers = makeDispatchers(socketId);
+    this.conn = monet.wsConnect(
       url,
       options?.protocols ?? [],
       headers,
-      () => {
-        this._readyState = 1; // OPEN
-        this.onopen?.();
-      },
-      (event: {isBinary: boolean}) => {
-        // Signal: queue the flag, pull the data, fire the event.
-        this.pendingFlags.push(event.isBinary);
-        this.drainMessages();
-      },
-      (event: {code: number; reason: string; wasClean: boolean}) => {
-        this._readyState = 3; // CLOSED
-        this._closed = true;
-        const closeEvent: MonetWsCloseEvent = {
-          code: event.code,
-          reason: event.reason,
-          wasClean: event.wasClean,
-        };
-        if (this._onclose !== null) {
-          this._onclose(closeEvent);
-        } else {
-          this.closeBuffer = closeEvent;
-        }
-      },
-      (event: {kind: string; message: string}) => {
-        this._readyState = 3; // CLOSED
-        this._closed = true;
-        this._onerror?.({kind: event.kind, message: event.message});
-      },
+      dispatchers.onOpen,
+      dispatchers.onMessage,
+      dispatchers.onClose,
+      dispatchers.onError,
     );
+    this.socketId = socketId;
+    // Strongly held until the first event (see the connecting docs):
+    // the handshake window is exactly when the user's own rooting is
+    // the fragile await-open cycle.
+    connecting.set(socketId, this);
   }
 
   /** 0 CONNECTING, 1 OPEN, 2 CLOSING, 3 CLOSED (WHATWG). */
@@ -173,46 +262,99 @@ export class MonetWebSocket {
     if (this._readyState !== 1) {
       throw new Error('MonetWebSocket is not open');
     }
-    const monet = getMonet();
     if (typeof data === 'string') {
       // JSI ArrayBuffer from a string: the module copies the bytes.
-      const bytes = new TextEncoder().encode(data);
-      monet.wsSend(this.connId, bytes.buffer, false);
+      this.conn.send(utf8Encode(data), false);
     } else {
-      monet.wsSend(this.connId, data, true);
+      this.conn.send(data, true);
     }
   }
 
   /** Sends a ping (the transport answers received pings by itself). */
   ping(): void {
-    getMonet().wsSendPing(this.connId);
+    this.conn.sendPing();
   }
 
   /** Starts the close handshake; `onclose` fires when the peer answers. */
   close(code?: number, reason?: string): void {
     if (this._readyState === 1) {
       this._readyState = 2; // CLOSING
-      getMonet().wsClose(this.connId, code ?? 1000, reason ?? '');
+      // The weak entry stays until the terminal close event: messages
+      // may still arrive before the peer's close answer, and a dead
+      // entry would drop them.
+      this.conn.close(code ?? 1000, reason ?? '');
     }
   }
 
   /** Force-aborts the connection (no close handshake). */
   abort(): void {
-    getMonet().wsAbort(this.connId);
+    // The weak entry stays so the terminal event (close 1006 or error)
+    // still reaches this object's handlers; it removes itself there.
+    this.conn.abort();
+  }
+
+  /** Internal: the native on_open dispatch (handshake completed). */
+  handleOpen(): void {
+    this._readyState = 1; // OPEN
+    // Established: the user's scope takes over the rooting (a socket in
+    // use is reachable from the code using it), so the entry turns weak
+    // and a dropped socket stays collectable.
+    connecting.delete(this.socketId);
+    liveSockets.set(this.socketId, new WeakRef(this));
+    this.onopen?.();
+  }
+
+  /**
+   * Internal: the native on_message signal — queue the type flag, pull
+   * the queued data, deliver or buffer.
+   */
+  handleMessageSignal(event: {isBinary: boolean}): void {
+    this.pendingFlags.push(event.isBinary);
+    this.drainMessages();
+  }
+
+  /** Internal: terminal close dispatch. */
+  handleClose(event: {
+    code: number;
+    reason: string;
+    wasClean: boolean;
+  }): void {
+    this._readyState = 3; // CLOSED
+    this._closed = true;
+    connecting.delete(this.socketId);
+    liveSockets.delete(this.socketId);
+    const closeEvent: MonetWsCloseEvent = {
+      code: event.code,
+      reason: event.reason,
+      wasClean: event.wasClean,
+    };
+    if (this._onclose !== null) {
+      this._onclose(closeEvent);
+    } else {
+      this.closeBuffer = closeEvent;
+    }
+  }
+
+  /** Internal: terminal error dispatch. */
+  handleError(event: {kind: string; message: string}): void {
+    this._readyState = 3; // CLOSED
+    this._closed = true;
+    connecting.delete(this.socketId);
+    liveSockets.delete(this.socketId);
+    this._onerror?.({kind: event.kind, message: event.message});
   }
 
   /** Pulls all queued messages, delivering or buffering each. */
   private drainMessages(): void {
-    const monet = getMonet();
     for (;;) {
-      const buffer = monet.wsTakeMessage(this.connId);
+      const buffer = this.conn.takeMessage();
       if (buffer == null) {
         break;
       }
       const isBinary = this.pendingFlags.shift() ?? false;
       const data: string | ArrayBuffer = isBinary
         ? buffer
-        : utf8Decode(buffer);
+        : utf8Decode(new Uint8Array(buffer));
       const event = {data, isBinary};
       if (this._onmessage !== null) {
         this._onmessage(event);
@@ -221,11 +363,4 @@ export class MonetWebSocket {
       }
     }
   }
-}
-
-/** Decodes UTF-8 bytes into a string (the transport validated them). */
-function utf8Decode(buffer: ArrayBuffer): string {
-  const bytes = new Uint8Array(buffer);
-  // TextDecoder is available in RN's Hermes engine.
-  return new TextDecoder().decode(bytes);
 }

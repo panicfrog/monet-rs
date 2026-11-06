@@ -51,9 +51,8 @@ packages/monet-rn/                # npm 包根 = crate 根（crate 放包根，j
   │   [target.'cfg(target_os="android")'.dependencies] monet-rustls, monet-ws
   │   async-global-executor, futures-lite, serde, linkme, anyhow
   src/lib.rs                       # #[RustTurboModule("Monet")]（唯一模块）
-  src/registry.rs                  # fetchId/connId → 会话状态（Mutex<HashMap>，u64 计数）
-  src/fetch.rs                     # fetch 通道：pump 任务 + 取块队列
-  src/ws.rs                        # WS 通道：pump 任务 + 取消息队列
+  src/fetch.rs                     # fetch 通道：fetchId 注册表 + pump 任务 + 取块队列
+  src/ws.rs                        # WS 连接对象（#[TurboObject] + NativeState，Drop = 断开）
   ts/                               # 手写 TS 层（WHATWG fetch 兼容子集）
   │   index.ts                     # 导出 fetch/MonetWebSocket/configurePins/…
   │   response.ts                  # Response 封装（ok/status/headers/arrayBuffer/text/json/body 异步迭代器）
@@ -92,22 +91,41 @@ impl MonetModule {
     pub fn body_done(&self, fetch_id: f64) -> Result<bool>   // EOS 判定（队列空且已结束）
     pub fn abort(&self, fetch_id: f64) -> Result<bool>       // CancelToken.cancel()
 
-    // ---- WebSocket ----
+    // ---- WebSocket：连接对象（#[TurboObject]），无注册表、无 connId ----
     pub fn ws_connect(&self, url: String, protocols: Vec<String>, headers: Vec<HeaderKV>,
                       on_open: TurboCallback, on_message: TurboCallback, // {isBinary}
                       on_close: TurboCallback,                          // {code, reason, wasClean}
-                      on_error: TurboCallback) -> Result<f64 /*connId*/>
-    pub fn ws_take_message(&self, rt, conn_id: f64) -> Result<Option<JsiArrayBuffer>>
-    pub fn ws_send(&self, rt, conn_id: f64, message: JsiArrayBuffer, is_binary: bool) -> Result<bool>
-    pub fn ws_send_ping(&self, conn_id: f64) -> Result<bool>
-    pub fn ws_close(&self, conn_id: f64, code: f64, reason: String) -> Result<bool>
-    pub fn ws_abort(&self, conn_id: f64) -> Result<bool>
+                      on_error: TurboCallback) -> Result<MonetWsConnection>
+}
+
+#[TurboObject]
+impl MonetWsConnection {
+    pub fn send(&self, rt, message: JsiArrayBuffer, is_binary: bool) -> Result<bool>
+    pub fn send_ping(&self) -> Result<bool>
+    pub fn close(&self, code: f64, reason: String) -> Result<bool>
+    pub fn abort(&self) -> Result<bool>
+    pub fn take_message(&self, rt) -> Result<Option<JsiArrayBuffer>>  // None = 暂无
 }
 ```
 
+**WS 连接的生命周期 = JS 对象的生命周期**（M4 实施时从注册表方案改过来）：
+`ws_connect` 返回的连接对象经 `to_js` 交给 JS，其 NativeState 持唯一强引用；
+JS 侧 GC（或模块卸载）→ NativeState 析构 → Rust `Drop` → `CancelToken` →
+pump 收尾。pump 只共享可克隆的片段（取消息队列 `Arc<Mutex<Vec>>`、命令通道
+接收端），绝不持有连接本身——引用计数归零完全由 JS 驱动。TS 层的四个事件
+回调闭包同样**不能捕获 socket 对象**（TurboCallback 的 JSI 句柄是 Hermes 的
+强 GC 根；构造器里的箭头函数还会词法捕获 `this`），在模块级工厂里创建、只
+捕获相关 id，事件经弱表解析。**释放语义**：`close()`（握手）/`abort()`（立即
+断开）是确定性主路径；GC 驱动的 `Drop` 是兜底——Hermes 的 NativeState cell
+finalizer 在老生代清扫才跑（young-gen scavenge 只清 WeakRef），是 *eventually*
+而非及时（这也是 jsi-rs/Nitro 同时提供显式 dispose 的原因）。连接握手期间
+socket 由 TS 层的 connecting 表强持有：`await open` 的挂起帧对 GC 是无根环
+（socket → onopen 闭包 → resolve → promise → 续体 → 环境 → socket），
+握手窗口内的一次 GC 会把 socket 连同 open 一起收走。
+
 内部结构：
 
-- **pump 任务**（`async_global_executor::spawn`，每 fetch/每连接一个）：`client.execute_with_cancel(req, token)` → head 到 → `on_head(status, headers)`；随后循环 `resp.body.next()` → 入队 `Mutex<VecDeque<Bytes>>` + `on_chunk()`；`None` → `on_done`，`Err` → `on_error`。终态后从注册表摘除（take_chunk 的 EOS 用 body_done 区分"队列空"与"已结束"）
+- **pump 任务**（`async_global_executor::spawn`，每 fetch/每连接一个）：`client.execute_with_cancel(req, token)` → head 到 → `on_head(status, headers)`；随后循环 `resp.body.next()` → 入队 `Mutex<VecDeque<Bytes>>` + `on_chunk()`；`None` → `on_done`，`Err` → `on_error`。fetch 终态后从注册表摘除（take_chunk 的 EOS 用 body_done 区分"队列空"与"已结束"）；WS 无注册表——pump 只握队列与命令通道，终态即返回，状态随连接对象存亡
 - **iOS**：`UrlsessionTransport` 一份实例同时服务 HTTP + WS（两 trait 同一类型）；pins 走 `with_pins`（shim 全局注册，last-wins，与 host 语义一致）
 - **Android**：`MonetRustlsTransport`（HTTP）+ `MonetWsTransport`（WS）；pins 分别进 `MonetRustlsConfig.pins` / `WsConfig`（`TlsTrust::PlatformVerifier` 默认，Android 系统信任库）
 
@@ -115,7 +133,7 @@ impl MonetModule {
 
 - `fetch(input, init?) → Promise<MonetResponse>`：`init.method/headers/body/signal`（AbortSignal → abort(fetchId)，RN 自带 AbortController）
 - `MonetResponse`：`ok/status/headers(Headers)/arrayBuffer()/text()/json()` + `body` 异步迭代器（for-await 逐块）；**不做**：FormData/Blob/ReadableStream 完整规范、redirect 手动模式（v1 一律跟随）
-- `MonetWebSocket`：EventTarget 风格（onopen/onmessage/onclose/onerror + addEventListener），binaryType 兼容
+- `MonetWebSocket`：EventTarget 风格（onopen/onmessage/onclose/onerror + addEventListener），binaryType 兼容；内部持有原生连接对象（NativeState）。显式 `close()`/`abort()` 确定性断开；丢弃不 close 也不泄漏（JS 侧无持有，Rust `Drop` 兜底断开——时机由引擎的老生代清扫决定）
 - 回调 → TS Promise/事件的粘合全部在这一层，生成绑定不外露
 
 ### v1 明确不做（记录在案）

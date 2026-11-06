@@ -26,8 +26,8 @@
 
 use std::sync::Arc;
 
-use monet_core::Transport;
 use monet_core::pin::PinConfig;
+use monet_core::Transport;
 
 /// The HTTP transport for this platform + configuration.
 pub fn http_transport(pins: &PinConfig) -> Arc<dyn Transport> {
@@ -48,7 +48,9 @@ fn select_http(pins: &PinConfig) -> Result<Arc<dyn Transport>, String> {
                 #[cfg(not(feature = "fallback-rustls"))]
                 return Err(reason.to_string());
                 #[cfg(feature = "fallback-rustls")]
-                log::info!("monet-rn: HttpEngine unavailable ({reason}) — falling back to monet-rustls");
+                log::info!(
+                    "monet-rn: HttpEngine unavailable ({reason}) — falling back to monet-rustls"
+                );
             }
         }
     }

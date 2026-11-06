@@ -150,12 +150,42 @@ async fn serve_scripted(
     Ok(())
 }
 
+/// WebSocket connections currently open on `/gc-probe`. The observable
+/// for the JS GC check: the app drops a `MonetWebSocket` without
+/// close()/abort() and this count must fall back once the GC-run
+/// NativeState teardown disconnects the Rust side. Static because the
+/// HTTP battery server (same process, other port) serves it as
+/// `/ws-open`.
+pub static GC_PROBE_OPEN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Decrements [`GC_PROBE_OPEN`] when dropped — spanning every exit path
+/// of the connection handler, abrupt client disconnects included (a
+/// guard, not a trailing decrement, because the handler returns from
+/// several places).
+struct GcProbeGuard;
+
+impl GcProbeGuard {
+    /// Arms the guard: counts the connection in.
+    fn arm() -> Self {
+        GC_PROBE_OPEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        GcProbeGuard
+    }
+}
+
+impl Drop for GcProbeGuard {
+    fn drop(&mut self) {
+        GC_PROBE_OPEN.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// A long-lived, externally reachable WebSocket echo server for the JS
 /// battery (the `server` bin): every accepted connection behaves by its
 /// URL path — `/echo` mirrors messages, `/close-1012` closes with the
-/// fidelity-check code, `/ping` sends a probe. Multi-connection (each
-/// battery check opens its own socket); no observation queue (the JS
-/// battery asserts from the client side).
+/// fidelity-check code, `/ping` sends a probe, `/gc-probe` mirrors and
+/// counts (see [`GC_PROBE_OPEN`]). Multi-connection (each battery check
+/// opens its own socket); no observation queue (the JS battery asserts
+/// from the client side).
 pub struct PathEchoServer {
     addr: std::net::SocketAddr,
 }
@@ -219,6 +249,9 @@ async fn serve_by_path(
         },
     )
     .await?;
+    // The GC check's route counts its connections for the /ws-open
+    // observable; the guard releases the count on every exit below.
+    let _gc_probe = (path == "/gc-probe").then(GcProbeGuard::arm);
     match path.as_str() {
         "/close-1012" => {
             use tokio_tungstenite::tungstenite::protocol::CloseFrame;
@@ -239,7 +272,8 @@ async fn serve_by_path(
             while let Some(Ok(_)) = ws.next().await {}
         }
         _ => {
-            // /echo (and anything unrecognized): mirror messages.
+            // /echo, /gc-probe (the counted GC-check route), and anything
+            // unrecognized: mirror messages.
             while let Some(Ok(message)) = ws.next().await {
                 match message {
                     Message::Text(text) => {

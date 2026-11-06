@@ -99,6 +99,31 @@ async function withTimeout<T>(work: Promise<T>, label: string): Promise<T> {
   }
 }
 
+/**
+ * Forces a GC pass (debug-build Hermes exposes global.gc; otherwise
+ * allocation pressure until the collector runs). Enough to clear
+ * WeakRefs — the observable the dispose check asserts on. (Cell
+ * finalizers, by contrast, only run on the old-generation sweep; that
+ * is the engine's eventually-guarantee and not something a check can
+ * rely on.)
+ */
+function forceGc(): void {
+  const gc = (globalThis as {gc?: () => void}).gc;
+  if (typeof gc === 'function') {
+    gc();
+    gc();
+    return;
+  }
+  const junk: unknown[][] = [];
+  for (let round = 0; round < 40; round++) {
+    junk.length = 0;
+    for (let i = 0; i < 100; i++) {
+      junk.push(new Array(20_000).fill(round));
+    }
+  }
+  junk.length = 0;
+}
+
 // ---- the checks (names mirror crates/monet-conformance/src/http.rs) ----
 
 const CHECKS: Array<{name: string; run: (base: string) => Promise<void>}> = [
@@ -274,6 +299,54 @@ const CHECKS: Array<{name: string; run: (base: string) => Promise<void>}> = [
       } finally {
         ws.abort();
       }
+    },
+  },
+  {
+    name: 'ws:dispose_closes_connection',
+    run: async base => {
+      // The socket lifecycle, end to end on the server's observable: the
+      // server counts open connections on /gc-probe (served as /ws-open).
+      // Deterministic release is the explicit API — abort() disconnects
+      // immediately (close() is the polite handshake, exercised by
+      // round_trips) — and the dropped object must not be retained by the
+      // JS side: the native-held event closures capture only a bare id,
+      // so nothing roots the socket once the user lets go.
+      // (The GC-driven Rust drop of the connection is the engine's
+      // eventually-guarantee — Hermes runs NativeState finalizers on the
+      // old-generation sweep, which is not prompt and not testable from
+      // here; the explicit path above is the contract.)
+      const openCount = async (): Promise<number> =>
+        Number(await (await fetch(`${base}/ws-open`)).text());
+      let ws: MonetWebSocket | undefined = new MonetWebSocket(
+        `${DEFAULT_WS_BASE}/gc-probe`,
+      );
+      await waitForOpen(ws);
+      const probe = new WeakRef(ws);
+      assert(
+        (await openCount()) === 1,
+        'the server did not count the open /gc-probe connection',
+      );
+      ws!.abort();
+      await withTimeout(
+        (async () => {
+          for (;;) {
+            if ((await openCount()) === 0) {
+              return;
+            }
+            await new Promise<void>(resolve => setTimeout(resolve, 200));
+          }
+        })(),
+        'ws:dispose_closes_connection',
+      );
+      // Released and dropped: no JS-side rooting (the GC's clearing of
+      // the WeakRef is prompt — the young generation does that).
+      ws = undefined;
+      forceGc();
+      await new Promise<void>(resolve => setTimeout(resolve, 200));
+      assert(
+        probe.deref() === undefined,
+        'the dropped socket was still reachable — something retains it',
+      );
     },
   },
 ];

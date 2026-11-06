@@ -59,8 +59,8 @@ fn main() {
             ws.port()
         );
     }
-    println!("http routes: /plain /chunked /echo /redirect /slow-head /stalled /held /fast");
-    println!("ws routes: /echo (mirror) /close-1012 (fidelity check) /ping (probe)");
+    println!("http routes: /plain /ws-open /chunked /echo /redirect /slow-head /stalled /held /fast");
+    println!("ws routes: /echo (mirror) /close-1012 (fidelity check) /ping (probe) /gc-probe (counted)");
 
     // The server threads keep themselves alive; main must not return or
     // the process exits. Ctrl-C terminates.

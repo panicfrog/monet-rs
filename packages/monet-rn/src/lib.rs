@@ -16,35 +16,33 @@ use std::sync::RwLock;
 
 use jsi::RuntimeHandle;
 use jsi_turbo::RustTurboModule;
+use monet_core::pin::PinConfig;
 use monet_core::Client;
 use monet_core::Method;
 use monet_core::Request;
-use monet_core::pin::PinConfig;
 
 use crate::fetch::FetchRegistry;
+use crate::ws::MonetWsConnection;
 use crate::ws::WsCommand;
-use crate::ws::WsRegistry;
-use futures_lite::StreamExt as _;
+use crate::ws::WsQueue;
 
 #[cfg(target_os = "android")]
 mod bootstrap;
 mod fetch;
 mod platform;
-/// The WebSocket channel: the registry lands with the fetch channel so
-/// the module's state story is complete; the ws_* methods and the pump
-/// wiring arrive in M4 (fields read then).
-/// The WebSocket registry: pure Rust (jsi + core types only), compiled
-/// unconditionally — the transport selection in platform.rs is what the
-/// `websocket` feature gates.
+/// The WebSocket connection object: pure Rust (jsi + core types only),
+/// compiled unconditionally — the transport selection in platform.rs is
+/// what the `websocket` feature gates. The connection's lifetime is the
+/// JS object's (NativeState): drop = disconnect.
 mod ws;
 
 /// The module state: one Client over the platform-selected transport,
-/// rebuilt when configuration changes, plus the fetch/socket registries
-/// shared with the pump tasks.
+/// rebuilt when configuration changes, plus the fetch registry shared
+/// with the pump tasks. WebSocket connections carry their own state —
+/// no registry needed (see ws.rs).
 pub struct Monet {
     client: RwLock<Arc<Client>>,
     fetches: FetchRegistry,
-    sockets: WsRegistry,
 }
 
 impl Monet {
@@ -54,7 +52,6 @@ impl Monet {
                 &PinConfig::default(),
             )))),
             fetches: FetchRegistry::new(),
-            sockets: WsRegistry::new(),
         })
     }
 
@@ -106,8 +103,8 @@ struct ErrorEvent {
     message: String,
 }
 
-/// One WS message signal: the type flag; the bytes follow through
-/// `ws_take_message`.
+/// One WS message signal: the type flag; the bytes follow through the
+/// connection object's `take_message`.
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct WsMessageEvent {
@@ -184,7 +181,10 @@ impl Monet {
     ) -> anyhow::Result<f64> {
         // `FromStr::Err` is `Infallible` — the match is exhaustive by
         // construction; unknown verbs land in `Method::Other`.
-        let method = options.method.parse::<Method>().unwrap_or_else(|_| unreachable!());
+        let method = options
+            .method
+            .parse::<Method>()
+            .unwrap_or_else(|_| unreachable!());
         let url = options
             .url
             .parse::<monet_core::Url>()
@@ -215,7 +215,6 @@ impl Monet {
         // client is only needed for hook plumbing (empty in v1), so the
         // pump drives the transport directly — cancellation stays
         // transport-level, which the Client pipeline doesn't expose.
-        use monet_core::Transport as _;
         let transport = platform::http_transport(&PinConfig::default());
         let execute = transport.execute(request, cancel);
         async_global_executor::spawn(async move {
@@ -300,12 +299,15 @@ impl Monet {
 
     // ---- WebSocket: open callback first, messages pulled in chunks ----
 
-    /// Opens a WebSocket. `on_open` fires when the handshake completes;
-    /// then `on_message` signals queued data (JS pulls with
-    /// `ws_take_message`, the event carries `{isBinary}`), and exactly
-    /// one of `on_close` / `on_error` terminates. The close event
-    /// carries `{code, reason, wasClean}` — the fidelity the
-    /// URLSession-based iOS transport cannot provide.
+    /// Opens a WebSocket and returns the connection object. `on_open`
+    /// fires when the handshake completes; then `on_message` signals
+    /// queued data (JS pulls with the object's `take_message`, the event
+    /// carries `{isBinary}`), and exactly one of `on_close` / `on_error`
+    /// terminates. The close event carries `{code, reason, wasClean}` —
+    /// the fidelity the URLSession-based iOS transport cannot provide.
+    /// The connection's lifetime is the JS object's: GC dropping the
+    /// wrapper drops the native state, whose `Drop` cancels the
+    /// transport.
     pub fn ws_connect(
         &self,
         url: String,
@@ -315,7 +317,7 @@ impl Monet {
         on_message: jsi_turbo::TurboCallback,
         on_close: jsi_turbo::TurboCallback,
         on_error: jsi_turbo::TurboCallback,
-    ) -> anyhow::Result<f64> {
+    ) -> anyhow::Result<MonetWsConnection> {
         let url = url
             .parse::<monet_core::Url>()
             .map_err(|e| anyhow::anyhow!("invalid URL: {e}"))?;
@@ -334,8 +336,7 @@ impl Monet {
                 .map_err(|e| anyhow::anyhow!("invalid header: {e}"))?;
         }
 
-        let (conn_id, cancel, command_rx) = self.sockets.allocate();
-        let sockets = self.sockets.clone();
+        let (conn, cancel, command_rx, queue) = MonetWsConnection::channel();
         let on_open = Arc::new(on_open);
         let on_message = Arc::new(on_message);
         let on_close = Arc::new(on_close);
@@ -352,10 +353,9 @@ impl Monet {
                 Ok(mut stream) => {
                     on_open.call_with_no_args();
                     ws_pump(
-                        conn_id,
                         &mut stream,
                         command_rx,
-                        &sockets,
+                        &queue,
                         &on_message,
                         &on_close,
                         &on_error,
@@ -363,79 +363,26 @@ impl Monet {
                     .await;
                 }
                 Err(error) => {
-                    sockets.finish(conn_id);
+                    // The connect itself failed: the object JS holds is
+                    // inert (its queue is empty, its commands go
+                    // nowhere) and `on_error` says why. Nothing to clean
+                    // up — the connection carries its own state.
                     on_error.call(ErrorEvent::from(error));
                 }
             }
         })
         .detach();
 
-        Ok(conn_id)
-    }
-
-    /// Takes one queued WS message as a zero-copy ArrayBuffer. The
-    /// isBinary flag arrived on the `on_message` signal that preceded
-    /// this pull — the signal/data pairs are strictly FIFO, so the TS
-    /// layer pairs them by order (same shape as the fetch channel's
-    /// on_chunk/take_chunk).
-    pub fn ws_take_message<'rt>(
-        &self,
-        rt: &mut RuntimeHandle<'rt>,
-        conn_id: f64,
-    ) -> anyhow::Result<Option<jsi::JsiArrayBuffer<'rt>>> {
-        Ok(self.sockets.take_message(conn_id, rt).map(|(buffer, _)| buffer))
-    }
-
-    /// Sends a text (`is_binary == false`) or binary message.
-    pub fn ws_send<'rt>(
-        &self,
-        _rt: &mut RuntimeHandle<'rt>,
-        conn_id: f64,
-        message: jsi::JsiArrayBuffer<'rt>,
-        is_binary: bool,
-    ) -> anyhow::Result<bool> {
-        // The upload is copied here (v1 parity with fetch): the borrow
-        // ends with the call.
-        let data = message.data(_rt).to_vec();
-        Ok(self.sockets.send_command(
-            conn_id,
-            WsCommand::Send { data, is_binary },
-        ))
-    }
-
-    /// Sends a ping (the transport answers received pings by itself).
-    pub fn ws_send_ping(&self, conn_id: f64) -> anyhow::Result<bool> {
-        Ok(self.sockets.send_command(
-            conn_id,
-            WsCommand::Send {
-                data: Vec::new(),
-                is_binary: true,
-            },
-        ))
-    }
-
-    /// Starts the close handshake with this code and reason; the peer's
-    /// answering close frame fires `on_close`.
-    pub fn ws_close(&self, conn_id: f64, code: f64, reason: String) -> anyhow::Result<bool> {
-        let code = u16::try_from(code as u64).unwrap_or(1000);
-        Ok(self
-            .sockets
-            .send_command(conn_id, WsCommand::Close { code, reason }))
-    }
-
-    /// Aborts a connection: cancels the transport-level token.
-    pub fn ws_abort(&self, conn_id: f64) -> anyhow::Result<bool> {
-        Ok(self.sockets.abort(conn_id))
+        Ok(conn)
     }
 }
 
 /// The WS pump: delivers received messages into the queue with signals,
 /// applies user commands to the stream, and terminates exactly once.
 async fn ws_pump(
-    conn_id: f64,
     stream: &mut monet_core::ws::WebSocketStream,
     mut command_rx: futures_channel::mpsc::UnboundedReceiver<WsCommand>,
-    sockets: &crate::ws::WsRegistry,
+    queue: &WsQueue,
     on_message: &jsi_turbo::TurboCallback,
     on_close: &jsi_turbo::TurboCallback,
     on_error: &jsi_turbo::TurboCallback,
@@ -444,9 +391,10 @@ async fn ws_pump(
     use monet_core::ws::WsMessage;
     loop {
         // Two-way select: a received message or a user command. The
-        // cancel token lives with the transport (handed over in
-        // `connect`): firing it drops the transport pump, which ends
-        // the stream — `Ok(None)` below carries the abnormal close.
+        // cancel token lives with the connection object (JS side) and
+        // the transport (handed over in `connect`): firing it drops the
+        // transport pump, which ends the stream — `Ok(None)` below
+        // carries the abnormal close.
         enum Step {
             Message(monet_core::Result<Option<WsMessage>>),
             Command(Option<WsCommand>),
@@ -458,33 +406,25 @@ async fn ws_pump(
         .await;
         match step {
             Step::Message(Ok(Some(WsMessage::Text(text)))) => {
-                if sockets.push_message(conn_id, text.into_bytes(), false) {
-                    on_message.call(WsMessageEvent { is_binary: false });
-                } else {
-                    return;
-                }
+                queue.lock().unwrap().push(text.into_bytes());
+                on_message.call(WsMessageEvent { is_binary: false });
             }
             Step::Message(Ok(Some(WsMessage::Binary(bytes)))) => {
-                if sockets.push_message(conn_id, bytes.to_vec(), true) {
-                    on_message.call(WsMessageEvent { is_binary: true });
-                } else {
-                    return;
-                }
-            }
-            Step::Message(Ok(Some(WsMessage::Ping(bytes)))) => {
-                let _ = bytes;
-                // Surfaced for tests/custom protocols; the transport
-                // already answered.
-                let _ = sockets.push_message(conn_id, Vec::new(), true);
+                queue.lock().unwrap().push(bytes.to_vec());
                 on_message.call(WsMessageEvent { is_binary: true });
             }
-            Step::Message(Ok(Some(WsMessage::Pong(_)))) => {
+            Step::Message(Ok(Some(WsMessage::Ping(bytes)))) => {
+                // Surfaced with its payload for tests/custom protocols;
+                // the transport already answered it.
+                queue.lock().unwrap().push(bytes.to_vec());
+                on_message.call(WsMessageEvent { is_binary: true });
+            }
+            Step::Message(Ok(Some(WsMessage::Pong(bytes)))) => {
                 // Fire-and-forget: surfaced like a message for symmetry.
-                let _ = sockets.push_message(conn_id, Vec::new(), true);
+                queue.lock().unwrap().push(bytes.to_vec());
                 on_message.call(WsMessageEvent { is_binary: true });
             }
             Step::Message(Ok(Some(WsMessage::Close(frame)))) => {
-                sockets.finish(conn_id);
                 match frame {
                     Some(frame) => on_close.call(WsCloseEvent {
                         code: f64::from(frame.code),
@@ -501,7 +441,6 @@ async fn ws_pump(
             }
             Step::Message(Ok(None)) => {
                 // Stream ended without a close frame: abnormal shutdown.
-                sockets.finish(conn_id);
                 on_close.call(WsCloseEvent {
                     code: 1006.0,
                     reason: String::new(),
@@ -510,7 +449,6 @@ async fn ws_pump(
                 return;
             }
             Step::Message(Err(error)) => {
-                sockets.finish(conn_id);
                 on_error.call(ErrorEvent::from(error));
                 return;
             }
@@ -521,7 +459,6 @@ async fn ws_pump(
                     WsMessage::Text(String::from_utf8_lossy(&data).into_owned())
                 };
                 if stream.send(message).is_err() {
-                    sockets.finish(conn_id);
                     on_error.call(ErrorEvent::from(monet_core::Error::Body(
                         "websocket driver dropped".into(),
                     )));
@@ -530,7 +467,6 @@ async fn ws_pump(
             }
             Step::Command(Some(WsCommand::Close { code, reason })) => {
                 if stream.close(code, reason).is_err() {
-                    sockets.finish(conn_id);
                     on_error.call(ErrorEvent::from(monet_core::Error::Body(
                         "websocket driver dropped".into(),
                     )));
@@ -540,8 +476,9 @@ async fn ws_pump(
                 // arrives as a Close message above.
             }
             Step::Command(None) => {
-                // The command channel closed (state cleaned up after a
-                // terminal event raced us): nothing left to do.
+                // The command channel closed (the connection object is
+                // gone): the cancel token has fired with it, so the
+                // stream race above is about to end this pump anyway.
                 return;
             }
         }

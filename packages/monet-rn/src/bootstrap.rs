@@ -16,8 +16,10 @@ pub extern "system" fn Java_com_monet_rn_httpengine_MonetBootstrap_nativeInit(
     _class: jni::objects::JClass<'_>,
     context: jni::objects::JObject<'_>,
 ) {
-    let mut captured: Option<(jni::JavaVM, jni::objects::Global<jni::objects::JObject<'static>>)> =
-        None;
+    let mut captured: Option<(
+        jni::JavaVM,
+        jni::objects::Global<jni::objects::JObject<'static>>,
+    )> = None;
     let () = env
         .with_env(|env| -> Result<(), jni::errors::Error> {
             let vm = env.get_java_vm()?;
@@ -30,7 +32,9 @@ pub extern "system" fn Java_com_monet_rn_httpengine_MonetBootstrap_nativeInit(
         if let Err(error) =
             monet_httpengine::init(&vm, context, "com.monet.rn.httpengine.HttpEngineBridge")
         {
-            log::info!("monet-rn: HttpEngine bootstrap failed ({error}) — the rustls fallback applies");
+            log::info!(
+                "monet-rn: HttpEngine bootstrap failed ({error}) — the rustls fallback applies"
+            );
         }
     }
 }

@@ -52,15 +52,14 @@ impl FetchRegistry {
     pub fn allocate(&self) -> (f64, CancelToken) {
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let cancel = CancelToken::new();
-        self.inner
-            .states
-            .lock()
-            .unwrap()
-            .insert(id, FetchState {
+        self.inner.states.lock().unwrap().insert(
+            id,
+            FetchState {
                 cancel: cancel.clone(),
                 queue: Mutex::new(VecDeque::new()),
                 finished: false,
-            });
+            },
+        );
         (id as f64, cancel)
     }
 
@@ -88,7 +87,9 @@ impl FetchRegistry {
         let states = self.inner.states.lock().unwrap();
         let state = states.get(&f64_to_u64(id))?;
         let mut queue = state.queue.lock().unwrap();
-        queue.pop_front().map(|chunk| JsiArrayBuffer::from_vec(chunk, rt))
+        queue
+            .pop_front()
+            .map(|chunk| JsiArrayBuffer::from_vec(chunk, rt))
     }
 
     /// Marks the fetch terminated (the terminal callback has fired).

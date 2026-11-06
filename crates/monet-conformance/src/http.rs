@@ -226,6 +226,19 @@ async fn respond(
             StatusCode::OK,
             boxed(Full::new(Bytes::from_static(b"plain"))),
         ),
+        // The observable for the JS GC check: how many WebSocket
+        // connections are currently open on the battery server's
+        // /gc-probe route (same process, other port — the count travels
+        // via the static; see ws.rs). The JS battery watches a dropped
+        // socket's connection close through this.
+        "/ws-open" => ok(
+            StatusCode::OK,
+            boxed(Full::new(Bytes::from(
+                crate::ws::GC_PROBE_OPEN
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .to_string(),
+            ))),
+        ),
         "/chunked" => {
             let stream = futures_lite::stream::iter([
                 b"alpha".to_vec(),

@@ -1,19 +1,23 @@
-//! The WebSocket registry: connId → open socket, shared between the
-//! module methods (JS thread) and the pump tasks (executor threads).
+//! The WebSocket connection object: the native half of MonetWebSocket.
 //!
-//! Same protocol as the fetch channel: the pump queues received messages
-//! and signals `on_message`; JS pulls with `ws_take_message`
-//! (zero-copy). Sending is command-driven — `ws_send`/`ws_close` push a
-//! [`WsCommand`] into a per-connection channel that the pump drains and
-//! applies to the [`WebSocketStream`] it owns (the stream's send half is
-//! `&mut self`, so only the pump may touch it).
+//! `ws_connect` returns a `MonetWsConnection` to JS; the JS wrapper's
+//! NativeState holds the sole strong reference, so when the JS object is
+//! collected (or the app tears down) the Rust instance drops — and its
+//! [`Drop`] impl fires the cancel token, which ends the pump. No registry,
+//! no connection ids: the object IS the handle.
+//!
+//! The pump shares only the clonable pieces (the receive queue, the
+//! command channel's receiving end) — never the connection itself — so the
+//! reference count reaching zero is driven by JS alone. Same protocol
+//! as the fetch channel underneath: the pump queues received messages and
+//! signals `on_message`; JS pulls with `take_message` (zero-copy). Sending
+//! is command-driven — `send`/`close` push a [`WsCommand`] into a channel
+//! that the pump drains and applies to the [`WebSocketStream`] it owns
+//! (the stream's send half is `&mut self`, so only the pump may touch it).
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use jsi::JsiArrayBuffer;
-use jsi::RuntimeHandle;
+use jsi::{JsiArrayBuffer, RuntimeHandle};
 use monet_core::CancelToken;
 
 /// One user-issued command for the pump to apply to the stream.
@@ -24,134 +28,138 @@ pub(crate) enum WsCommand {
     Close { code: u16, reason: String },
 }
 
-struct SocketState {
+/// The receive queue: received messages waiting for JS to pull them
+/// (zero-copy). The isBinary flag is NOT queued — it rides the
+/// `on_message` signal that precedes each pull, and the TS layer pairs
+/// them FIFO (same shape as the fetch channel's on_chunk/take_chunk).
+pub(crate) type WsQueue = Arc<Mutex<Vec<Vec<u8>>>>;
+
+/// A live WebSocket connection as handed to JS. Every operation goes
+/// through the object; dropping it disconnects.
+pub struct MonetWsConnection {
     cancel: CancelToken,
-    queue: Mutex<Vec<QueuedMessage>>,
-    /// Commands waiting for the pump (send/close arrive from the JS
-    /// thread; only the pump touches the stream).
     commands: futures_channel::mpsc::UnboundedSender<WsCommand>,
-    finished: bool,
+    queue: WsQueue,
 }
 
-struct QueuedMessage {
-    data: Vec<u8>,
-    is_binary: bool,
-}
-
-#[derive(Clone)]
-pub struct WsRegistry {
-    inner: Arc<Inner>,
-}
-
-struct Inner {
-    next_id: AtomicU64,
-    states: Mutex<HashMap<u64, SocketState>>,
-}
-
-impl WsRegistry {
-    pub fn new() -> Self {
-        WsRegistry {
-            inner: Arc::new(Inner {
-                next_id: AtomicU64::new(0),
-                states: Mutex::new(HashMap::new()),
-            }),
-        }
-    }
-
-    /// Allocates a connection: the id (surfaced to JS as f64), the
-    /// cancel token for the transport connect call, and the receiving
-    /// end of the command channel for the pump to drain.
-    pub fn allocate(
-        &self,
-    ) -> (
-        f64,
+impl MonetWsConnection {
+    /// Creates the connection halves: the object for JS, the cancel token
+    /// for the transport's connect call, the command stream for the pump
+    /// to drain, and the shared receive queue. (Same shape as
+    /// `monet_core::ws::channel`, plus the cancel token the transport
+    /// needs — it stays live in the object so dropping the object can
+    /// fire it.)
+    pub(crate) fn channel() -> (
+        Self,
         CancelToken,
         futures_channel::mpsc::UnboundedReceiver<WsCommand>,
+        WsQueue,
     ) {
-        let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let cancel = CancelToken::new();
         let (command_tx, command_rx) = futures_channel::mpsc::unbounded();
-        self.inner.states.lock().unwrap().insert(
-            id,
-            SocketState {
+        let queue: WsQueue = Arc::new(Mutex::new(Vec::new()));
+        (
+            MonetWsConnection {
                 cancel: cancel.clone(),
-                queue: Mutex::new(Vec::new()),
                 commands: command_tx,
-                finished: false,
+                queue: queue.clone(),
             },
-        );
-        (f64::from(u32::try_from(id).unwrap_or(u32::MAX)), cancel, command_rx)
+            cancel,
+            command_rx,
+            queue,
+        )
     }
+}
 
-    /// Queues one received message from the pump; `false` when the state
-    /// is gone (post-cleanup — the pump stops pulling).
-    pub fn push_message(&self, id: f64, data: Vec<u8>, is_binary: bool) -> bool {
-        let mut states = self.inner.states.lock().unwrap();
-        match states.get_mut(&(id as u64)) {
-            Some(state) => {
-                state.queue.lock().unwrap().push(QueuedMessage { data, is_binary });
-                true
-            }
-            None => false,
+impl Drop for MonetWsConnection {
+    fn drop(&mut self) {
+        // The JS object went away (GC or teardown): disconnect. The pump
+        // sees the stream end, fires its terminal event (to whoever is
+        // still listening), and exits.
+        //
+        // NOTE: on Hermes the GC-driven path is an *eventually* guarantee,
+        // not a prompt one — the NativeState cell's finalizer runs on the
+        // old-generation sweep, which a young-gen collection does not
+        // trigger (a cleared WeakRef says nothing about the finalizer).
+        // Deterministic release is the explicit API: `close()` for the
+        // handshake, `abort()` for an immediate disconnect — both fire
+        // this same token. The Drop is the backstop for the dropped
+        // object, arriving whenever the collector gets to it.
+        self.cancel.cancel();
+    }
+}
+
+impl Default for MonetWsConnection {
+    /// An inert connection: a token nothing watches, a command channel
+    /// nobody drains, an empty queue. Only the object machinery's
+    /// default-construction bound wants this — `ws_connect` is the only
+    /// constructor that reaches JS, and it always wires a real pump.
+    fn default() -> Self {
+        MonetWsConnection {
+            cancel: CancelToken::new(),
+            commands: futures_channel::mpsc::unbounded().0,
+            queue: Arc::new(Mutex::new(Vec::new())),
         }
     }
+}
 
-    /// Takes one queued message as a zero-copy ArrayBuffer; `None` when
-    /// the queue is empty (check `is_done`).
+#[jsi_turbo::TurboObject]
+impl MonetWsConnection {
+    /// Sends a text (`is_binary == false`) or binary message.
+    pub fn send<'rt>(
+        &self,
+        rt: &mut RuntimeHandle<'rt>,
+        message: JsiArrayBuffer<'rt>,
+        is_binary: bool,
+    ) -> anyhow::Result<bool> {
+        // The upload is copied here (v1 parity with fetch): the borrow
+        // ends with the call.
+        let data = message.data(rt).to_vec();
+        Ok(self
+            .commands
+            .unbounded_send(WsCommand::Send { data, is_binary })
+            .is_ok())
+    }
+
+    /// Sends a ping (the transport answers received pings by itself).
+    pub fn send_ping(&self) -> anyhow::Result<bool> {
+        Ok(self
+            .commands
+            .unbounded_send(WsCommand::Send {
+                data: Vec::new(),
+                is_binary: true,
+            })
+            .is_ok())
+    }
+
+    /// Starts the close handshake with this code and reason; the peer's
+    /// answering close frame fires `on_close`.
+    pub fn close(&self, code: f64, reason: String) -> anyhow::Result<bool> {
+        let code = u16::try_from(code as u64).unwrap_or(1000);
+        Ok(self
+            .commands
+            .unbounded_send(WsCommand::Close { code, reason })
+            .is_ok())
+    }
+
+    /// Force-aborts the connection (no close handshake): fires the
+    /// transport-level token. The pump surfaces the abrupt end as a
+    /// `1006` close event.
+    pub fn abort(&self) -> anyhow::Result<bool> {
+        self.cancel.cancel();
+        Ok(true)
+    }
+
+    /// Takes one queued message as a zero-copy ArrayBuffer. The isBinary
+    /// flag arrived on the `on_message` signal that preceded this pull —
+    /// the signal/data pairs are strictly FIFO, so the TS layer pairs
+    /// them by order (same shape as the fetch channel's
+    /// on_chunk/take_chunk).
     pub fn take_message<'rt>(
         &self,
-        id: f64,
         rt: &mut RuntimeHandle<'rt>,
-    ) -> Option<(JsiArrayBuffer<'rt>, bool)> {
-        let states = self.inner.states.lock().unwrap();
-        let state = states.get(&(id as u64))?;
-        let mut queue = state.queue.lock().unwrap();
-        queue
-            .pop()
-            .map(|message| (JsiArrayBuffer::from_vec(message.data, rt), message.is_binary))
-    }
-
-    /// Enqueues a send/close command for the pump. `false` when the
-    /// connection is unknown or its pump is already gone.
-    pub fn send_command(&self, id: f64, command: WsCommand) -> bool {
-        let states = self.inner.states.lock().unwrap();
-        match states.get(&(id as u64)) {
-            Some(state) => state.commands.unbounded_send(command).is_ok(),
-            None => false,
-        }
-    }
-
-    /// Marks the connection terminated.
-    pub fn finish(&self, id: f64) {
-        let mut states = self.inner.states.lock().unwrap();
-        if let Some(state) = states.get_mut(&(id as u64)) {
-            state.finished = true;
-        }
-    }
-
-    /// `true` when terminated and drained.
-    pub fn is_done(&self, id: f64) -> bool {
-        let states = self.inner.states.lock().unwrap();
-        match states.get(&(id as u64)) {
-            Some(state) => state.finished && state.queue.lock().unwrap().is_empty(),
-            None => true,
-        }
-    }
-
-    /// Fires the cancel token (abort / connect-phase cancellation).
-    pub fn abort(&self, id: f64) -> bool {
-        let states = self.inner.states.lock().unwrap();
-        match states.get(&(id as u64)) {
-            Some(state) => {
-                state.cancel.cancel();
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// Drops a finished connection's state.
-    pub fn cleanup(&self, id: f64) {
-        self.inner.states.lock().unwrap().remove(&(id as u64));
+    ) -> anyhow::Result<Option<JsiArrayBuffer<'rt>>> {
+        let data = self.queue.lock().unwrap().pop();
+        Ok(data.map(|data| JsiArrayBuffer::from_vec(data, rt)))
     }
 }
