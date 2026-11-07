@@ -115,11 +115,16 @@ pump 收尾。pump 只共享可克隆的片段（取消息队列 `Arc<Mutex<Vec>
 接收端），绝不持有连接本身——引用计数归零完全由 JS 驱动。TS 层的四个事件
 回调闭包同样**不能捕获 socket 对象**（TurboCallback 的 JSI 句柄是 Hermes 的
 强 GC 根；构造器里的箭头函数还会词法捕获 `this`），在模块级工厂里创建、只
-捕获相关 id，事件经弱表解析。**释放语义**：`close()`（握手）/`abort()`（立即
-断开）是确定性主路径；GC 驱动的 `Drop` 是兜底——Hermes 的 NativeState cell
-finalizer 在老生代清扫才跑（young-gen scavenge 只清 WeakRef），是 *eventually*
-而非及时（这也是 jsi-rs/Nitro 同时提供显式 dispose 的原因）。连接握手期间
-socket 由 TS 层的 connecting 表强持有：`await open` 的挂起帧对 GC 是无根环
+捕获相关 id，事件经弱表解析。**释放语义**：丢掉引用即释放——app 自身的分配
+驱动回收器走到 wrapper 的 NativeState，Rust `Drop` 断开连接，无需任何显式
+dispose；要立即断开用 `close()`（握手）/`abort()`（取消）。**两个引擎事实**
+（2026-11 实测钉死）：Hades 的强制 `gc()`（force-compaction 路径）清 WeakRef
+但跳过 NativeState cell finalization——`Drop` 只在自然老生代清扫时跑，是
+eventually 而非可观测窗口；`WeakRef.deref()` 会把目标放进 Hermes 的
+keep-alive 集（keepDuringJob）直到下一次 JSI `drainMicrotasks`——宿主稀疏
+drain 时被轮询的对象因自己的探针而永生（所以 TS 层的事件分发 deref 是对的：
+事件在流动期间连接本就该活着）。连接握手期间 socket 由 TS 层的 connecting
+表强持有：`await open` 的挂起帧对 GC 是无根环
 （socket → onopen 闭包 → resolve → promise → 续体 → 环境 → socket），
 握手窗口内的一次 GC 会把 socket 连同 open 一起收走。
 
@@ -133,7 +138,7 @@ socket 由 TS 层的 connecting 表强持有：`await open` 的挂起帧对 GC �
 
 - `fetch(input, init?) → Promise<MonetResponse>`：`init.method/headers/body/signal`（AbortSignal → abort(fetchId)，RN 自带 AbortController）
 - `MonetResponse`：`ok/status/headers(Headers)/arrayBuffer()/text()/json()` + `body` 异步迭代器（for-await 逐块）；**不做**：FormData/Blob/ReadableStream 完整规范、redirect 手动模式（v1 一律跟随）
-- `MonetWebSocket`：EventTarget 风格（onopen/onmessage/onclose/onerror + addEventListener），binaryType 兼容；内部持有原生连接对象（NativeState）。显式 `close()`/`abort()` 确定性断开；丢弃不 close 也不泄漏（JS 侧无持有，Rust `Drop` 兜底断开——时机由引擎的老生代清扫决定）
+- `MonetWebSocket`：EventTarget 风格（onopen/onmessage/onclose/onerror + addEventListener），binaryType 兼容；内部持有原生连接对象（NativeState）。丢弃不 close 也不泄漏：JS 侧无持有，自然回收触发 Rust `Drop` 断开；`close()`/`abort()` 用于需要立即断开的场景
 - 回调 → TS Promise/事件的粘合全部在这一层，生成绑定不外露
 
 ### v1 明确不做（记录在案）

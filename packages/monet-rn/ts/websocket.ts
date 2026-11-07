@@ -32,13 +32,13 @@ import { utf8Decode, utf8Encode } from './utf8';
  * (`liveSockets`) — the user's scope holds a socket they are using — so
  * dropping it without close()/abort() stays collectable. The connection
  * object rides the JS wrapper's NativeState: when the collector reclaims
- * the wrapper, the connection's Rust `Drop` fires the cancel token and
- * ends the pump. On Hermes that GC-driven path is an eventually guarantee
- * (NativeState finalizers run on the old-generation sweep, not promptly),
- * so the deterministic release paths are the explicit `close()` handshake
- * and `abort()` — the Drop is the backstop, arriving whenever the
- * collector gets to it. The pump's terminal event (which always fires,
- * even after that cancellation) is what removes a socket's entry here.
+ * the wrapper (the app's own allocation drives it — no explicit
+ * collection needed), the connection's Rust `Drop` fires the cancel
+ * token and ends the pump. That is the release contract for a dropped
+ * socket; the timing is the collector's schedule, so use close() or
+ * abort() when immediacy matters. The pump's terminal event (which
+ * always fires, even after that cancellation) is what removes a socket's
+ * entry here.
  */
 const connecting = new Map<number, MonetWebSocket>();
 const liveSockets = new Map<number, WeakRef<MonetWebSocket>>();
@@ -125,13 +125,13 @@ type OpenHandler = () => void;
  * fires on handshake, message/close/error as events; send/close/ping as
  * methods) over the native connection object. The `close` event's code
  * and reason round-trip exactly — the fidelity that motivated the iOS
- * transport's hand-rolled framing. Releasing is explicit and
- * deterministic — `close()` for the handshake, `abort()` for an immediate
+ * transport's hand-rolled framing. Releasing when timing matters is
+ * explicit — `close()` for the handshake, `abort()` for an immediate
  * disconnect. A socket dropped without either is not leaked: nothing on
  * the JS side retains it, and the connection's Rust `Drop` (the JS
- * wrapper's NativeState) disconnects whenever the collector reclaims the
- * wrapper — Hermes runs that finalizer on the old-generation sweep, so
- * treat it as a backstop, not a prompt close.
+ * wrapper's NativeState) disconnects once the collector reclaims the
+ * wrapper — the app's own allocation drives that, no explicit disposal
+ * required.
  */
 export class MonetWebSocket {
   /** The native connection object (its lifetime is this object's). */

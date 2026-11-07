@@ -73,18 +73,17 @@ impl MonetWsConnection {
 
 impl Drop for MonetWsConnection {
     fn drop(&mut self) {
-        // The JS object went away (GC or teardown): disconnect. The pump
-        // sees the stream end, fires its terminal event (to whoever is
-        // still listening), and exits.
+        // The JS object went away: disconnect. The pump sees the stream
+        // end, fires its terminal event (to whoever is still listening),
+        // and exits.
         //
-        // NOTE: on Hermes the GC-driven path is an *eventually* guarantee,
-        // not a prompt one — the NativeState cell's finalizer runs on the
-        // old-generation sweep, which a young-gen collection does not
-        // trigger (a cleared WeakRef says nothing about the finalizer).
-        // Deterministic release is the explicit API: `close()` for the
-        // handshake, `abort()` for an immediate disconnect — both fire
-        // this same token. The Drop is the backstop for the dropped
-        // object, arriving whenever the collector gets to it.
+        // This is the release path for a *dropped* socket: the app's own
+        // allocation drives the collector to the wrapper's NativeState,
+        // no explicit disposal required. The timing is the collector's
+        // schedule (young-gen scavenges clear WeakRefs but run cell
+        // finalizers only on the old-generation sweep), so `close()` /
+        // `abort()` — which fire this same token directly — remain the
+        // paths to use when immediacy matters.
         self.cancel.cancel();
     }
 }
