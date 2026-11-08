@@ -156,8 +156,7 @@ async fn serve_scripted(
 /// NativeState teardown disconnects the Rust side. Static because the
 /// HTTP battery server (same process, other port) serves it as
 /// `/ws-open`.
-pub static GC_PROBE_OPEN: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+pub static GC_PROBE_OPEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Decrements [`GC_PROBE_OPEN`] when dropped — spanning every exit path
 /// of the connection handler, abrupt client disconnects included (a
@@ -233,18 +232,23 @@ impl PathEchoServer {
     }
 }
 
-/// Reads the handshake request's path (tungstenite's callback sees it
-/// before the upgrade completes) and serves the matching behavior.
+/// Reads the handshake request's path and the hook-check header
+/// (tungstenite's callback sees both before the upgrade completes) and
+/// serves the matching behavior.
 #[allow(clippy::result_large_err)]
 async fn serve_by_path(
     stream: tokio::net::TcpStream,
 ) -> Result<(), tokio_tungstenite::tungstenite::Error> {
     let mut path = String::new();
+    let mut hook_header = String::new();
     let mut ws = tokio_tungstenite::accept_hdr_async(
         stream,
         |request: &tokio_tungstenite::tungstenite::http::Request<()>,
          response: tokio_tungstenite::tungstenite::handshake::server::Response| {
             path = request.uri().path().to_string();
+            if let Some(value) = request.headers().get("x-ws-hook") {
+                hook_header = String::from_utf8_lossy(value.as_bytes()).into_owned();
+            }
             Ok(response)
         },
     )
@@ -253,6 +257,27 @@ async fn serve_by_path(
     // observable; the guard releases the count on every exit below.
     let _gc_probe = (path == "/gc-probe").then(GcProbeGuard::arm);
     match path.as_str() {
+        "/hook-echo" => {
+            // The request-hook check: whatever the hook injected into the
+            // upgrade request's `x-ws-hook` header comes back as the
+            // first message, then the route mirrors like /echo.
+            ws.send(Message::Text(hook_header.into())).await?;
+            while let Some(Ok(message)) = ws.next().await {
+                match message {
+                    Message::Text(text) => {
+                        ws.send(Message::Text(text)).await?;
+                    }
+                    Message::Binary(bytes) => {
+                        ws.send(Message::Binary(bytes)).await?;
+                    }
+                    Message::Close(_) => {
+                        let _ = ws.close(None).await;
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            }
+        }
         "/close-1012" => {
             use tokio_tungstenite::tungstenite::protocol::CloseFrame;
             use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;

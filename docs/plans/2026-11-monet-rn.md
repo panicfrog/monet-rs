@@ -178,7 +178,7 @@ monet-urlsession 的 Swift shim 对象会进 superlib `librust_app.a`，最终�
 - **M2**：**首次三端构建全绿**（iOS 模拟器 + Android 模拟器）：Monet 模块带一个 `ping() -> String` 方法，App 调通——一次性消解聚合构建 × monet crates × Swift shim 进 superlib × Android 链接四重集成风险
 - **M3**：fetch 通道全量（configure_pins/timeout/fetch/take_chunk/abort + pump + TS fetch/Response + server bin）+ JS 电池 HTTP 六项：iOS 模拟器、Android 模拟器双绿 + **iPhone 真机跑一次**（补上 transport 矩阵最后一块）
 - **M4**：WS 通道（ws_* + TS WebSocket + 电池 WS 三项）双端绿
-- **M5（v1.1）**：JS hook 回程协议 + TS hook API；TLS/pins 的真机手动验证项
+- **M5（v1.1）**：JS hook 回程协议 + TS hook API；TLS/pins 的真机手动验证项。**已实施（2026-11-08）**：observer/hook 双通道（见 docs/plans/2026-11-hooks.md 设计记录），电池 +8 项，双平台 18/18；TLS/pins 真机手动验证仍开放
 - 每步：crates/ 内改动照常过 workspace 全套测试 + clippy/fmt；monet-rn crate 本身无 host 测试（jsi 依赖只在 app 环境解析），正确性由 rn-demo 电池承载——**这是与 workspace 内 crate 的验证策略差异，记录在案**
 
 ## 与 DESIGN.md 的对账

@@ -17,7 +17,6 @@
 import React, { useCallback, useEffect, useRef, useState} from 'react';
 import {
   Platform,
-  SafeAreaView,
   ScrollView,
   StatusBar,
   StyleSheet,
@@ -25,8 +24,21 @@ import {
   TextInput,
   View,
 } from 'react-native';
+import {SafeAreaView} from 'react-native-safe-area-context';
 
-import {fetch, getMonet, MonetError, MonetWebSocket} from 'monet-rn';
+import {
+  addRequestHook,
+  addRequestObserver,
+  addResponseHook,
+  addResponseObserver,
+  clearHooks,
+  fetch,
+  getMonet,
+  MonetError,
+  MonetWebSocket,
+  MonetHookRequest,
+  MonetHookResponse,
+} from 'monet-rn';
 
 type CheckStatus = 'pending' | 'pass' | 'fail';
 type CheckState = {name: string; status: CheckStatus; detail: string};
@@ -309,10 +321,15 @@ const CHECKS: Array<{
       );
       await waitForOpen(ws);
       const probe = new WeakRef(ws);
-      assert(
-        (await openCount()) === 1,
-        'the server did not count the open /gc-probe connection',
-      );
+      // The server counts the connection when its handshake completes —
+      // microseconds after the client's on_open. A single immediate read
+      // races that arming (observed on iOS); poll briefly instead.
+      for (let i = 0; (await openCount()) === 0; i++) {
+        if (i > 40) {
+          throw new Error('the server did not count the open /gc-probe connection');
+        }
+        await new Promise<void>(resolve => setTimeout(resolve, 50));
+      }
       // Drop the only reference. The WeakRef was built on the local, but
       // construction does not enter Hermes' keep-alive set (only deref of
       // a live target does), and no event dispatch happens after the
@@ -338,6 +355,235 @@ const CHECKS: Array<{
         probe.deref() === undefined,
         'the dropped socket was still reachable — something on the JS side retains it',
       );
+    },
+  },
+  // ---- hook/observer checks (names mirror docs/plans/2026-11-hooks.md).
+  // Every check clears the global registrations in a finally — the checks
+  // run sequentially in one process and would otherwise pollute each
+  // other. ----
+  {
+    name: 'http:observer_zero_impact',
+    run: async base => {
+      const observed: MonetHookRequest[] = [];
+      try {
+        // A hook stamps the request; the observer must see the FINAL form
+        // (post-hook, pre-wire) while the fetch proceeds completely
+        // unaffected by being observed.
+        addRequestObserver(req => {
+          observed.push(req);
+        });
+        addRequestHook(req => ({
+          ...req,
+          headers: [...req.headers, {name: 'x-observer-test', value: 'stamped'}],
+        }));
+        const response = await fetch(`${base}/plain`);
+        assert(
+          response.status === 200,
+          `the observed fetch failed (status ${response.status})`,
+        );
+        const body = await response.text();
+        assert(body === 'plain', `body ${JSON.stringify(body)}`);
+        assert(observed.length === 1, `observer fired ${observed.length} times`);
+        assert(
+          observed[0].headers.some(
+            header => header.name === 'x-observer-test' && header.value === 'stamped',
+          ),
+          'the observer did not see the hook-stamped header — not the final form',
+        );
+      } finally {
+        clearHooks();
+      }
+    },
+  },
+  {
+    name: 'http:request_hook_rewrites_header',
+    run: async base => {
+      try {
+        addRequestHook(req => ({
+          ...req,
+          headers: [...req.headers, {name: 'x-hook', value: 'yes'}],
+        }));
+        const response = await fetch(`${base}/echo`);
+        const seen = JSON.parse(await response.text()) as {headers: string[]};
+        assert(
+          seen.headers.some(header => header.toLowerCase() === 'x-hook:yes'),
+          'the hook-added header did not reach the server',
+        );
+      } finally {
+        clearHooks();
+      }
+    },
+  },
+  {
+    name: 'http:hook_error_fails_fetch',
+    run: async base => {
+      try {
+        addRequestHook(() => {
+          throw new Error('hook veto');
+        });
+        try {
+          await fetch(`${base}/plain`);
+        } catch (error) {
+          assert(
+            error instanceof MonetError && error.kind === 'Hook',
+            error instanceof MonetError
+              ? `expected kind Hook, got ${error.kind}: ${error.message}`
+              : `expected MonetError, got ${String(error)}`,
+          );
+          return;
+        }
+        throw new Error('a fetch with a throwing request hook resolved');
+      } finally {
+        clearHooks();
+      }
+    },
+  },
+  {
+    name: 'http:hook_async_resolution',
+    run: async base => {
+      try {
+        // The hook awaits before rewriting — the pipeline must park on
+        // the pending-map resolution, not race ahead with the original
+        // request.
+        addRequestHook(async req => {
+          await new Promise<void>(resolve => setTimeout(resolve, 50));
+          return {
+            ...req,
+            headers: [...req.headers, {name: 'x-async-hook', value: 'waited'}],
+          };
+        });
+        const response = await fetch(`${base}/echo`);
+        const seen = JSON.parse(await response.text()) as {headers: string[]};
+        assert(
+          seen.headers.some(header => header.toLowerCase() === 'x-async-hook:waited'),
+          'the async hook rewrite did not reach the server',
+        );
+      } finally {
+        clearHooks();
+      }
+    },
+  },
+  {
+    name: 'http:hook_retry_uses_new_token',
+    run: async base => {
+      try {
+        // The token-refresh shape end to end: the request hook injects
+        // from a shared store, the response hook sees the 401, "refreshes"
+        // (flips the store), and asks for a retry — the re-run picks up
+        // the new token and /auth-guard accepts it. The attempt counter
+        // must read 1 on the second run.
+        let token = 'token1';
+        let retryAttempt = -1;
+        addRequestHook(req => ({
+          ...req,
+          headers: [
+            ...req.headers.filter(
+              header => header.name.toLowerCase() !== 'authorization',
+            ),
+            {name: 'Authorization', value: `Bearer ${token}`},
+          ],
+        }));
+        addResponseHook((res, attempt) => {
+          if (res.status === 401) {
+            retryAttempt = attempt;
+            token = 'token2'; // the "refresh"
+            return {retry: true};
+          }
+          return res;
+        });
+        const response = await fetch(`${base}/auth-guard`);
+        assert(response.status === 200, `status ${response.status} after the retry`);
+        const body = await response.text();
+        assert(body === 'ok', `body ${JSON.stringify(body)}`);
+        assert(
+          retryAttempt === 0,
+          `the retry fired at attempt ${retryAttempt}, expected 0`,
+        );
+      } finally {
+        clearHooks();
+      }
+    },
+  },
+  {
+    name: 'http:hook_retry_gives_up',
+    run: async _base => {
+      try {
+        // A response hook that always retries must hit the module's hard
+        // cap and fail the fetch — not loop forever.
+        addResponseHook(_res => ({retry: true}));
+        try {
+          await fetch('http://127.0.0.1:1/plain');
+        } catch {
+          // Any terminal error (Hook or Transport) proves the cap ended
+          // the loop; withTimeout guards the "not hang" property.
+          return;
+        }
+        throw new Error('an always-retrying hook never terminated the fetch');
+      } finally {
+        clearHooks();
+      }
+    },
+  },
+  {
+    name: 'http:abort_during_hook',
+    run: async base => {
+      try {
+        // A hook that never resolves parks the pipeline; aborting the
+        // fetch must win the race with kind Cancelled. The dangling hook
+        // call is retired by clearHooks in the finally.
+        addRequestHook(
+          () =>
+            new Promise<MonetHookRequest>(() => {
+              // Never resolves — the abort is the only way out.
+            }),
+        );
+        const controller = new AbortController();
+        const pending = fetch(`${base}/plain`, {signal: controller.signal});
+        await new Promise<void>(resolve => setTimeout(resolve, 100));
+        controller.abort();
+        try {
+          await pending;
+        } catch (error) {
+          assert(
+            error instanceof MonetError && error.kind === 'Cancelled',
+            error instanceof MonetError
+              ? `expected kind Cancelled, got ${error.kind}: ${error.message}`
+              : `expected MonetError, got ${String(error)}`,
+          );
+          return;
+        }
+        throw new Error('the abort during a parked hook did not cancel the fetch');
+      } finally {
+        clearHooks();
+      }
+    },
+  },
+  {
+    name: 'ws:request_hook_headers',
+    run: async _base => {
+      try {
+        // The same request-hook chain runs on the WebSocket upgrade
+        // request: the header it injects must arrive at the server, which
+        // /hook-echo reflects back as the first message.
+        addRequestHook(req => ({
+          ...req,
+          headers: [...req.headers, {name: 'x-ws-hook', value: 'injected'}],
+        }));
+        const ws = new MonetWebSocket(`${DEFAULT_WS_BASE}/hook-echo`);
+        try {
+          await waitForOpen(ws);
+          const first = await nextMessage(ws);
+          assert(
+            first.data === 'injected',
+            `first message ${JSON.stringify(first.data)}, expected "injected"`,
+          );
+        } finally {
+          ws.close(1000, 'done');
+          await waitForClose(ws);
+        }
+      } finally {
+        clearHooks();
+      }
     },
   },
 ];

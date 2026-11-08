@@ -22,13 +22,18 @@ use monet_core::Method;
 use monet_core::Request;
 
 use crate::fetch::FetchRegistry;
+use crate::hooks::Pending;
 use crate::ws::MonetWsConnection;
 use crate::ws::WsCommand;
 use crate::ws::WsQueue;
+use monet_core::HookRegistry;
 
 #[cfg(target_os = "android")]
 mod bootstrap;
 mod fetch;
+/// The JS hook/observer channel: TurboCallbacks adapted onto core's hook
+/// traits, with the pending-map resolve protocol (see docs/plans/2026-11-hooks.md).
+mod hooks;
 mod platform;
 /// The WebSocket connection object: pure Rust (jsi + core types only),
 /// compiled unconditionally — the transport selection in platform.rs is
@@ -36,15 +41,23 @@ mod platform;
 /// JS object's (NativeState): drop = disconnect.
 mod ws;
 
+/// The hard cap on hook-driven retries per fetch: a buggy response hook
+/// that always retries must fail the fetch, not loop forever.
+const MAX_HOOK_RETRIES: u32 = 3;
+
 /// The module state: one shared transport (behind the client for future
 /// hook plumbing, and directly for the fetch pumps — one engine, one
 /// connection pool, one lifecycle), rebuilt when configuration changes,
-/// plus the fetch registry. WebSocket connections carry their own state
-/// — no registry needed (see ws.rs).
+/// plus the fetch registry and the hook registry. Hooks live here, not
+/// on the client: a pin rebuild swaps the client wholesale, and hook
+/// registrations are app-lifetime state that must survive it. WebSocket
+/// connections carry their own state — no registry needed (see ws.rs).
 pub struct Monet {
     transport: RwLock<Arc<dyn monet_core::Transport>>,
     client: RwLock<Arc<Client>>,
     fetches: FetchRegistry,
+    hooks: RwLock<HookRegistry>,
+    pending: Arc<Pending>,
 }
 
 impl Monet {
@@ -54,6 +67,8 @@ impl Monet {
             client: RwLock::new(Arc::new(Client::new(transport.clone()))),
             transport: RwLock::new(transport),
             fetches: FetchRegistry::new(),
+            hooks: RwLock::new(HookRegistry::new()),
+            pending: Pending::shared(),
         })
     }
 
@@ -62,13 +77,21 @@ impl Monet {
     /// last-wins); Android pins go into the transport configs, so a
     /// rebuild re-installs them there. In-flight fetches keep the old
     /// transport alive through their Arc clones; it shuts down (engine
-    /// `shutdown()` on Android) once the last one finishes.
+    /// `shutdown()` on Android) once the last one finishes. Hook
+    /// registrations are deliberately untouched.
     fn rebuild(&self, pins: &PinConfig) -> anyhow::Result<()> {
         let transport = platform::http_transport(pins);
         let client = Client::new(transport.clone());
         *self.transport.write().unwrap() = transport;
         *self.client.write().unwrap() = Arc::new(client);
         Ok(())
+    }
+
+    /// A cheap snapshot of the hook chains for a pump task: the clone is
+    /// arcs-only, and taking it drops the read guard before any await
+    /// (std guards are not `Send` across awaits).
+    fn hook_snapshot(&self) -> HookRegistry {
+        self.hooks.read().unwrap().clone()
     }
 }
 
@@ -168,6 +191,137 @@ impl Monet {
         self.rebuild(&PinConfig::default())
     }
 
+    // ---- hooks & observers (M5; the design record is
+    // docs/plans/2026-11-hooks.md) ----
+
+    /// Registers a read-write request hook: it may rewrite the request
+    /// (url/method/headers) or abort the pipeline, and the pipeline waits
+    /// for its resolution. The callback receives
+    /// `{hookCallId, attempt, url, method, headers}` and JS must call
+    /// `resolveRequestHook` or `rejectRequestHook` with that id.
+    pub fn add_request_hook(&self, on_hook: jsi_turbo::TurboCallback) -> anyhow::Result<()> {
+        self.hooks
+            .write()
+            .unwrap()
+            .add_request_hook(crate::hooks::JsRequestHook::new(
+                on_hook,
+                self.pending.clone(),
+            ));
+        Ok(())
+    }
+
+    /// Registers a read-write response hook: it runs when the head
+    /// arrives, before the head is delivered, and may rewrite
+    /// status/headers, abort, or ask for a retry. The callback receives
+    /// `{hookCallId, attempt, status, headers}`.
+    pub fn add_response_hook(&self, on_hook: jsi_turbo::TurboCallback) -> anyhow::Result<()> {
+        self.hooks
+            .write()
+            .unwrap()
+            .add_response_hook(crate::hooks::JsResponseHook::new(
+                on_hook,
+                self.pending.clone(),
+            ));
+        Ok(())
+    }
+
+    /// Registers a read-only request observer: it sees the final request
+    /// (after every hook, before the wire) and cannot affect the
+    /// pipeline — the callback is fire-and-forget, nothing waits.
+    pub fn add_request_observer(&self, on_observe: jsi_turbo::TurboCallback) -> anyhow::Result<()> {
+        self.hooks
+            .write()
+            .unwrap()
+            .add_request_observer(crate::hooks::JsRequestObserver::new(on_observe));
+        Ok(())
+    }
+
+    /// Registers a read-only response observer: it sees the final
+    /// response head (after every hook, before delivery).
+    pub fn add_response_observer(
+        &self,
+        on_observe: jsi_turbo::TurboCallback,
+    ) -> anyhow::Result<()> {
+        self.hooks
+            .write()
+            .unwrap()
+            .add_response_observer(crate::hooks::JsResponseObserver::new(on_observe));
+        Ok(())
+    }
+
+    /// Drops every hook and observer registration (the `clear_pins`
+    /// symmetry), and every outstanding hook call.
+    pub fn clear_hooks(&self) -> anyhow::Result<()> {
+        self.hooks.write().unwrap().clear();
+        self.pending.clear();
+        Ok(())
+    }
+
+    /// Delivers a request hook's resolution: the rewritten
+    /// url/method/headers (body passes through untouched).
+    pub fn resolve_request_hook(
+        &self,
+        hook_call_id: f64,
+        request: crate::hooks::HookRequestResolution,
+    ) -> anyhow::Result<bool> {
+        Ok(crate::hooks::protocol::resolve_request(
+            &self.pending,
+            hook_call_id,
+            request,
+        ))
+    }
+
+    /// Delivers a request hook's rejection. A `Cancelled` kind maps to a
+    /// clean cancellation; anything else fails the fetch as a hook error.
+    pub fn reject_request_hook(
+        &self,
+        hook_call_id: f64,
+        error: crate::hooks::HookErrorEvent,
+    ) -> anyhow::Result<bool> {
+        Ok(crate::hooks::protocol::reject_request(
+            &self.pending,
+            hook_call_id,
+            error,
+        ))
+    }
+
+    /// Delivers a response hook's resolution: the rewritten
+    /// status/headers (the body passes through untouched).
+    pub fn resolve_response_hook(
+        &self,
+        hook_call_id: f64,
+        response: crate::hooks::HookResponseResolution,
+    ) -> anyhow::Result<bool> {
+        Ok(crate::hooks::protocol::resolve_response(
+            &self.pending,
+            hook_call_id,
+            response,
+        ))
+    }
+
+    /// Delivers a response hook's rejection.
+    pub fn reject_response_hook(
+        &self,
+        hook_call_id: f64,
+        error: crate::hooks::HookErrorEvent,
+    ) -> anyhow::Result<bool> {
+        Ok(crate::hooks::protocol::reject_response(
+            &self.pending,
+            hook_call_id,
+            error,
+        ))
+    }
+
+    /// Delivers a response hook's retry request: the pipeline re-runs
+    /// from the original request (request hooks included, so they can
+    /// inject a fresh token), up to the module's hard cap.
+    pub fn retry_response_hook(&self, hook_call_id: f64) -> anyhow::Result<bool> {
+        Ok(crate::hooks::protocol::retry_response(
+            &self.pending,
+            hook_call_id,
+        ))
+    }
+
     // ---- fetch: head callback first, body pulled in chunks ----
 
     /// Starts a fetch. The four callbacks fire from the pump task
@@ -175,6 +329,13 @@ impl Monet {
     /// dispatcher): `on_head` once with status + headers, `on_chunk` as
     /// a signal that a chunk is queued (JS then calls `take_chunk`),
     /// then exactly one of `on_done` / `on_error`.
+    ///
+    /// The pump runs the full hook pipeline per attempt (request hooks
+    /// raced with the cancel token → transport → response hooks), then
+    /// delivers the head: `on_head` fires only after the response hooks
+    /// have had their chance to rewrite it. A response hook's retry
+    /// re-runs the pipeline from the original request (up to
+    /// [`MAX_HOOK_RETRIES`]) — the token survives across attempts.
     pub fn fetch<'rt>(
         &self,
         rt: &mut RuntimeHandle<'rt>,
@@ -185,29 +346,20 @@ impl Monet {
         on_done: jsi_turbo::TurboCallback,
         on_error: jsi_turbo::TurboCallback,
     ) -> anyhow::Result<f64> {
-        // `FromStr::Err` is `Infallible` — the match is exhaustive by
-        // construction; unknown verbs land in `Method::Other`.
-        let method = options
-            .method
-            .parse::<Method>()
-            .unwrap_or_else(|_| unreachable!());
-        let url = options
+        // The upload is fully buffered in v1 (nitro parity): the JS
+        // ArrayBuffer is copied here — the borrow ends with the call. The
+        // bytes stay with the pump so a hook-driven retry can rebuild the
+        // request (a Body is a stream and cannot be cloned).
+        let body_bytes = body.map(|buffer| buffer.data(rt).to_vec());
+
+        // Fail fast on malformed inputs exactly as before the hook
+        // pipeline (the pump's build_request re-validates per attempt —
+        // hook rewrites land there — but the original JS inputs should
+        // throw synchronously, not surface through on_error).
+        let _ = options
             .url
             .parse::<monet_core::Url>()
             .map_err(|e| anyhow::anyhow!("invalid URL: {e}"))?;
-
-        let mut request = Request::new(method, url);
-        for header in &options.headers {
-            request
-                .headers
-                .append(&header.name, &header.value)
-                .map_err(|e| anyhow::anyhow!("invalid header: {e}"))?;
-        }
-        if let Some(buffer) = &body {
-            // The upload is fully buffered in v1 (nitro parity): the JS
-            // ArrayBuffer is copied here — the borrow ends with the call.
-            request.body = monet_core::body::Body::from_bytes(buffer.data(rt).to_vec());
-        }
 
         let (fetch_id, cancel) = self.fetches.allocate();
         let fetches = self.fetches.clone();
@@ -216,65 +368,123 @@ impl Monet {
         let on_done = Arc::new(on_done);
         let on_error = Arc::new(on_error);
 
-        // The transport future runs detached on the smol global executor
-        // (every monet transport is a runtime-agnostic BoxFuture). The
-        // client is only needed for hook plumbing (empty in v1), so the
-        // pump drives the transport directly — cancellation stays
-        // transport-level, which the Client pipeline doesn't expose.
         // The transport is the module's shared one: a per-fetch engine
         // would leak a Cronet broadcast receiver each time (the process
         // dies at the 1000-receiver cap) and pool no connections across
         // fetches. The Arc clone keeps it alive until this pump ends.
         let transport = self.transport.read().unwrap().clone();
-        let execute = transport.execute(request, cancel);
+        let hooks = self.hook_snapshot();
         async_global_executor::spawn(async move {
-            // Hold the Arc for the pump's lifetime: a pin-config rebuild
+            // Hold one Arc for the pump's lifetime: a pin-config rebuild
             // swaps the module's transport, and the old engine's
-            // shutdown() must wait until this pump is done with it.
-            let _keep_engine = transport;
-            match execute.await {
-                Ok(response) => {
-                    let status = f64::from(response.status);
-                    let headers = response
-                        .headers
-                        .iter_flattened()
-                        .map(|(name, value)| HeaderKV {
-                            name: name.to_string(),
-                            value: value.to_string(),
-                        })
-                        .collect();
-                    on_head.call(HeadEvent { status, headers });
+            // shutdown() must wait until this pump is done with it. The
+            // original stays usable for the per-attempt executes.
+            let _keep_engine = transport.clone();
 
-                    use futures_lite::StreamExt;
-                    let mut body = response.body;
-                    let mut failure: Option<monet_core::Error> = None;
-                    while let Some(chunk) = body.next().await {
-                        match chunk {
-                            Ok(bytes) => {
-                                if fetches.push_chunk(fetch_id, bytes.to_vec()) {
-                                    on_chunk.call_with_no_args();
-                                } else {
-                                    // State gone (cleanup after terminal):
-                                    // stop pulling.
-                                    return;
+            let mut attempt: u32 = 0;
+            let response = loop {
+                let mut request = match build_request(&options, &body_bytes) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        fetches.finish(fetch_id);
+                        on_error.call(ErrorEvent::from(error));
+                        return;
+                    }
+                };
+                request.extensions.insert(hooks::HookAttempt(attempt));
+
+                // Request hooks, raced with the cancel token — a stuck
+                // JS hook must not outlive the fetch's abort.
+                match race_cancel(hooks.run_request_hooks(request), &cancel).await {
+                    RaceOutcome::Done(Ok(request)) => {
+                        let transport = transport.clone();
+                        let hooks = hooks.clone();
+                        let cancel_for_execute = cancel.clone();
+                        match race_cancel(
+                            // Response hooks wrap the transport result:
+                            // they see the head before on_head delivers it.
+                            async move {
+                                hooks
+                                    .run_response_hooks(
+                                        transport.execute(request, cancel_for_execute).await?,
+                                    )
+                                    .await
+                            },
+                            &cancel,
+                        )
+                        .await
+                        {
+                            RaceOutcome::Done(Ok(response)) => break response,
+                            RaceOutcome::Done(Err(error)) => {
+                                if crate::hooks::is_hook_retry(&error) && attempt < MAX_HOOK_RETRIES
+                                {
+                                    // The response hook asked for a retry:
+                                    // rebuild from the original inputs and
+                                    // run the whole pipeline again. The
+                                    // aborted attempt's body is dropped
+                                    // with it.
+                                    attempt += 1;
+                                    continue;
                                 }
+                                fetches.finish(fetch_id);
+                                on_error.call(ErrorEvent::from(error));
+                                return;
                             }
-                            Err(error) => {
-                                failure = Some(error);
-                                break;
+                            RaceOutcome::Cancelled => {
+                                fetches.finish(fetch_id);
+                                on_error.call(ErrorEvent::from(monet_core::Error::Cancelled));
+                                return;
                             }
                         }
                     }
-                    fetches.finish(fetch_id);
-                    match failure {
-                        None => on_done.call_with_no_args(),
-                        Some(error) => on_error.call(ErrorEvent::from(error)),
+                    RaceOutcome::Done(Err(error)) => {
+                        fetches.finish(fetch_id);
+                        on_error.call(ErrorEvent::from(error));
+                        return;
+                    }
+                    RaceOutcome::Cancelled => {
+                        fetches.finish(fetch_id);
+                        on_error.call(ErrorEvent::from(monet_core::Error::Cancelled));
+                        return;
                     }
                 }
-                Err(error) => {
-                    fetches.finish(fetch_id);
-                    on_error.call(ErrorEvent::from(error));
+            };
+
+            let status = f64::from(response.status);
+            let headers = response
+                .headers
+                .iter_flattened()
+                .map(|(name, value)| HeaderKV {
+                    name: name.to_string(),
+                    value: value.to_string(),
+                })
+                .collect();
+            on_head.call(HeadEvent { status, headers });
+
+            use futures_lite::StreamExt;
+            let mut body = response.body;
+            let mut failure: Option<monet_core::Error> = None;
+            while let Some(chunk) = body.next().await {
+                match chunk {
+                    Ok(bytes) => {
+                        if fetches.push_chunk(fetch_id, bytes.to_vec()) {
+                            on_chunk.call_with_no_args();
+                        } else {
+                            // State gone (cleanup after terminal):
+                            // stop pulling.
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
+                    }
                 }
+            }
+            fetches.finish(fetch_id);
+            match failure {
+                None => on_done.call_with_no_args(),
+                Some(error) => on_error.call(ErrorEvent::from(error)),
             }
         })
         .detach();
@@ -322,6 +532,11 @@ impl Monet {
     /// The connection's lifetime is the JS object's: GC dropping the
     /// wrapper drops the native state, whose `Drop` cancels the
     /// transport.
+    ///
+    /// The request hook chain runs on the upgrade request (raced with
+    /// the cancel token) before the connect — auth-header injection for
+    /// the handshake shares the fetch-side registration. No response
+    /// hooks and no retry: the upgrade has no head the JS side sees.
     pub fn ws_connect(
         &self,
         url: String,
@@ -357,13 +572,32 @@ impl Monet {
         let on_error = Arc::new(on_error);
 
         let transport = platform::ws_transport(&PinConfig::default())?;
-        let connect = transport.connect(request, cancel);
+        let hooks = self.hook_snapshot();
         async_global_executor::spawn(async move {
             // Hold the transport for the connection's lifetime: its
             // private runtime drives both the connect future and the
             // socket pump — dropping it would tear them down.
-            let _keep_alive = transport;
-            match connect.await {
+            // Hold one Arc for the connection's lifetime (the connect
+            // below borrows the original).
+            let _keep_alive = transport.clone();
+
+            // Request hooks on the upgrade request (attempt is always 0
+            // here — no retry), raced with the cancel token: dropping
+            // the JS object mid-hook tears the connect down with it.
+            request.extensions.insert(crate::hooks::HookAttempt(0));
+            let request = match race_cancel(hooks.run_request_hooks(request), &cancel).await {
+                RaceOutcome::Done(Ok(request)) => request,
+                RaceOutcome::Done(Err(error)) => {
+                    on_error.call(ErrorEvent::from(error));
+                    return;
+                }
+                RaceOutcome::Cancelled => {
+                    on_error.call(ErrorEvent::from(monet_core::Error::Cancelled));
+                    return;
+                }
+            };
+
+            match transport.connect(request, cancel).await {
                 Ok(mut stream) => {
                     on_open.call_with_no_args();
                     ws_pump(
@@ -389,6 +623,54 @@ impl Monet {
 
         Ok(conn)
     }
+}
+
+/// Builds the request from the JS inputs. The pump calls this once per
+/// attempt — a retry must re-run from the original request, and a `Body`
+/// is a stream that cannot be cloned, so the buffered upload bytes stay
+/// with the pump.
+fn build_request(options: &FetchOptions, body: &Option<Vec<u8>>) -> monet_core::Result<Request> {
+    // `FromStr::Err` is `Infallible`; unknown verbs land in `Method::Other`.
+    let method = options
+        .method
+        .parse::<Method>()
+        .unwrap_or_else(|_| unreachable!());
+    let url = options
+        .url
+        .parse::<monet_core::Url>()
+        .map_err(|e| monet_core::Error::transport(format!("invalid URL: {e}")))?;
+    let mut request = Request::new(method, url);
+    for header in &options.headers {
+        request
+            .headers
+            .append(&header.name, &header.value)
+            .map_err(|e| monet_core::Error::transport(format!("invalid header: {e}")))?;
+    }
+    if let Some(bytes) = body {
+        // A clone per attempt: from_bytes consumes, and a retry rebuilds
+        // the request from these bytes.
+        request.body = monet_core::body::Body::from_bytes(bytes.clone());
+    }
+    Ok(request)
+}
+
+/// What a cancel-raced pipeline step resolves to.
+enum RaceOutcome<T> {
+    Done(T),
+    Cancelled,
+}
+
+/// Races a pipeline future against the fetch's cancel token — a stuck JS
+/// hook must not outlive the abort. Same shape as the WS pump's select.
+async fn race_cancel<F: std::future::Future>(
+    fut: F,
+    cancel: &monet_core::CancelToken,
+) -> RaceOutcome<F::Output> {
+    futures_lite::future::race(async { RaceOutcome::Done(fut.await) }, async {
+        cancel.cancelled().await;
+        RaceOutcome::Cancelled
+    })
+    .await
 }
 
 /// The WS pump: delivers received messages into the queue with signals,

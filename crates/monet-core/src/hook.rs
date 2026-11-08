@@ -8,6 +8,13 @@
 //! and ownership keeps hooks composable without lifetime gymnastics: a hook
 //! that needs async work (e.g. fetching a token) simply awaits, then
 //! mutates, then returns the request.
+//!
+//! Observers are the read-only half of the surface: they see the same
+//! values but cannot affect the pipeline (no return value, the chain does
+//! not wait). They run at a fixed position — after every mutating hook, so
+//! they observe the final form (pre-wire for requests, pre-delivery for
+//! responses). Observers get a shared reference; anything async they need
+//! to do (logging, metrics sinks) is their own concern to spawn.
 
 use std::sync::Arc;
 
@@ -40,12 +47,35 @@ pub trait ResponseHook: Send + Sync {
     fn on_response(&self, res: Response) -> BoxFuture<Result<Response>>;
 }
 
+/// Read-only view of the final outgoing request (after every mutating
+/// hook, before the transport). Fire-and-forget: the pipeline does not
+/// wait, and the observer cannot affect it — there is nothing to return.
+pub trait RequestObserver: Send + Sync {
+    /// Called with the final request, in registration order, after every
+    /// mutating hook has run.
+    fn on_request(&self, req: &Request);
+}
+
+/// Read-only view of the final response head (after every mutating hook,
+/// before delivery to the consumer). Same fire-and-forget contract as
+/// [`RequestObserver`].
+pub trait ResponseObserver: Send + Sync {
+    /// Called with the final response, in registration order, after every
+    /// mutating hook has run.
+    fn on_response(&self, res: &Response);
+}
+
 /// An ordered hook chain. Request and response hooks each run in
-/// registration order.
-#[derive(Default)]
+/// registration order; observers run after them, in registration order.
+///
+/// Cheap to clone (arcs to the hooks), so a front end can hand snapshots
+/// to per-request tasks without holding a lock across an await.
+#[derive(Default, Clone)]
 pub struct HookRegistry {
     request_hooks: Vec<Arc<dyn RequestHook>>,
     response_hooks: Vec<Arc<dyn ResponseHook>>,
+    request_observers: Vec<Arc<dyn RequestObserver>>,
+    response_observers: Vec<Arc<dyn ResponseObserver>>,
 }
 
 impl HookRegistry {
@@ -66,6 +96,21 @@ impl HookRegistry {
         self
     }
 
+    /// Appends a read-only request observer.
+    pub fn add_request_observer(&mut self, observer: impl RequestObserver + 'static) -> &mut Self {
+        self.request_observers.push(Arc::new(observer));
+        self
+    }
+
+    /// Appends a read-only response observer.
+    pub fn add_response_observer(
+        &mut self,
+        observer: impl ResponseObserver + 'static,
+    ) -> &mut Self {
+        self.response_observers.push(Arc::new(observer));
+        self
+    }
+
     /// Number of registered request hooks.
     pub fn request_hook_count(&self) -> usize {
         self.request_hooks.len()
@@ -76,8 +121,27 @@ impl HookRegistry {
         self.response_hooks.len()
     }
 
+    /// Number of registered request observers.
+    pub fn request_observer_count(&self) -> usize {
+        self.request_observers.len()
+    }
+
+    /// Number of registered response observers.
+    pub fn response_observer_count(&self) -> usize {
+        self.response_observers.len()
+    }
+
+    /// Drops every hook and observer (the monet-rn `clear_hooks`).
+    pub fn clear(&mut self) {
+        self.request_hooks.clear();
+        self.response_hooks.clear();
+        self.request_observers.clear();
+        self.response_observers.clear();
+    }
+
     /// Runs every request hook in order. The first failure stops the chain
-    /// and is wrapped in [`Error::Hook`] with the hook's name.
+    /// and is wrapped in [`Error::Hook`] with the hook's name. On success,
+    /// every request observer sees the final request before it returns.
     pub async fn run_request_hooks(&self, req: Request) -> Result<Request> {
         let mut req = req;
         for hook in &self.request_hooks {
@@ -86,11 +150,15 @@ impl HookRegistry {
                 source: Box::new(e),
             })?;
         }
+        for observer in &self.request_observers {
+            observer.on_request(&req);
+        }
         Ok(req)
     }
 
     /// Runs every response hook in order, with the same error semantics as
-    /// [`HookRegistry::run_request_hooks`].
+    /// [`HookRegistry::run_request_hooks`]. On success, every response
+    /// observer sees the final response before it returns.
     pub async fn run_response_hooks(&self, res: Response) -> Result<Response> {
         let mut res = res;
         for hook in &self.response_hooks {
@@ -98,6 +166,9 @@ impl HookRegistry {
                 hook: hook.name().to_string(),
                 source: Box::new(e),
             })?;
+        }
+        for observer in &self.response_observers {
+            observer.on_response(&res);
         }
         Ok(res)
     }
@@ -234,5 +305,133 @@ mod tests {
         assert_eq!(req.url.as_str(), "https://example.com/");
         let res = block_on(registry.run_response_hooks(response())).unwrap();
         assert_eq!(res.status, 200);
+    }
+
+    /// An observer that records the headers it saw.
+    struct RecordingObserver {
+        log: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl RequestObserver for RecordingObserver {
+        fn on_request(&self, req: &Request) {
+            self.log.lock().unwrap().push(format!(
+                "req:{}",
+                req.headers.get("x-order").unwrap_or_default()
+            ));
+        }
+    }
+
+    impl ResponseObserver for RecordingObserver {
+        fn on_response(&self, res: &Response) {
+            self.log.lock().unwrap().push(format!(
+                "res:{}",
+                res.headers.get("x-order").unwrap_or_default()
+            ));
+        }
+    }
+
+    #[test]
+    fn observers_see_the_final_form_after_hooks() {
+        let hook_log = Arc::new(Mutex::new(Vec::new()));
+        let observer_log = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = HookRegistry::new();
+        registry
+            .add_request_hook(StampingHook::new("a", &hook_log))
+            .add_request_hook(StampingHook::new("b", &hook_log))
+            .add_request_observer(RecordingObserver {
+                log: observer_log.clone(),
+            });
+        assert_eq!(registry.request_observer_count(), 1);
+
+        block_on(registry.run_request_hooks(request())).unwrap();
+        // The observer saw the request as it leaves the chain — after both
+        // hooks stamped it.
+        assert_eq!(*observer_log.lock().unwrap(), vec!["req:ab"]);
+    }
+
+    #[test]
+    fn response_observers_see_the_final_form() {
+        let hook_log = Arc::new(Mutex::new(Vec::new()));
+        let observer_log = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = HookRegistry::new();
+        registry
+            .add_response_hook(StampingHook::new("r", &hook_log))
+            .add_response_observer(RecordingObserver {
+                log: observer_log.clone(),
+            });
+
+        block_on(registry.run_response_hooks(response())).unwrap();
+        assert_eq!(*observer_log.lock().unwrap(), vec!["res:r"]);
+    }
+
+    #[test]
+    fn observers_do_not_run_when_a_hook_fails() {
+        // Observers see the final form; a failed chain has no final form,
+        // so nothing is observed (and the error passes through untouched).
+        let hook_log = Arc::new(Mutex::new(Vec::new()));
+        let observer_log = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = HookRegistry::new();
+        registry
+            .add_request_observer(RecordingObserver {
+                log: observer_log.clone(),
+            })
+            .add_request_hook(StampingHook::new("a", &hook_log));
+        // A failing hook after the observer registration — order between
+        // hooks and observers is fixed (hooks first), registration order
+        // only matters within each class.
+        struct FailHook;
+        impl RequestHook for FailHook {
+            fn name(&self) -> &str {
+                "fail"
+            }
+            fn on_request(&self, req: Request) -> BoxFuture<Result<Request>> {
+                Box::pin(async {
+                    let _ = req;
+                    Err(Error::transport("nope"))
+                })
+            }
+        }
+        registry.add_request_hook(FailHook);
+
+        let err = block_on(registry.run_request_hooks(request())).unwrap_err();
+        assert!(matches!(err, Error::Hook { .. }));
+        assert!(observer_log.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn registry_clone_snapshots_the_chains() {
+        // The cheap clone front ends hand to per-request tasks: the clone
+        // runs the hooks that existed at clone time.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = HookRegistry::new();
+        registry.add_request_hook(StampingHook::new("a", &log));
+
+        let snapshot = registry.clone();
+        registry.add_request_hook(StampingHook::new("b", &log));
+
+        let req = block_on(snapshot.run_request_hooks(request())).unwrap();
+        assert_eq!(req.headers.get("x-order").unwrap(), "a");
+        let req = block_on(registry.run_request_hooks(request())).unwrap();
+        assert_eq!(req.headers.get("x-order").unwrap(), "ab");
+    }
+
+    #[test]
+    fn clear_drops_everything() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let observer_log = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = HookRegistry::new();
+        registry
+            .add_request_hook(StampingHook::new("a", &log))
+            .add_request_observer(RecordingObserver {
+                log: observer_log.clone(),
+            });
+        registry.clear();
+        assert_eq!(registry.request_hook_count(), 0);
+        assert_eq!(registry.request_observer_count(), 0);
+
+        let req = block_on(registry.run_request_hooks(request())).unwrap();
+        assert_eq!(req.headers.get("x-order"), None);
+        assert!(log.lock().unwrap().is_empty());
+        assert!(observer_log.lock().unwrap().is_empty());
     }
 }

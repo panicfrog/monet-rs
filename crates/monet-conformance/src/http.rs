@@ -254,6 +254,29 @@ async fn respond(
                 boxed(http_body_util::StreamBody::new(stream)),
             )
         }
+        // The hook-retry target: 401 unless the request carries the
+        // "refreshed" token, with an `x-retry` response header so a
+        // response hook can key its decision on more than the status.
+        // The JS check's flow: token1 → 401 → hook refreshes + retries →
+        // token2 → 200.
+        "/auth-guard" => {
+            let authorized = request_headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value == "Bearer token2");
+            if authorized {
+                ok(StatusCode::OK, boxed(Full::new(Bytes::from_static(b"ok"))))
+            } else {
+                let mut response = ok(
+                    StatusCode::UNAUTHORIZED,
+                    boxed(Full::new(Bytes::from_static(b"stale token"))),
+                );
+                response
+                    .headers_mut()
+                    .insert("x-retry", "yes".parse().unwrap());
+                response
+            }
+        }
         // The echo route answers with the request body so the check can
         // verify it survived the transport.
         "/echo" => {

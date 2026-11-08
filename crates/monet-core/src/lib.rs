@@ -54,7 +54,7 @@ pub use client::Client;
 pub use error::{Error, PlatformErrorCode, Result};
 pub use extensions::Extensions;
 pub use headers::HeaderMap;
-pub use hook::{HookRegistry, RequestHook, ResponseHook};
+pub use hook::{HookRegistry, RequestHook, RequestObserver, ResponseHook, ResponseObserver};
 pub use method::Method;
 pub use mock::{MockTransport, RecordedRequest};
 pub use pin::{Date, PinConfig, PinEntry, PinError};

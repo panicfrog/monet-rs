@@ -9,6 +9,18 @@ export type { Monet } from '../generated/rust-turbo/Monet';
 
 export { fetch } from './fetch';
 export type { MonetRequestInit } from './fetch';
+export {
+  addRequestHook,
+  addRequestObserver,
+  addResponseHook,
+  addResponseObserver,
+  clearHooks,
+} from './hooks';
+export type {
+  MonetHookRequest,
+  MonetHookResponse,
+  MonetHookRetry,
+} from './hooks';
 export { MonetError, MonetHeaders, MonetResponse } from './response';
 export type { ErrorEvent, HeadEvent } from './response';
 export { MonetWebSocket } from './websocket';

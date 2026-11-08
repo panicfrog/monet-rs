@@ -1,0 +1,428 @@
+//! The JS hook channel: TurboCallbacks adapted onto core's hook traits.
+//!
+//! Two registrations share the event shapes:
+//! - **Hooks** (read-write, pipeline waits): the adapter fires the JS
+//!   callback with the event and parks on a oneshot; JS resolves through
+//!   the module's `resolve_request_hook` / `reject_request_hook` /
+//!   `resolve_response_hook` / `reject_response_hook` /
+//!   `retry_response_hook` methods, which send through the pending map.
+//! - **Observers** (read-only, fire-and-forget): the adapter fires the
+//!   same event shape and returns immediately. Core runs observers after
+//!   every mutating hook, so the event carries the final form, and
+//!   nothing ever waits on it.
+//!
+//! The attempt counter travels in [`Extensions`] (inserted by the pump
+//! before each pipeline run) rather than through the trait signatures —
+//! Rust-native hooks read it the same way. The retry outcome rides the
+//! error channel as a sentinel ([`RETRY_SENTINEL_MSG`]) because core's
+//! chain wraps hook failures in `Error::Hook`; the pump recognizes it and
+//! re-runs the pipeline from the original request.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+use futures_channel::oneshot;
+use jsi_turbo::TurboCallback;
+use monet_core::error::{Error, Result};
+use monet_core::hook::{RequestHook, RequestObserver, ResponseHook, ResponseObserver};
+use monet_core::request::Request;
+use monet_core::response::Response;
+use monet_core::transport::BoxFuture;
+use monet_core::{Extensions, HeaderMap, Method, Url};
+
+use crate::HeaderKV;
+
+/// The pipeline attempt this run is on (0 = first try). Inserted into
+/// `Request.extensions` by the pump before each run, read by the JS hook
+/// adapter to give JS the full decision context.
+pub(crate) struct HookAttempt(pub u32);
+
+/// The sentinel a response hook's retry rides on (inside `Error::Hook`).
+/// The pump matches it to re-run the pipeline; see module docs.
+pub(crate) const RETRY_SENTINEL_MSG: &str = "monet-rn: hook retry";
+
+// ---- event and resolution shapes (TurboStructs, camelCase on the wire) ----
+
+/// One request-phase event: what a hook sees and may rewrite, plus the
+/// call correlation. Observers receive the same shape (their
+/// `hook_call_id` is 0 — nothing will ever resolve it).
+#[derive(serde::Serialize, serde::Deserialize, jsi_turbo::TurboStruct, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct HookRequestEvent {
+    pub hook_call_id: f64,
+    pub attempt: f64,
+    pub url: String,
+    pub method: String,
+    pub headers: Vec<HeaderKV>,
+}
+
+/// One response-phase event: the head a hook sees and may rewrite.
+#[derive(serde::Serialize, serde::Deserialize, jsi_turbo::TurboStruct, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct HookResponseEvent {
+    pub hook_call_id: f64,
+    pub attempt: f64,
+    pub status: f64,
+    pub headers: Vec<HeaderKV>,
+}
+
+/// What JS sends back to resolve a request hook: the rewritten
+/// url/method/headers. The body and extensions pass through untouched —
+/// v1 keeps bodies out of the protocol.
+#[derive(serde::Serialize, serde::Deserialize, jsi_turbo::TurboStruct, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct HookRequestResolution {
+    pub url: String,
+    pub method: String,
+    pub headers: Vec<HeaderKV>,
+}
+
+/// What JS sends back to resolve a response hook: the rewritten
+/// status/headers. The body passes through untouched.
+#[derive(serde::Serialize, serde::Deserialize, jsi_turbo::TurboStruct, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct HookResponseResolution {
+    pub status: f64,
+    pub headers: Vec<HeaderKV>,
+}
+
+/// A hook rejection. `kind` follows the same discriminants as the fetch
+/// channel's error events; `Cancelled` maps to a clean cancellation,
+/// everything else becomes a transport-flavored failure wrapped in
+/// `Error::Hook`.
+#[derive(serde::Serialize, serde::Deserialize, jsi_turbo::TurboStruct, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct HookErrorEvent {
+    pub kind: String,
+    pub message: String,
+}
+
+impl HookErrorEvent {
+    fn into_error(self) -> Error {
+        if self.kind == "Cancelled" {
+            Error::Cancelled
+        } else {
+            Error::transport(format!("{}: {}", self.kind, self.message))
+        }
+    }
+}
+
+/// Snapshot of a request's head fields for the event shapes.
+fn request_head(req: &Request) -> (String, String, Vec<HeaderKV>) {
+    (
+        req.url.to_string(),
+        req.method.as_str().to_string(),
+        req.headers
+            .iter_flattened()
+            .map(|(name, value)| HeaderKV {
+                name: name.to_string(),
+                value: value.to_string(),
+            })
+            .collect(),
+    )
+}
+
+/// The current attempt as the events report it (absent = 0).
+fn attempt_of(extensions: &Extensions) -> f64 {
+    f64::from(
+        extensions
+            .get::<HookAttempt>()
+            .map(|a| a.0)
+            .unwrap_or_default(),
+    )
+}
+
+/// Merges a resolution into a request: replaces url/method/headers, keeps
+/// the body and extensions exactly as they were.
+fn rebuild_request(mut req: Request, resolution: HookRequestResolution) -> Result<Request> {
+    req.method = resolution
+        .method
+        .parse()
+        .map_err(|_| Error::transport("monet-rn: hook rewrote the method to an invalid verb"))?;
+    req.url = Url::parse(&resolution.url)
+        .map_err(|_| Error::transport("monet-rn: hook rewrote the URL to an invalid one"))?;
+    let mut headers = HeaderMap::new();
+    for header in &resolution.headers {
+        headers
+            .append(&header.name, &header.value)
+            .map_err(|_| Error::transport("monet-rn: hook rewrote headers to invalid ones"))?;
+    }
+    req.headers = headers;
+    Ok(req)
+}
+
+/// Merges a resolution into a response: replaces status/headers, keeps the
+/// body and extensions.
+fn rebuild_response(mut res: Response, resolution: HookResponseResolution) -> Response {
+    res.status = resolution.status.max(0.0).min(u16::MAX as f64) as u16;
+    let mut headers = HeaderMap::new();
+    for header in &resolution.headers {
+        let _ = headers.append(&header.name, &header.value);
+    }
+    res.headers = headers;
+    res
+}
+
+// ---- the pending map: hookCallId -> resolution sender ----
+
+/// What a parked request hook wakes up to.
+enum RequestResolution {
+    Modified(HookRequestResolution),
+    Error(Error),
+}
+
+/// What a parked response hook wakes up to.
+enum ResponseResolution {
+    Modified(HookResponseResolution),
+    Error(Error),
+    Retry,
+}
+
+/// The outstanding hook calls, shared between the adapters (allocate +
+/// park) and the module's resolve/reject/retry methods (deliver).
+#[derive(Default)]
+pub(crate) struct Pending {
+    next_id: AtomicU64,
+    requests: Mutex<HashMap<u64, oneshot::Sender<RequestResolution>>>,
+    responses: Mutex<HashMap<u64, oneshot::Sender<ResponseResolution>>>,
+}
+
+impl Pending {
+    pub(crate) fn shared() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Allocates a call id and the receiving end the adapter parks on.
+    fn allocate_request(&self) -> (f64, oneshot::Receiver<RequestResolution>) {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let (tx, rx) = oneshot::channel();
+        self.requests.lock().unwrap().insert(id, tx);
+        (f64::from(u32::try_from(id).unwrap_or(u32::MAX)), rx)
+    }
+
+    fn allocate_response(&self) -> (f64, oneshot::Receiver<ResponseResolution>) {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let (tx, rx) = oneshot::channel();
+        self.responses.lock().unwrap().insert(id, tx);
+        (f64::from(u32::try_from(id).unwrap_or(u32::MAX)), rx)
+    }
+
+    /// Delivers a request resolution; `false` when nothing was parked
+    /// under the id (already cancelled and cleaned up, or unknown).
+    fn resolve_request(&self, id: f64, resolution: RequestResolution) -> bool {
+        match self.requests.lock().unwrap().remove(&(id as u64)) {
+            Some(sender) => sender.send(resolution).is_ok(),
+            None => false,
+        }
+    }
+
+    fn resolve_response(&self, id: f64, resolution: ResponseResolution) -> bool {
+        match self.responses.lock().unwrap().remove(&(id as u64)) {
+            Some(sender) => sender.send(resolution).is_ok(),
+            None => false,
+        }
+    }
+
+    /// Drops every outstanding call (the `clear_hooks` path). The parked
+    /// adapters wake with a channel-dropped error; the JS side's
+    /// never-resolving promises are its own garbage.
+    pub(crate) fn clear(&self) {
+        self.requests.lock().unwrap().clear();
+        self.responses.lock().unwrap().clear();
+    }
+}
+
+// ---- the adapters: TurboCallback behind core's hook traits ----
+
+/// A read-write request hook backed by a JS callback.
+pub(crate) struct JsRequestHook {
+    on_hook: TurboCallback,
+    pending: Arc<Pending>,
+}
+
+impl JsRequestHook {
+    pub(crate) fn new(on_hook: TurboCallback, pending: Arc<Pending>) -> Self {
+        JsRequestHook { on_hook, pending }
+    }
+}
+
+impl RequestHook for JsRequestHook {
+    fn name(&self) -> &str {
+        "js-request-hook"
+    }
+
+    fn on_request(&self, req: Request) -> BoxFuture<Result<Request>> {
+        let attempt = attempt_of(&req.extensions);
+        let (url, method, headers) = request_head(&req);
+        let (id, rx) = self.pending.allocate_request();
+        self.on_hook.call(HookRequestEvent {
+            hook_call_id: id,
+            attempt,
+            url,
+            method,
+            headers,
+        });
+        Box::pin(async move {
+            match rx.await {
+                Ok(RequestResolution::Modified(resolution)) => rebuild_request(req, resolution),
+                Ok(RequestResolution::Error(error)) => Err(error),
+                // The pump dropped the pipeline run (abort raced us, or
+                // clear_hooks): only observable as a stray wake; the
+                // original caller is already gone with its Cancelled.
+                Err(_) => Err(Error::transport("monet-rn: js hook call dropped")),
+            }
+        })
+    }
+}
+
+/// A read-write response hook backed by a JS callback.
+pub(crate) struct JsResponseHook {
+    on_hook: TurboCallback,
+    pending: Arc<Pending>,
+}
+
+impl JsResponseHook {
+    pub(crate) fn new(on_hook: TurboCallback, pending: Arc<Pending>) -> Self {
+        JsResponseHook { on_hook, pending }
+    }
+}
+
+impl ResponseHook for JsResponseHook {
+    fn name(&self) -> &str {
+        "js-response-hook"
+    }
+
+    fn on_response(&self, res: Response) -> BoxFuture<Result<Response>> {
+        let attempt = attempt_of(&res.extensions);
+        let headers = res
+            .headers
+            .iter_flattened()
+            .map(|(name, value)| HeaderKV {
+                name: name.to_string(),
+                value: value.to_string(),
+            })
+            .collect();
+        let (id, rx) = self.pending.allocate_response();
+        self.on_hook.call(HookResponseEvent {
+            hook_call_id: id,
+            attempt,
+            status: f64::from(res.status),
+            headers,
+        });
+        Box::pin(async move {
+            match rx.await {
+                Ok(ResponseResolution::Modified(resolution)) => {
+                    Ok(rebuild_response(res, resolution))
+                }
+                Ok(ResponseResolution::Error(error)) => Err(error),
+                Ok(ResponseResolution::Retry) => Err(Error::Body(RETRY_SENTINEL_MSG.into())),
+                Err(_) => Err(Error::transport("monet-rn: js hook call dropped")),
+            }
+        })
+    }
+}
+
+/// A read-only request observer backed by a JS callback.
+pub(crate) struct JsRequestObserver {
+    on_observe: TurboCallback,
+}
+
+impl JsRequestObserver {
+    pub(crate) fn new(on_observe: TurboCallback) -> Self {
+        JsRequestObserver { on_observe }
+    }
+}
+
+impl RequestObserver for JsRequestObserver {
+    fn on_request(&self, req: &Request) {
+        let attempt = attempt_of(&req.extensions);
+        let (url, method, headers) = request_head(req);
+        self.on_observe.call(HookRequestEvent {
+            hook_call_id: 0.0,
+            attempt,
+            url,
+            method,
+            headers,
+        });
+    }
+}
+
+/// A read-only response observer backed by a JS callback.
+pub(crate) struct JsResponseObserver {
+    on_observe: TurboCallback,
+}
+
+impl JsResponseObserver {
+    pub(crate) fn new(on_observe: TurboCallback) -> Self {
+        JsResponseObserver { on_observe }
+    }
+}
+
+impl ResponseObserver for JsResponseObserver {
+    fn on_response(&self, res: &Response) {
+        let attempt = attempt_of(&res.extensions);
+        let headers = res
+            .headers
+            .iter_flattened()
+            .map(|(name, value)| HeaderKV {
+                name: name.to_string(),
+                value: value.to_string(),
+            })
+            .collect();
+        self.on_observe.call(HookResponseEvent {
+            hook_call_id: 0.0,
+            attempt,
+            status: f64::from(res.status),
+            headers,
+        });
+    }
+}
+
+/// Recognizes the retry sentinel through core's `Error::Hook` wrapping —
+/// the pump's cue to re-run the pipeline from the original request.
+pub(crate) fn is_hook_retry(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Hook { source, .. }
+            if matches!(&**source, Error::Body(message) if message == RETRY_SENTINEL_MSG)
+    )
+}
+
+/// The public pieces the module methods route through.
+pub(crate) mod protocol {
+    use super::*;
+
+    /// Delivers a request-hook resolution coming from JS.
+    pub(crate) fn resolve_request(
+        pending: &Pending,
+        id: f64,
+        resolution: HookRequestResolution,
+    ) -> bool {
+        pending.resolve_request(id, RequestResolution::Modified(resolution))
+    }
+
+    /// Delivers a request-hook rejection coming from JS.
+    pub(crate) fn reject_request(pending: &Pending, id: f64, error: HookErrorEvent) -> bool {
+        pending.resolve_request(id, RequestResolution::Error(error.into_error()))
+    }
+
+    /// Delivers a response-hook resolution coming from JS.
+    pub(crate) fn resolve_response(
+        pending: &Pending,
+        id: f64,
+        resolution: HookResponseResolution,
+    ) -> bool {
+        pending.resolve_response(id, ResponseResolution::Modified(resolution))
+    }
+
+    /// Delivers a response-hook rejection coming from JS.
+    pub(crate) fn reject_response(pending: &Pending, id: f64, error: HookErrorEvent) -> bool {
+        pending.resolve_response(id, ResponseResolution::Error(error.into_error()))
+    }
+
+    /// Delivers a response-hook retry request coming from JS.
+    pub(crate) fn retry_response(pending: &Pending, id: f64) -> bool {
+        pending.resolve_response(id, ResponseResolution::Retry)
+    }
+}
