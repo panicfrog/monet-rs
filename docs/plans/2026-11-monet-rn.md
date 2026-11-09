@@ -163,6 +163,50 @@ platform/rn-demo/                  # in-repo RN App（jsi-rs example 同款骨�
 - 连接地址可配：模拟器默认 `http://localhost:<port>`，Android 模拟器 `10.0.2.2`，真机填 host 的 LAN IP
 - TLS/pins 的 JS 级检查需要受信证书（自签 CA + SPKI hash 预置），标 v1.1 手动项（与 iOS SecTrust 链路验证同批，都用真机做）。**已实施（2026-11-09）**：`server` bin 默认带 TLS 对（https :8966 / wss :8967，fixture CA 内嵌；leaf SAN 覆盖 server 主机名的 `.local` mDNS 名——pin 键必须是主机名，monet-core 拒绝 IP 键）；leaf SPKI 每次启动现铸、经 `/leaf-spki` 下发（不烤进 App）。TLS 电池 6 项（trusted_ca / pin_match / pin_mismatch fail-closed / wss trusted / wss pin / wss pin_mismatch），iPhone 17 真机 6/6。两个电池侧的确定性前提记录在案：(a) TLS 电池服务器响应带 `Connection: close` 且不发 session ticket——URLSession 按连接池复用已握手的 TLS 连接（resumption 亦然），池内连接不再触发 server-trust challenge，pin 只在首个握手上评估；(b) 电池全局串行——hook/pins 注册表是进程级的，两电池并发互相污染。生产语义（URLSession 栈 pin 为 per-connection，见 urlsession plan）不受影响
 
+### Android 真机段（2026-11-09，部分闭合 + 两个边界记录在案）
+
+设备：小米 API 36（HttpEngine fetch + monet-ws WS）。真机流程：fixture CA 经
+`network_security_config` 锚进 App（base-config——verifier 无端点上下文，
+domain-config 锚不可见；android-demo 同款）；明文只放行 loopback/10.0.2.2；
+真机经 **adb reverse + localhost** 访问电池服务器（Android 无 mDNS resolver 解不了
+`.local`，pin 键又必须是主机名）。
+
+wiring 修复（当天已提交）：bootstrap 补 `rustls_platform_verifier::android::init_with_env`
+（此前 monet-ws/rustls 的 PlatformVerifier 在 Android 根本无法评估信任）；monet-rn
+的 vendored 依赖显式开 `platform-verifier` + transport 配置显式 `TlsTrust::PlatformVerifier`
+（此前静默落在 webpki-roots）；npm 包的 Android 库带 `rustls-platform-verifier-0.2.0.aar`
+（Kotlin CertificateVerifier 类，0.7.x 原生 crate 的版本同步项）。
+
+**边界 1 —— Android 的信任面是分层的，设备级证书安装对 Rust 栈无效**：
+
+| 路径 | 信任来源 | fixture CA 可达 |
+|---|---|---|
+| fetch（HttpEngine） | Conscrypt ← **NSC**（锚点生效） | ✅ trusted_ca_get 实测过 |
+| wss（monet-ws → rustls-platform-verifier） | Kotlin verifier 读 **AndroidCAStore（系统根目录）**——字节码实证 `TrustManagerFactory.init(AndroidCAStore)` | ❌ 用户库和 NSC 锚都不在系统根目录 |
+
+iOS 上一次设备级安装覆盖所有 TLS 栈（SecTrust 在系统信任设置后面）；Android 每个
+栈各自选信任面。Android 真机 wss 三项（trusted / pin / pin_mismatch）**当前不可通过**，
+正道是 `configureTrust(CustomRoots)`（App 自带信任根——**v1.1 立项候选**，monet-rn
+一个方法 + rebuild 扩信任根 + TS 层 + 电池扩展；企业私有 CA 在 Rust 栈目前完全没有入口，
+这是生产需要而不只是电池需要）。
+
+**边界 2 —— HttpEngine 的 pin 路径存在未决缺陷**：`https:pin_mismatch_rejects`（fetch，
+`addPublicKeyPins` 装配）在真机 mismatch 放行 200。该路径**从未被任何电池覆盖**——
+`tls:pin_mismatch_rejects` 只挂 MonetRustlsTransport，`run_httpengine_battery` 只跑明文
+套件，httpengine plan H3 声称的"破坏性 pin 检查"从未实现（该 gap 在 httpengine plan
+修订记录中补记）。下一步：模拟器复现区分 install_pins 装配 vs 平台引擎强制；电池补
+httpengine 的 pin mismatch 检查。
+
+**工程坑（当天踩过，记录在案）**：(a) `RustTurbo.podspec` 的 script phase 声明了
+`output_files` 而无 `input_files`——Xcode 依赖分析看到产物在就跳过整个 Rust 构建，
+静默链接旧 `.a`（症状：App 行为停留在几天前；修法：构建前 `rm librust-app.a`，
+上游应去掉 output_files 或补 input_files）；(b) aggregate build 编译 vendor/ 拷贝——
+改 crates/ 后必须 `npm run sync-vendor`，vendor 是 gitignored 的，crates/ 干净不代表
+vendor 新；(c) cargo 构建缓存在 `node_modules/.cache/rust-turbo`，npm install 不会
+动它——`.a` 与新 Obj-C 桥混装会以 `Exception in HostFunction` 形式爆发，修法 `rm -rf`
+后全量重建；(d) monet-rn 的 `log` crate 未接 android_logger，原生日志在 Android
+无处可去（排查只能靠猜；**接入 android_logger 是低成本高收益项**）。
+
 ## iOS 集成风险（M2 消解）
 
 monet-urlsession 的 Swift shim 对象会进 superlib `librust_app.a`，最终链进 RN App（Obj-C++/Swift 混编）：
@@ -178,7 +222,8 @@ monet-urlsession 的 Swift shim 对象会进 superlib `librust_app.a`，最终�
 - **M2**：**首次三端构建全绿**（iOS 模拟器 + Android 模拟器）：Monet 模块带一个 `ping() -> String` 方法，App 调通——一次性消解聚合构建 × monet crates × Swift shim 进 superlib × Android 链接四重集成风险
 - **M3**：fetch 通道全量（configure_pins/timeout/fetch/take_chunk/abort + pump + TS fetch/Response + server bin）+ JS 电池 HTTP 六项：iOS 模拟器、Android 模拟器双绿 + **iPhone 真机跑一次**（补上 transport 矩阵最后一块）
 - **M4**：WS 通道（ws_* + TS WebSocket + 电池 WS 三项）双端绿
-- **M5（v1.1）**：JS hook 回程协议 + TS hook API；TLS/pins 的真机手动验证项。**已实施（2026-11-08）**：observer/hook 双通道（见 docs/plans/2026-11-hooks.md 设计记录），电池 +8 项，双平台 18/18。**TLS/pins 真机验证已闭合（2026-11-09）**：iPhone 17 真机主电池 19/19 + TLS 电池 6/6（电池细节见上面"验证形态"节），顺带修掉两个真 bug——`ws_connect` 此前用 `PinConfig::default()` 建 WS transport（pins 到不了 WS 握手），iOS 的 `with_pins` 此前仅非空注册（`clearPins` 后 shim 残留旧 pins 继续生效）
+- **M5（v1.1）**：JS hook 回程协议 + TS hook API；TLS/pins 的真机手动验证项。**已实施（2026-11-08）**：observer/hook 双通道（见 docs/plans/2026-11-hooks.md 设计记录），电池 +8 项，双平台 18/18。**TLS/pins 真机验证已闭合（2026-11-09）**：iPhone 17 真机主电池 19/19 + TLS 电池 6/6（电池细节见上面"验证形态"节），顺带修掉两个真 bug——`ws_connect` 此前用 `PinConfig::default()` 建 WS transport（pins 到不了 WS 握手），iOS 的 `with_pins` 此前仅非空注册（`clearPins` 后 shim 残留旧 pins 继续生效）。**Android 真机段（2026-11-09）**：wiring 修复已落地（见"验证形态"节的 Android 小节），fetch 信任路径实测通过；wss 三项当前不可通过（信任面分层边界，同小节）——configureTrust（M6）立项后闭合
+- **M6（v1.1 候选，已立项）**：`configureTrust(roots)`——App 自带信任根（`TlsTrust::CustomRoots` 的 monet-rn 面）。动机双源：企业/私有 CA 在 Rust 栈（Android wss、<34 fetch fallback）**目前完全没有入口**（platform-verifier 只读 AndroidCAStore 系统根目录，NSC 只到平台栈——见"验证形态"节边界 1）；JS 电池的 Android wss 三项靠它变绿。范围：Monet 新方法（DER 根列表）+ rebuild 扩信任根（transport 配置的 trust 与 pins 同路）+ TS 层 + 电池扩展。iOS 侧无需求（SecTrust 全覆盖），实现时定 no-op 还是 CustomRoots 生效
 - 每步：crates/ 内改动照常过 workspace 全套测试 + clippy/fmt；monet-rn crate 本身无 host 测试（jsi 依赖只在 app 环境解析），正确性由 rn-demo 电池承载——**这是与 workspace 内 crate 的验证策略差异，记录在案**
 
 ## 与 DESIGN.md 的对账

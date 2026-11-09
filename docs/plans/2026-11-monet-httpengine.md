@@ -51,3 +51,21 @@ monet-demo 增加 `run_httpengine_battery()`(cfg android,SDK≥34 门槛):**整�
 - **H1**:crate 骨架(host stub + android cfg)+ Kotlin 桥 + init/JNI 地基 + 引擎版本探针入电池
 - **H2**:Transport 全量(head/body/cancel/error)+ conformance HTTP 套件模拟器全绿
 - **H3**:pins 原生注入(破坏性 pin 检查:错 hash → 引擎拒绝)+ 提交
+
+## H3 修订(2026-11-09,真机电池暴露)——pin 路径从未被覆盖,现状是未决缺陷
+
+对账发现:H3 的"破坏性 pin 检查"**从未实现**——`run_httpengine_battery` 只挂明文
+conformance 套件,`tls:pin_mismatch_rejects` 只挂 MonetRustlsTransport。pin 装配
+(`addPublicKeyPins(host, Set<byte[]>, includeSubdomains, Instant)`)自 H3 起没有任何
+检查,装配错误或引擎不强制都不会被发现。
+
+真机(JS 电池,小米 API 36)实测暴露:**mismatch pin 放行 200**——`configurePins` 装
+了错误 hash 后 fetch 正常完成,没有 `ERR_SSL_PINNED_KEY_NOT_IN_CERT_CHAIN`。
+`https:trusted_ca_get` 通过(engine 本身 + NSC 锚正常),排除 engine 整体不可用;
+wss(monet-ws)侧 pin mismatch 正确拒绝,排除 pin 配置面。
+
+下一步(按序):① 模拟器(API 35 AOSP)复现 JS 电池同款 mismatch——若拒绝,则是该设备/
+引擎模块不强制(MIUI 的 HttpEngine 主线模块版本差异,记录在案即结);若同样放行,
+② 打日志查 `install_pins` 的 JNI 调用(异常被吞?HashSet 装配?);③ 无论根因,
+`run_httpengine_battery` 补挂 TLS 形态的 pin mismatch 检查(LocalCa from_pkcs8 +
+spawn_https_on),终结该路径无覆盖状态。
