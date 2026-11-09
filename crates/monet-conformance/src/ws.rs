@@ -194,6 +194,35 @@ impl PathEchoServer {
     /// accept loop runs on a private tokio thread like every other
     /// conformance server.
     pub fn spawn_on(addr: &str) -> PathEchoServer {
+        Self::spawn_with_accept(addr, |stream| {
+            Box::pin(async move { Ok::<_, std::io::Error>(stream) })
+        })
+    }
+
+    /// The WSS variant: identical path routing, TLS-encrypted with `ca`'s
+    /// leaf — the on-device battery's `wss://` target.
+    pub fn spawn_tls_on(addr: &str, ca: &crate::tls::LocalCa) -> PathEchoServer {
+        let acceptor = crate::tls::tls_acceptor(ca);
+        Self::spawn_with_accept(addr, move |stream| {
+            let acceptor = acceptor.clone();
+            Box::pin(async move {
+                acceptor
+                    .accept(stream)
+                    .await
+                    .map_err(|_| std::io::Error::other("tls"))
+            })
+        })
+    }
+
+    /// The shared accept-loop shape: `accept` wraps each TCP stream (plain
+    /// for [`PathEchoServer::spawn_on`], a TLS handshake for
+    /// [`PathEchoServer::spawn_tls_on`]) before it routes by path.
+    fn spawn_with_accept<Accept, Fut, S>(addr: &str, accept: Accept) -> PathEchoServer
+    where
+        Accept: Fn(tokio::net::TcpStream) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = std::io::Result<S>> + Send,
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
+    {
         let bound_addr = addr.to_string();
         let (addr_tx, addr_rx) = mpsc::channel();
         std::thread::Builder::new()
@@ -214,8 +243,12 @@ impl PathEchoServer {
                             Ok(pair) => pair,
                             Err(_) => break,
                         };
+                        let wrapped = match accept(stream).await {
+                            Ok(io) => io,
+                            Err(_) => continue,
+                        };
                         tokio::spawn(async move {
-                            let _ = serve_by_path(stream).await;
+                            let _ = serve_by_path(wrapped).await;
                         });
                     }
                 });
@@ -234,11 +267,13 @@ impl PathEchoServer {
 
 /// Reads the handshake request's path and the hook-check header
 /// (tungstenite's callback sees both before the upgrade completes) and
-/// serves the matching behavior.
+/// serves the matching behavior. Generic over the stream so the plain
+/// and TLS listeners share it.
 #[allow(clippy::result_large_err)]
-async fn serve_by_path(
-    stream: tokio::net::TcpStream,
-) -> Result<(), tokio_tungstenite::tungstenite::Error> {
+async fn serve_by_path<S>(stream: S) -> Result<(), tokio_tungstenite::tungstenite::Error>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin,
+{
     let mut path = String::new();
     let mut hook_header = String::new();
     let mut ws = tokio_tungstenite::accept_hdr_async(

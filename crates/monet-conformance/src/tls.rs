@@ -43,6 +43,18 @@ impl LocalCa {
         }
     }
 
+    /// [`LocalCa::from_pkcs8`] with the leaf's SANs covering `hosts`
+    /// (loopback names always included) — for serving on interfaces
+    /// beyond loopback, like the on-device battery over the LAN. The
+    /// hosts a pin config can key on are hostnames, not IPs, so the
+    /// device-reachable name (e.g. the server host's `.local` Bonjour
+    /// name) must be in the leaf for a pinned handshake to validate.
+    pub fn from_pkcs8_for_hosts(ca_der: Vec<u8>, ca_key_pkcs8: &[u8], hosts: &[String]) -> LocalCa {
+        LocalCa {
+            cert: ServerCert::from_pkcs8_for_hosts(ca_der, ca_key_pkcs8, hosts),
+        }
+    }
+
     /// The DER root for [`monet_tls::TlsTrust::CustomRoots`].
     pub fn der(&self) -> Vec<u8> {
         self.cert.ca_der.clone()
@@ -55,23 +67,72 @@ impl LocalCa {
     }
 }
 
+/// A ticketer that never issues tickets. Together with no TLS 1.2
+/// session storage, it forces every connection to a battery TLS server
+/// into a full handshake — the client's server-trust challenge fires on
+/// every request, so pin policy is evaluated per fetch. URLSession skips
+/// the challenge entirely (pin evaluation included) when it resumes a
+/// session, and the pin checks must not be at the mercy of the client's
+/// connection-pool temperature. (This is a battery-side determinism
+/// fix; the production resumption behavior — pins enforced on fresh
+/// handshakes only — is documented in the urlsession plan.)
+#[derive(Debug)]
+struct NeverTickets;
+
+impl rustls::server::ProducesTickets for NeverTickets {
+    fn enabled(&self) -> bool {
+        false
+    }
+    fn lifetime(&self) -> u32 {
+        0
+    }
+    fn encrypt(&self, _plain: &[u8]) -> Option<Vec<u8>> {
+        None
+    }
+    fn decrypt(&self, _cipher: &[u8]) -> Option<Vec<u8>> {
+        None
+    }
+}
+
+/// A TLS acceptor for `ca`'s leaf — the one acceptor every TLS battery
+/// server (HTTP and WS) handshakes with, with resumption disabled.
+pub(crate) fn tls_acceptor(ca: &LocalCa) -> TlsAcceptor {
+    let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("rustls protocol versions")
+    .with_no_client_auth()
+    .with_single_cert(
+        vec![self::private::leaf_der(&ca.cert)],
+        ca.cert.leaf_key.clone_key(),
+    )
+    .expect("fresh leaf certificate is valid");
+    config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+    config.ticketer = Arc::new(NeverTickets);
+    TlsAcceptor::from(Arc::new(config))
+}
+
 /// Spawns the HTTPS variant of the conformance HTTP server: identical
 /// routes and observations, TLS-encrypted with `ca`'s leaf certificate.
 pub fn spawn_https_server(ca: &LocalCa) -> HttpServer {
-    let acceptor = TlsAcceptor::from(Arc::new(
-        rustls::ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .expect("rustls protocol versions")
-        .with_no_client_auth()
-        .with_single_cert(
-            vec![self::private::leaf_der(&ca.cert)],
-            ca.cert.leaf_key.clone_key(),
-        )
-        .expect("fresh leaf certificate is valid"),
-    ));
-    HttpServer::spawn_with(move |stream| {
+    spawn_https_on(ca, "127.0.0.1:0")
+}
+
+/// [`spawn_https_server`] on a caller-chosen address (the device battery
+/// binds `0.0.0.0`). The leaf's SPKI SHA-256 is registered for the
+/// `/leaf-spki` route so an on-device client can pin the fresh leaf —
+/// every start mints a new leaf key, so the hash is served, not baked in.
+pub fn spawn_https_on(ca: &LocalCa, bind: &str) -> HttpServer {
+    crate::http::set_tls_leaf_spki(
+        base64::engine::general_purpose::STANDARD.encode(ca.leaf_spki_sha256()),
+    );
+    // Every response closes its connection: a pooled TLS connection
+    // performs no handshake, so the server-trust challenge (and with it
+    // pin evaluation) would fire only for the first fetch to a host.
+    crate::http::set_tls_connection_close();
+    let acceptor = tls_acceptor(ca);
+    HttpServer::spawn_with(bind, move |stream| {
         let acceptor = acceptor.clone();
         async move {
             acceptor
@@ -126,10 +187,23 @@ mod private {
             ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
             let ca = ca_params.self_signed(&ca_key).expect("self-signed CA");
             let ca_der = ca.der().to_vec();
-            Self::mint(ca, ca_key, ca_der)
+            Self::mint(
+                ca,
+                ca_key,
+                ca_der,
+                vec!["localhost".into(), "127.0.0.1".into()],
+            )
         }
 
         pub fn from_pkcs8(ca_der: Vec<u8>, ca_key_pkcs8: &[u8]) -> ServerCert {
+            Self::from_pkcs8_for_hosts(ca_der, ca_key_pkcs8, &[])
+        }
+
+        pub fn from_pkcs8_for_hosts(
+            ca_der: Vec<u8>,
+            ca_key_pkcs8: &[u8],
+            hosts: &[String],
+        ) -> ServerCert {
             // Fixture keys ship as PEM (openssl's default) or DER — accept
             // both, so a hand-generated fixture cannot panic the battery.
             let key_der = super::pkcs8_der(ca_key_pkcs8);
@@ -145,14 +219,26 @@ mod private {
                     .expect("fixture CA certificate parses")
                     .self_signed(&ca_key)
                     .expect("issuer reconstructs");
-            Self::mint(ca, ca_key, ca_der)
+            // The leaf's SANs: the caller's hosts first, then the loopback
+            // names (deduped, order-preserving) — a battery serving on the
+            // LAN still gets a leaf that validates over loopback too.
+            let mut sans: Vec<String> = hosts.to_vec();
+            for name in ["localhost", "127.0.0.1"] {
+                if !sans.iter().any(|host| host == name) {
+                    sans.push(name.to_string());
+                }
+            }
+            Self::mint(ca, ca_key, ca_der, sans)
         }
 
-        fn mint(ca: rcgen::Certificate, ca_key: rcgen::KeyPair, ca_der: Vec<u8>) -> ServerCert {
+        fn mint(
+            ca: rcgen::Certificate,
+            ca_key: rcgen::KeyPair,
+            ca_der: Vec<u8>,
+            sans: Vec<String>,
+        ) -> ServerCert {
             let leaf_key = rcgen::KeyPair::generate().expect("generate leaf key");
-            let mut leaf_params =
-                rcgen::CertificateParams::new(vec!["127.0.0.1".into(), "localhost".into()])
-                    .expect("leaf params");
+            let mut leaf_params = rcgen::CertificateParams::new(sans).expect("leaf params");
             // An explicit subject distinct from the issuer: PKIX treats a
             // subject==issuer leaf as self-signed and rejects the chain
             // (rustls's webpki path tolerates it, so only the platform
@@ -234,19 +320,7 @@ pub fn wss_echo_with_trusted_ca(t: &dyn monet_core::transport::WebSocketTranspor
     use tokio_tungstenite::tungstenite::Message;
 
     let (addr_tx, addr_rx) = std::sync::mpsc::channel();
-    let acceptor = TlsAcceptor::from(Arc::new(
-        rustls::ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .expect("rustls protocol versions")
-        .with_no_client_auth()
-        .with_single_cert(
-            vec![private::leaf_der(&ca.cert)],
-            ca.cert.leaf_key.clone_key(),
-        )
-        .expect("fresh leaf certificate is valid"),
-    ));
+    let acceptor = tls_acceptor(ca);
     std::thread::Builder::new()
         .name("monet-conformance-wss".into())
         .spawn(move || {

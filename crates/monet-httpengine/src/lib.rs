@@ -84,7 +84,8 @@ impl Drop for HttpengineTransport {
     }
 }
 
-impl Transport for HttpengineTransport {    fn execute(&self, req: Request, cancel: CancelToken) -> BoxFuture<Result<Response>> {
+impl Transport for HttpengineTransport {
+    fn execute(&self, req: Request, cancel: CancelToken) -> BoxFuture<Result<Response>> {
         #[cfg(target_os = "android")]
         {
             jni::execute(&self.engine, req, cancel)

@@ -67,14 +67,14 @@ impl HttpServer {
     }
 
     /// Spawns the server with a custom accept step wrapping each TCP
-    /// stream (the TLS scenarios hand in a handshake).
-    pub(crate) fn spawn_with<Accept, Fut, S>(accept: Accept) -> HttpServer
+    /// stream (the TLS scenarios hand in a handshake) on the given bind.
+    pub(crate) fn spawn_with<Accept, Fut, S>(bind: &str, accept: Accept) -> HttpServer
     where
         Accept: Fn(tokio::net::TcpStream) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = std::io::Result<S>> + Send,
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
     {
-        Self::spawn_inner("127.0.0.1:0", accept)
+        Self::spawn_inner(bind, accept)
     }
 
     fn spawn_inner<Accept, Fut, S>(bind: &str, accept: Accept) -> HttpServer
@@ -212,9 +212,56 @@ impl HttpServer {
     }
 }
 
+/// The leaf SPKI SHA-256 (base64) of the running TLS battery server, if
+/// one is up — set by
+/// [`spawn_https_on`](crate::tls::spawn_https_on), served at
+/// `/leaf-spki` so an on-device client can pin the fresh leaf (every
+/// start mints a new leaf key, so the hash is served, never baked in).
+static TLS_LEAF_SPKI: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Registers the TLS battery server's leaf SPKI for `/leaf-spki`.
+pub(crate) fn set_tls_leaf_spki(hash: String) {
+    let _ = TLS_LEAF_SPKI.set(hash);
+}
+
+/// Whether responses close the connection after the body. The TLS battery
+/// server turns this on: clients pool connections per (host, port) —
+/// URLSession included — and a fetch served over a pooled TLS connection
+/// performs no handshake, so no server-trust challenge and no pin
+/// evaluation: the pin checks would ride whatever connection a previous
+/// fetch established. Closing after each response forces a full
+/// handshake (and the challenge, and the pin evaluation) on every fetch.
+/// (The in-process Rust batteries never need this — each check spawns a
+/// fresh server, so every connection is a fresh one.)
+static TLS_CONNECTION_CLOSE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Arms `Connection: close` on every response — the TLS battery server.
+pub(crate) fn set_tls_connection_close() {
+    TLS_CONNECTION_CLOSE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Answers one route. `request_body` is the body the check sent — the
 /// echo route reflects it. `gate` is the concurrency gate (see `/fast`).
 async fn respond(
+    method: &str,
+    path: &str,
+    request_headers: &hyper::HeaderMap,
+    request_body: Vec<u8>,
+    gate: &std::sync::Arc<tokio::sync::Notify>,
+) -> HyperResponse<BoxBody<Bytes, std::convert::Infallible>> {
+    let mut response = respond_route(method, path, request_headers, request_body, gate).await;
+    if TLS_CONNECTION_CLOSE.load(std::sync::atomic::Ordering::Relaxed) {
+        response
+            .headers_mut()
+            .insert("connection", "close".parse().unwrap());
+    }
+    response
+}
+
+/// The route table — [`respond`] adds the TLS battery's connection close.
+#[allow(clippy::too_many_arguments)]
+async fn respond_route(
     method: &str,
     path: &str,
     request_headers: &hyper::HeaderMap,
@@ -226,6 +273,12 @@ async fn respond(
             StatusCode::OK,
             boxed(Full::new(Bytes::from_static(b"plain"))),
         ),
+        // The TLS battery server's leaf SPKI (base64) — 404 when no TLS
+        // variant is running, i.e. from every in-process battery server.
+        "/leaf-spki" => match TLS_LEAF_SPKI.get() {
+            Some(hash) => ok(StatusCode::OK, boxed(Full::new(Bytes::from(hash.clone())))),
+            None => ok(StatusCode::NOT_FOUND, boxed(Full::new(Bytes::new()))),
+        },
         // The observable for the JS GC check: how many WebSocket
         // connections are currently open on the battery server's
         // /gc-probe route (same process, other port — the count travels
