@@ -69,3 +69,36 @@ wss(monet-ws)侧 pin mismatch 正确拒绝,排除 pin 配置面。
 ② 打日志查 `install_pins` 的 JNI 调用(异常被吞?HashSet 装配?);③ 无论根因,
 `run_httpengine_battery` 补挂 TLS 形态的 pin mismatch 检查(LocalCa from_pkcs8 +
 spawn_https_on),终结该路径无覆盖状态。
+
+## H3 修订二(2026-11-09,步骤①执行完毕)——根因落定:local trust anchor 的 pin 豁免,已修已验
+
+步骤①结果:API 35 google_apis 模拟器**同款复现**——TLS 电池 2/4,装配日志正常
+(`addPublicKeyPins(localhost = 1 hash(es))` → `engine built (1 pin entries)`),
+`https:pin_mismatch_rejects` 仍放行 200。排除 MIUI 模块差异,是平台语义(②的装配
+怀疑同日由 android_logger 日志排除——装配链路从始至终没有错)。
+
+根因(官方 API 文档落定):Chromium/Cronet 对 **local trust anchor**(用户安装 CA、
+network-security-config 锚)默认**豁免 pin 强制**——`HttpEngine.Builder` 自带
+`setEnablePublicKeyPinningBypassForLocalTrustAnchors(bool)`,默认 true。设计动机是
+Chromium 安全 FAQ 的立场:pin 防的是公共 CA 误签发;对本地锚(SSL 调试代理、企业
+MITM)强制 pin 会把调试/代理场景全部打死,官方措辞关掉豁免"highly discouraged"。
+电池的 fixture CA 恰是 NSC `<base-config>` 锚——所以 `trusted_ca_get` 过(本地锚被
+信任)而 pin 强制被跳过(本地锚豁免),两件事是同一个信任面的两面。
+
+修复:`build_engine` 在 **pins 非空时**调
+`setEnablePublicKeyPinningBypassForLocalTrustAnchors(false)`。取舍:显式配 pin 的 app
+要的正是"本地装了 MITM CA 也不放行"——本地锚正是 pin 存在意义里的攻击面;不配 pin
+的引擎保持平台默认(豁免),代理/调试场景不受影响。与 `addPublicKeyPins` 同为
+API 34+,无版本分叉。
+
+验证(修复后,双端):AOSP 模拟器 TLS 电池 2→3 pass,`https:pin_mismatch_rejects`
+以真 pin 拒绝通过(检查断言错误消息含 pinning failed/PINNED,非泛化失败);小米真机
+(API 36)同款 3 pass。剩余 3 失败全部是 wss 的已知边界(rustls-platform-verifier
+读不到 NSC 锚,monet-rn plan 边界 1)——正是 M6 configureTrust 的立项依据。
+
+步骤③的归宿:JS 电池的 `https:pin_mismatch_rejects` 就是暴露本缺陷的自动化覆盖,
+修复后已真实强制,Rust 侧不缺这双眼睛。`run_httpengine_battery` 的封闭式 pin 检查
+(修订一设想 LocalCa + spawn_https_on)需要引擎配自定义根,而 `HttpEngine.Builder`
+的方法面**没有 custom roots API**(只有 pins/QUIC hints/DNS/cache/代理),本地铸的
+CA 引擎一律 UnknownIssuer——即 M6 的 configureTrust(roots) 在 Android 只能落到
+monet-ws/monet-rustls(<34 fallback),HttpEngine 侧是 no-op + 文档记录。M6 设计输入。

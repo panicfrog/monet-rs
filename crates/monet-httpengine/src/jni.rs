@@ -258,6 +258,24 @@ pub fn build_engine(pins: &PinConfig) -> Result<EngineHandle> {
                 install_pins(env, &builder, entry)?;
             }
 
+            // Pins only bite against publicly-trusted chains by default:
+            // Cronet bypasses pin enforcement for local trust anchors
+            // (user-installed / network-security-config CAs) — a mismatch
+            // against a locally-anchored cert resolves 200. That is the H3
+            // boundary on record (reproduced on both MIUI and AOSP API 35).
+            // An app that pins wants enforcement exactly there — a locally
+            // installed MITM CA is the attack pinning exists for — so the
+            // bypass is disabled whenever pins are set. Unpinned engines
+            // keep the platform default.
+            if !pins.entries().is_empty() {
+                env.call_method(
+                    &builder,
+                    jni::jni_str!("setEnablePublicKeyPinningBypassForLocalTrustAnchors"),
+                    jni::jni_sig!("(Z)Landroid/net/http/HttpEngine$Builder;"),
+                    &[false.into()],
+                )?;
+            }
+
             env.call_method(
                 &builder,
                 jni::jni_str!("setEnableBrotli"),
