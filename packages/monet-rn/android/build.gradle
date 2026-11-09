@@ -45,4 +45,11 @@ dependencies {
     def rnPackageJson = new File(rootProject.projectDir, "../node_modules/react-native/package.json")
     def rnVersion = new groovy.json.JsonSlurper().parse(rnPackageJson).version
     implementation "com.facebook.react:react-android:${rnVersion}"
+    // The JVM component of rustls-platform-verifier (the native side rides
+    // in the superlib). The Kotlin CertificateVerifier class must be on
+    // every consumer's classpath — monet-tls's TlsTrust::PlatformVerifier
+    // loads it through the app classloader (initialized by the native
+    // bootstrap). Version-matched to the native crate via the
+    // rustls-platform-verifier-android version-sync crate (0.2.0 ↔ 0.7.x).
+    implementation files("libs/rustls-platform-verifier-0.2.0.aar")
 }

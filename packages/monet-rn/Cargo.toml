@@ -85,13 +85,34 @@ monet-urlsession = { path = "vendor/monet-urlsession" }
 #   HttpEngine has no WebSocket surface, so this is independent of the
 #   HTTP choice.
 monet-httpengine = { path = "vendor/monet-httpengine", optional = true }
-monet-rustls = { path = "vendor/monet-rustls", optional = true }
-monet-ws = { path = "vendor/monet-ws", optional = true }
+# platform-verifier: the Android TLS trust goes through the platform trust
+# store (rustls-platform-verifier; the embedder's bootstrap initializes its
+# host settings — see src/bootstrap.rs), NOT the embedded Mozilla bundle
+# that is the transports' own default. The npm package's Android library
+# ships the verifier's JVM component (libs/), so every consumer's
+# classloader can find it.
+monet-rustls = { path = "vendor/monet-rustls", optional = true, features = [
+  "platform-verifier",
+] }
+monet-ws = { path = "vendor/monet-ws", optional = true, features = [
+  "platform-verifier",
+] }
+# The TlsTrust surface the transport configs are built with (vendored like
+# the transports above).
+monet-tls = { path = "vendor/monet-tls", features = ["platform-verifier"] }
 log = "0.4"
 # The bootstrap JNI entry (MonetBootstrap.nativeInit): present in every
 # configuration — a no-op without the httpengine feature — so the Java
 # side can call it unconditionally.
 jni = "0.22"
+# The bootstrap also initializes the Android platform verifier
+# (rustls-platform-verifier's host settings: JVM + Context + class
+# loader). monet-ws/monet-rustls connections with
+# TlsTrust::PlatformVerifier cannot evaluate trust without it — every
+# TLS handshake rejects with UnknownIssuer. Same 0.7 line as
+# monet-tls's, so one crate instance resolves (the statics the
+# verifier reads are the ones this init writes).
+rustls-platform-verifier = "0.7"
 
 [features]
 default = ["httpengine", "websocket"]

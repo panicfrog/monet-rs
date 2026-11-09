@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The TLS battery's trust and cleartext policy (same shape as the
+  android-demo rig's, which carried the Rust battery on-device):
+
+  - The fixture CA anchors TLS trust app-wide for the platform verifiers
+    (the HttpEngine fetch path and monet-ws's rustls platform verifier).
+    It must live in <base-config>: the verifiers call checkServerTrusted
+    without endpoint context, and Conscrypt only applies <domain-config>
+    anchors when the domain is known — a domain-scoped anchor would never
+    be seen. The system CAs stay trusted alongside it.
+
+  - Cleartext is permitted for loopback and the emulator's host alias
+    only: the plain battery runs over http (adb reverse maps a device's
+    localhost port to the host), and the platform HttpEngine (unlike the
+    Rust transports) enforces NSC's cleartext policy. The LAN IP is
+    deliberately NOT listed — on a real device the battery goes through
+    adb reverse, never cleartext over the air.
+-->
+<network-security-config>
+    <base-config>
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="@raw/monet_fixture_ca" />
+        </trust-anchors>
+    </base-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">localhost</domain>
+        <domain includeSubdomains="false">10.0.2.2</domain>
+    </domain-config>
+</network-security-config>

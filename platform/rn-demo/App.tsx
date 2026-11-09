@@ -49,10 +49,16 @@ const DEFAULT_BASE =
   Platform.OS === 'android' ? 'http://10.0.2.2:8964' : 'http://127.0.0.1:8964';
 const CHECK_TIMEOUT_MS = 10_000;
 // The TLS battery target: the battery server's TLS pair (https :8966 /
-// wss :8967). The base must be the server host's mDNS name — pin config
-// keys are hostnames (monet-core rejects IPs), and a `.local` name is
-// what an iPhone on the LAN resolves AND can key pins on.
-const DEFAULT_TLS_BASE = 'https://xieyongpingdeMacBook-Pro-2.local:8966';
+// wss :8967). Pin config keys are hostnames (monet-core rejects IPs):
+// - iOS: the server host's mDNS name — resolvable over the LAN and a
+//   valid pin key.
+// - Android: no mDNS resolver exists in the OS, so a real device goes
+//   through adb reverse and dials `localhost` (a valid pin key, and the
+//   leaf's SANs always cover it).
+const DEFAULT_TLS_BASE =
+  Platform.OS === 'android'
+    ? 'https://localhost:8966'
+    : 'https://xieyongpingdeMacBook-Pro-2.local:8966';
 const TLS_WS_PORT = '8967';
 
 /** The ws twin of a plain base: same host, the battery server's ws port —

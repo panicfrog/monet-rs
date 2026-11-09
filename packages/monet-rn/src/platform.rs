@@ -57,6 +57,11 @@ fn select_http(pins: &PinConfig) -> Result<Arc<dyn Transport>, String> {
     #[cfg(all(target_os = "android", feature = "fallback-rustls"))]
     {
         let config = monet_rustls::MonetRustlsConfig {
+            // Platform trust store, not the embedded Mozilla bundle —
+            // the transports' default; the system CA store (and any
+            // network_security_config anchors the app adds) is what a
+            // platform stack must honor.
+            trust: monet_tls::TlsTrust::PlatformVerifier,
             pins: pins.clone(),
             ..monet_rustls::MonetRustlsConfig::default()
         };
@@ -90,6 +95,11 @@ pub fn ws_transport(pins: &PinConfig) -> anyhow::Result<Arc<dyn monet_core::WebS
     #[cfg(all(target_os = "android", feature = "websocket"))]
     {
         let config = monet_ws::WsConfig {
+            // Platform trust store (see select_http's fallback note):
+            // the same trust surface as the HttpEngine fetch path — the
+            // transports' own default is the embedded Mozilla bundle,
+            // which silently diverges from the platform stacks.
+            trust: monet_tls::TlsTrust::PlatformVerifier,
             pins: pins.clone(),
             ..monet_ws::WsConfig::default()
         };
