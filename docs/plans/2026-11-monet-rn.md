@@ -185,10 +185,13 @@ wiring 修复（当天已提交）：bootstrap 补 `rustls_platform_verifier::an
 | wss（monet-ws → rustls-platform-verifier） | Kotlin verifier 读 **AndroidCAStore（系统根目录）**——字节码实证 `TrustManagerFactory.init(AndroidCAStore)` | ❌ 用户库和 NSC 锚都不在系统根目录 |
 
 iOS 上一次设备级安装覆盖所有 TLS 栈（SecTrust 在系统信任设置后面）；Android 每个
-栈各自选信任面。Android 真机 wss 三项（trusted / pin / pin_mismatch）**当前不可通过**，
-正道是 `configureTrust(CustomRoots)`（App 自带信任根——**v1.1 立项候选**，monet-rn
-一个方法 + rebuild 扩信任根 + TS 层 + 电池扩展；企业私有 CA 在 Rust 栈目前完全没有入口，
-这是生产需要而不只是电池需要）。
+栈各自选信任面。Android 真机 wss 三项（trusted / pin / pin_mismatch）**曾不可通过**——
+`configureTrust`（M6，2026-11-09 已实施）闭合：电池的 wss 三项现在自取 `/ca`（电池
+服务器新增路由，明文 http 下发 fixture CA 的 base64 DER）走 configureTrust 配根，
+monet-ws 以 `TlsTrust::PlatformAndCustomRoots`（系统 + 自带，NSC 语义）握手。双端
+验证：模拟器（API 35）TLS 电池 6/6，真机（小米 API 36）6/6（含 wss 三项，真 pin
+拒绝/回环全部真实握手——不再是 10s 超时）。企业私有 CA 在 Rust 栈的生产入口同理
+（configureTrust 就是为此立项，不只是电池需要）。
 
 **边界 2 —— HttpEngine 的 pin 强制：已根因 + 已修（2026-11-09 当日闭合）**。真机
 mismatch 放行 200 → 模拟器（API 35 AOSP）同款复现（排除 MIUI 模块差异）→ 根因落定：
@@ -231,7 +234,7 @@ monet-urlsession 的 Swift shim 对象会进 superlib `librust_app.a`，最终�
 - **M3**：fetch 通道全量（configure_pins/timeout/fetch/take_chunk/abort + pump + TS fetch/Response + server bin）+ JS 电池 HTTP 六项：iOS 模拟器、Android 模拟器双绿 + **iPhone 真机跑一次**（补上 transport 矩阵最后一块）
 - **M4**：WS 通道（ws_* + TS WebSocket + 电池 WS 三项）双端绿
 - **M5（v1.1）**：JS hook 回程协议 + TS hook API；TLS/pins 的真机手动验证项。**已实施（2026-11-08）**：observer/hook 双通道（见 docs/plans/2026-11-hooks.md 设计记录），电池 +8 项，双平台 18/18。**TLS/pins 真机验证已闭合（2026-11-09）**：iPhone 17 真机主电池 19/19 + TLS 电池 6/6（电池细节见上面"验证形态"节），顺带修掉两个真 bug——`ws_connect` 此前用 `PinConfig::default()` 建 WS transport（pins 到不了 WS 握手），iOS 的 `with_pins` 此前仅非空注册（`clearPins` 后 shim 残留旧 pins 继续生效）。**Android 真机段（2026-11-09）**：wiring 修复已落地（见"验证形态"节的 Android 小节），fetch 信任路径实测通过；wss 三项当前不可通过（信任面分层边界，同小节）——configureTrust（M6）立项后闭合
-- **M6（v1.1 候选，已立项）**：`configureTrust(roots)`——App 自带信任根（`TlsTrust::CustomRoots` 的 monet-rn 面）。动机双源：企业/私有 CA 在 Rust 栈（Android wss、<34 fetch fallback）**目前完全没有入口**（platform-verifier 只读 AndroidCAStore 系统根目录，NSC 只到平台栈——见"验证形态"节边界 1）；JS 电池的 Android wss 三项靠它变绿。范围：Monet 新方法（DER 根列表）+ rebuild 扩信任根（transport 配置的 trust 与 pins 同路）+ TS 层 + 电池扩展。iOS 侧无需求（SecTrust 全覆盖），实现时定 no-op 还是 CustomRoots 生效。**Android 生效面（2026-11-09 修订，边界 2 的落点）**：`HttpEngine.Builder` 没有 custom roots API（方法面只有 pins/QUIC hints/DNS/cache/代理）——configureTrust 对 HttpEngine 是 no-op + 文档记录，fetch 走 HttpEngine 时信任仍由 NSC/系统锚决定；实际生效的是 monet-ws 与 monet-rustls（<34 fallback），正是 wss 三项变绿所需要的那一面
+- **M6（v1.1 候选，已立项）**：`configureTrust(roots)`——App 自带信任根。**已实施（2026-11-09，Android 双端验证）**：语义定为**扩展**（系统 + 自带，NSC 同款——混合流量不被打断），载体 `TlsTrust::PlatformAndCustomRoots`（monet-tls 组合 verifier：platform 先试，UnknownIssuer 回退 custom，双败时 surface custom 错误——Conscrypt 对用户锚的次序）。monet-rn 面：`configureTrust(roots)/clearTrust()`（每项 PEM 或裸 base64 DER，fail-closed）+ `TrustConfig{pins, roots}` 单锁存 + rebuild 同路；TS `configureTrust/clearTrust`。电池：服务器新增 `/ca` 路由，App 的 wss 三项走 `withBatteryCa`（明文 http 取 CA → configureTrust → finally clearTrust）。验证：AOSP 模拟器主电池 19/19 + TLS 电池 6/6；小米真机 6/6（wss 三项经 configureTrust 全绿，https 三项经 NSC 照旧）。**iOS 侧已实现待验证**：Swift shim 新增 roots 查询（roots_count/root_at 过 build.rs 的 monet_ 包装）+ `SecTrustSetAnchorCertificates`（不设 anchorsOnly，扩展语义）——URLSession 挑战路径在"有 pins 或有 roots"时拦截（roots 必须覆盖所有 host，否则附加信任不可达），NWConnection verify block 同理；`evaluate` 空 hashes 走 .use（roots-only host）。次日验证备忘：(a) 2026-11-09 晚的模拟器 TLS 0/6（"undefined is not a function"）是**构建空转**——xcodebuild 的 `-quiet` 被误拼进 `-destination` 引号，命令打印设备列表即退出，app 还是 08:45 的旧 Rust（`nm` 无 configure_trust 符号实证）；正确命令重建 + `rm librust-app.a`（podspec output_files 无 input_files 的老陷阱）即可。(b) 模拟器 CLI 装 CA 走不通（simctl spawn 看不到宿主路径、无 security 二进制）——要么真机（CA 已设备级安装，https 三项走设备信任库语义），要么临时把整个 TLS 电池包进 withBatteryCa（自带 CA 部署形态，顺带覆盖 URLSession 挑战的新路径）。**Android 生效面（边界 2 的落点）**：`HttpEngine.Builder` 没有 custom roots API（方法面只有 pins/QUIC hints/DNS/cache/代理）——configureTrust 对 HttpEngine 是 no-op + 文档记录，fetch 走 HttpEngine 时信任仍由 NSC/系统锚决定；实际生效的是 monet-ws 与 monet-rustls（<34 fallback），正是 wss 三项变绿所需要的那一面
 - 每步：crates/ 内改动照常过 workspace 全套测试 + clippy/fmt；monet-rn crate 本身无 host 测试（jsi 依赖只在 app 环境解析），正确性由 rn-demo 电池承载——**这是与 workspace 内 crate 的验证策略差异，记录在案**
 
 ## 与 DESIGN.md 的对账

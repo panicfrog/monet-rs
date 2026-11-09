@@ -29,7 +29,7 @@ use monet_core::hook::{RequestHook, RequestObserver, ResponseHook, ResponseObser
 use monet_core::request::Request;
 use monet_core::response::Response;
 use monet_core::transport::BoxFuture;
-use monet_core::{Extensions, HeaderMap, Method, Url};
+use monet_core::{Extensions, HeaderMap, Url};
 
 use crate::HeaderKV;
 

@@ -127,6 +127,14 @@ pub fn spawn_https_on(ca: &LocalCa, bind: &str) -> HttpServer {
     crate::http::set_tls_leaf_spki(
         base64::engine::general_purpose::STANDARD.encode(ca.leaf_spki_sha256()),
     );
+    // The CA itself (bare base64 DER, like /leaf-spki): an on-device
+    // battery fetches this over plain http and hands it to
+    // configureTrust — the Rust stacks (monet-ws, the rustls fallback)
+    // cannot see the network_security_config anchor the platform stacks
+    // read.
+    crate::http::set_tls_ca(
+        base64::engine::general_purpose::STANDARD.encode(ca.der()),
+    );
     // Every response closes its connection: a pooled TLS connection
     // performs no handshake, so the server-trust challenge (and with it
     // pin evaluation) would fire only for the first fetch to a host.

@@ -153,7 +153,7 @@ final class WebSocketConnection {
     tcpOptions.noDelay = true
     let tlsOptions = secure ? NWProtocolTLS.Options() : nil
     if let tlsOptions, let host = target.host {
-      configurePinning(tlsOptions: tlsOptions, host: host)
+      configureTlsVerification(tlsOptions: tlsOptions, host: host)
     }
     let parameters = NWParameters(tls: tlsOptions, tcp: tcpOptions)
 
@@ -178,12 +178,17 @@ final class WebSocketConnection {
     created.start(queue: queue)
   }
 
-  /// Pinned hosts get a verify block that replaces Network.framework's
-  /// trust evaluation (nitro's NitroWSPinningBridge pattern); the pins
-  /// resolve once so the block checks the entry this decision made with.
-  private func configurePinning(tlsOptions: NWProtocolTLS.Options, host: String) {
+  /// Pinned hosts and roots-configured apps get a verify block that
+  /// replaces Network.framework's trust evaluation (nitro's
+  /// NitroWSPinningBridge pattern); the pins and roots resolve once so
+  /// the block checks the configuration this decision made with. The
+  /// block evaluates with the custom roots anchored (configureTrust
+  /// applies to every wss host, not just pinned ones), then the pin
+  /// layer on top.
+  private func configureTlsVerification(tlsOptions: NWProtocolTLS.Options, host: String) {
     let hashes = PinningShim.pinnedHashes(for: host)
-    guard !hashes.isEmpty else { return }
+    let roots = PinningShim.customRoots()
+    guard !hashes.isEmpty || !roots.isEmpty else { return }
     let failureSlot = PinningFailureSlot()
     tlsFailureSlot = failureSlot
     let securityOptions = tlsOptions.securityProtocolOptions
@@ -191,6 +196,7 @@ final class WebSocketConnection {
       securityOptions,
       { _, secTrust, complete in
         let trust = sec_trust_copy_ref(secTrust).takeRetainedValue()
+        PinningShim.apply(roots, to: trust)
         PinningShim.evaluate(trust: trust, hashes: hashes) { outcome in
           switch outcome {
           case .use:

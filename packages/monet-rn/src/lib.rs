@@ -52,12 +52,13 @@ const MAX_HOOK_RETRIES: u32 = 3;
 /// on the client: a pin rebuild swaps the client wholesale, and hook
 /// registrations are app-lifetime state that must survive it. WebSocket
 /// connections carry their own state — no registry needed (see ws.rs);
-/// they build their transport from the live pin config, which is why it
-/// is retained here alongside the rebuilt HTTP transport.
+/// they build their transport from the live trust config (pins and
+/// custom roots), which is why it is retained here alongside the
+/// rebuilt HTTP transport.
 pub struct Monet {
     transport: RwLock<Arc<dyn monet_core::Transport>>,
     client: RwLock<Arc<Client>>,
-    pins: RwLock<PinConfig>,
+    trust: RwLock<platform::TrustConfig>,
     fetches: FetchRegistry,
     hooks: RwLock<HookRegistry>,
     pending: Arc<Pending>,
@@ -65,11 +66,15 @@ pub struct Monet {
 
 impl Monet {
     pub fn create() -> anyhow::Result<Self> {
-        let transport = platform::http_transport(&PinConfig::default());
+        let trust = platform::TrustConfig {
+            pins: PinConfig::default(),
+            roots: Vec::new(),
+        };
+        let transport = platform::http_transport(&trust);
         Ok(Monet {
             client: RwLock::new(Arc::new(Client::new(transport.clone()))),
             transport: RwLock::new(transport),
-            pins: RwLock::new(PinConfig::default()),
+            trust: RwLock::new(trust),
             fetches: FetchRegistry::new(),
             hooks: RwLock::new(HookRegistry::new()),
             pending: Pending::shared(),
@@ -77,18 +82,18 @@ impl Monet {
     }
 
     /// Rebuilds the transport + client after a configuration change
-    /// (pins). iOS pins live in the Swift shim (process-global,
-    /// last-wins); Android pins go into the transport configs, so a
-    /// rebuild re-installs them there. In-flight fetches keep the old
-    /// transport alive through their Arc clones; it shuts down (engine
-    /// `shutdown()` on Android) once the last one finishes. Hook
-    /// registrations are deliberately untouched.
-    fn rebuild(&self, pins: &PinConfig) -> anyhow::Result<()> {
-        *self.pins.write().unwrap() = pins.clone();
-        let transport = platform::http_transport(pins);
+    /// (pins, trust roots). iOS pins and roots live in the Swift shim
+    /// (process-global, last-wins); Android pins and roots go into the
+    /// transport configs, so a rebuild re-installs them there. In-flight
+    /// fetches keep the old transport alive through their Arc clones;
+    /// it shuts down (engine `shutdown()` on Android) once the last one
+    /// finishes. Hook registrations are deliberately untouched.
+    fn rebuild(&self, trust: platform::TrustConfig) -> anyhow::Result<()> {
+        let transport = platform::http_transport(&trust);
         let client = Client::new(transport.clone());
         *self.transport.write().unwrap() = transport;
         *self.client.write().unwrap() = Arc::new(client);
+        *self.trust.write().unwrap() = trust;
         Ok(())
     }
 
@@ -196,11 +201,45 @@ impl Monet {
     pub fn configure_pins(&self, json: String) -> anyhow::Result<()> {
         let pins = PinConfig::from_json(&json)
             .map_err(|e| anyhow::anyhow!("invalid pinning config: {e}"))?;
-        self.rebuild(&pins)
+        let mut trust = self.trust.read().unwrap().clone();
+        trust.pins = pins;
+        self.rebuild(trust)
     }
 
     pub fn clear_pins(&self) -> anyhow::Result<()> {
-        self.rebuild(&PinConfig::default())
+        let mut trust = self.trust.read().unwrap().clone();
+        trust.pins = PinConfig::default();
+        self.rebuild(trust)
+    }
+
+    /// Sets the app-supplied trust roots (each a PEM block or bare
+    /// base64 DER) that TLS handshakes anchor alongside the platform
+    /// store — network_security_config semantics (system CAs stay
+    /// trusted). Fail-closed: an entry that does not decode is an error
+    /// and installs nothing.
+    ///
+    /// Platform reach (the HttpEngine carve-out is on record in the
+    /// plans): monet-ws and the monet-rustls fetch fallback take the
+    /// roots; the platform HttpEngine has no custom-roots API, so that
+    /// fetch path still trusts the system + network_security_config
+    /// anchors only. On iOS every fetch and wss challenge is anchored
+    /// through the Swift shim.
+    pub fn configure_trust(&self, roots: Vec<String>) -> anyhow::Result<()> {
+        let decoded = roots
+            .iter()
+            .map(|root| der_from_pem_or_base64(root))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let mut trust = self.trust.read().unwrap().clone();
+        trust.roots = decoded;
+        self.rebuild(trust)
+    }
+
+    /// Clears the custom trust roots: connections configured after this
+    /// trust the platform store only.
+    pub fn clear_trust(&self) -> anyhow::Result<()> {
+        let mut trust = self.trust.read().unwrap().clone();
+        trust.roots = Vec::new();
+        self.rebuild(trust)
     }
 
     // ---- hooks & observers (M5; the design record is
@@ -598,10 +637,11 @@ impl Monet {
         let on_close = Arc::new(on_close);
         let on_error = Arc::new(on_error);
 
-        // The live pin config: pins configured through configurePins must
-        // reach the WS handshake too (the wss verify block consults them),
-        // not just the rebuilt HTTP transport.
-        let transport = platform::ws_transport(&self.pins.read().unwrap().clone())?;
+        // The live trust config: pins and custom roots configured through
+        // configurePins/configureTrust must reach the WS handshake too
+        // (the wss verify block consults them), not just the rebuilt
+        // HTTP transport.
+        let transport = platform::ws_transport(&self.trust.read().unwrap().clone())?;
         let hooks = self.hook_snapshot();
         async_global_executor::spawn(async move {
             // Hold the transport for the connection's lifetime: its
@@ -657,6 +697,25 @@ impl Monet {
 
         Ok(conn)
     }
+}
+
+/// One custom trust root as the app supplies it: a PEM block or bare
+/// base64 DER. The armor lines are dropped when present, and all
+/// whitespace goes (PEM wraps its body) — what remains must decode as
+/// standard base64 DER.
+fn der_from_pem_or_base64(input: &str) -> anyhow::Result<Vec<u8>> {
+    let body: String = input
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("-----"))
+        .collect::<Vec<_>>()
+        .join("");
+    if body.is_empty() {
+        anyhow::bail!("empty root certificate");
+    }
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(body.as_bytes())
+        .map_err(|e| anyhow::anyhow!("root certificate is not base64 DER: {e}"))
 }
 
 /// Builds the request from the JS inputs. The pump calls this once per

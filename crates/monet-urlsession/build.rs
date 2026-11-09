@@ -70,6 +70,10 @@ fn main() {
              \x20 return pins_for_host(rust::Slice<const ::std::uint8_t>(host, host_len), \n\
              \x20                       rust::Slice<::std::uint8_t>(out, out_capacity));\n\
              }}\n\
+             inline ::std::size_t monet_root_at(\
+             ::std::size_t index, ::std::uint8_t *out, ::std::size_t out_capacity) noexcept {{\n\
+             \x20 return root_at(index, rust::Slice<::std::uint8_t>(out, out_capacity));\n\
+             }}\n\
              inline void monet_on_ws_message(\
              ::std::uint64_t id, bool is_binary, const ::std::uint8_t *data, ::std::size_t len) noexcept {{\n\
              \x20 on_ws_message(id, is_binary, rust::Slice<const ::std::uint8_t>(data, len));\n\

@@ -46,3 +46,24 @@ export function configurePins(json: string): void {
 export function clearPins(): void {
   getMonet().clearPins();
 }
+
+/**
+ * Sets the app-supplied trust roots (each a PEM block or bare base64
+ * DER) anchored alongside the platform trust store —
+ * network_security_config semantics (system CAs stay trusted).
+ * Fail-closed: an entry that does not decode throws and installs
+ * nothing.
+ *
+ * Reach: WebSocket connections and (on Android < 34) the rustls fetch
+ * fallback. The platform HttpEngine fetch path has no custom-roots
+ * API — those fetches trust the system + network_security_config
+ * anchors only.
+ */
+export function configureTrust(roots: string[]): void {
+  getMonet().configureTrust(roots);
+}
+
+/** Clears the custom trust roots (rebuilds the transport/client). */
+export function clearTrust(): void {
+  getMonet().clearTrust();
+}

@@ -224,6 +224,19 @@ pub(crate) fn set_tls_leaf_spki(hash: String) {
     let _ = TLS_LEAF_SPKI.set(hash);
 }
 
+/// The battery CA's DER (base64), if a TLS variant is running — set by
+/// [`spawn_https_on`](crate::tls::spawn_https_on), served at `/ca` so an
+/// on-device battery can hand the CA to configureTrust (the Rust stacks
+/// cannot see the network_security_config anchor the platform stacks
+/// read). Same shape as `/leaf-spki`: bare base64, 404 without a TLS
+/// server.
+static TLS_CA: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Registers the battery CA for `/ca`.
+pub(crate) fn set_tls_ca(der_base64: String) {
+    let _ = TLS_CA.set(der_base64);
+}
+
 /// Whether responses close the connection after the body. The TLS battery
 /// server turns this on: clients pool connections per (host, port) —
 /// URLSession included — and a fetch served over a pooled TLS connection
@@ -277,6 +290,13 @@ async fn respond_route(
         // variant is running, i.e. from every in-process battery server.
         "/leaf-spki" => match TLS_LEAF_SPKI.get() {
             Some(hash) => ok(StatusCode::OK, boxed(Full::new(Bytes::from(hash.clone())))),
+            None => ok(StatusCode::NOT_FOUND, boxed(Full::new(Bytes::new()))),
+        },
+        // The TLS battery's CA (base64 DER) — same 404 convention, same
+        // purpose family: on-device configuration material the battery
+        // fetches over plain http (configureTrust's roots).
+        "/ca" => match TLS_CA.get() {
+            Some(der) => ok(StatusCode::OK, boxed(Full::new(Bytes::from(der.clone())))),
             None => ok(StatusCode::NOT_FOUND, boxed(Full::new(Bytes::new()))),
         },
         // The observable for the JS GC check: how many WebSocket

@@ -27,6 +27,7 @@
 
 use crate::pin;
 use crate::registry;
+use crate::roots;
 use crate::ws;
 
 // ---- data plane: Swift calls these through the generated header ----
@@ -71,6 +72,20 @@ fn pins_for_host(host: &[u8], out: &mut [u8]) -> usize {
     pin::hashes_for_host(host, out)
 }
 
+/// How many custom trust roots are registered (configureTrust) — the
+/// challenge path's loop bound, and its "intercept at all" signal
+/// alongside the pin query.
+fn roots_count() -> usize {
+    roots::count()
+}
+
+/// Copies root `index`'s DER into `out`, returning the bytes written;
+/// an `out` too small writes nothing and returns the needed length
+/// (Swift sizes its buffer with a first empty call).
+fn root_at(index: usize, out: &mut [u8]) -> usize {
+    roots::root_at(index, out)
+}
+
 // ---- data plane: WebSocket events ----
 
 /// The handshake completed; resolves the connect future with the stream.
@@ -113,6 +128,8 @@ pub mod bridge {
         fn on_done(id: u64);
         fn on_error(id: u64, code: i32, message: &[u8]);
         fn pins_for_host(host: &[u8], out: &mut [u8]) -> usize;
+        fn roots_count() -> usize;
+        fn root_at(index: usize, out: &mut [u8]) -> usize;
         fn on_ws_open(id: u64);
         fn on_ws_message(id: u64, is_binary: bool, data: &[u8]);
         fn on_ws_ping(id: u64, data: &[u8]);

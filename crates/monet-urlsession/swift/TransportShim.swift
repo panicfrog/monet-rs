@@ -135,9 +135,12 @@ final class TaskDelegate: NSObject, URLSessionDataDelegate {
   }
 
   /// Server-trust challenges: pinned hosts get evaluated + matched
-  /// against monet-core's pins; everything else falls through to the
-  /// system's default handling (which already performs standard chain
-  /// validation — pinning is the extra layer on top).
+  /// against monet-core's pins; hosts challenged while custom roots are
+  /// registered get them anchored before evaluation (configureTrust —
+  /// the roots must apply to every host, not just pinned ones, or the
+  /// added trust would be unreachable); everything else falls through
+  /// to the system's default handling (which already performs standard
+  /// chain validation — pinning is the extra layer on top).
   func urlSession(
     _ session: URLSession,
     task: URLSessionTask,
@@ -146,13 +149,15 @@ final class TaskDelegate: NSObject, URLSessionDataDelegate {
   ) {
     let host = challenge.protectionSpace.host
     let hashes = PinningShim.pinnedHashes(for: host)
-    guard !hashes.isEmpty,
+    let roots = PinningShim.customRoots()
+    guard !hashes.isEmpty || !roots.isEmpty,
       challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
       let trust = challenge.protectionSpace.serverTrust
     else {
       completionHandler(.performDefaultHandling, nil)
       return
     }
+    PinningShim.apply(roots, to: trust)
     PinningShim.evaluate(trust: trust, hashes: hashes) { [weak self] outcome in
       guard let self else {
         completionHandler(.performDefaultHandling, nil)

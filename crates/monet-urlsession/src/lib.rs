@@ -14,6 +14,7 @@
 mod ffi;
 mod pin;
 mod registry;
+mod roots;
 mod ws;
 
 pub use ffi::bridge;
@@ -73,6 +74,18 @@ impl UrlsessionTransport {
     /// instead of constructing the transport.
     pub fn with_pins(self, pins: PinConfig) -> Self {
         pin::register(pins);
+        self
+    }
+
+    /// Registers the app-supplied DER roots the shim anchors
+    /// server-trust challenges with — additional to the system's, the
+    /// network_security_config semantics (configureTrust).
+    ///
+    /// Process-global last-wins, like [`Self::with_pins`]: every
+    /// construction registers (empty list included), so a clear reaches
+    /// the shim.
+    pub fn with_roots(self, roots: Vec<Vec<u8>>) -> Self {
+        roots::register(roots);
         self
     }
 }

@@ -29,16 +29,41 @@ use std::sync::Arc;
 use monet_core::pin::PinConfig;
 use monet_core::Transport;
 
+/// The trust surface the platform transports are built with: pins for
+/// pin enforcement, and the app-supplied custom roots anchored
+/// alongside the platform store (configureTrust) — one configuration
+/// event, one rebuild.
+#[derive(Clone)]
+pub struct TrustConfig {
+    pub pins: PinConfig,
+    pub roots: Vec<Vec<u8>>,
+}
+
+/// The rustls trust for the configured roots: the platform store plus
+/// the app's own anchors (network_security_config semantics), or the
+/// bare platform store when none are configured.
+fn rustls_trust(roots: &[Vec<u8>]) -> monet_tls::TlsTrust {
+    if roots.is_empty() {
+        monet_tls::TlsTrust::PlatformVerifier
+    } else {
+        monet_tls::TlsTrust::PlatformAndCustomRoots(roots.to_vec())
+    }
+}
+
 /// The HTTP transport for this platform + configuration.
-pub fn http_transport(pins: &PinConfig) -> Arc<dyn Transport> {
-    select_http(pins).unwrap_or_else(|reason| Arc::new(BrokenTransport(reason)))
+pub fn http_transport(trust: &TrustConfig) -> Arc<dyn Transport> {
+    select_http(trust).unwrap_or_else(|reason| Arc::new(BrokenTransport(reason)))
 }
 
 #[allow(unused_variables)]
-fn select_http(pins: &PinConfig) -> Result<Arc<dyn Transport>, String> {
+fn select_http(trust: &TrustConfig) -> Result<Arc<dyn Transport>, String> {
     #[cfg(all(target_os = "android", feature = "httpengine"))]
     {
-        match monet_httpengine::HttpengineTransport::new(pins.clone()) {
+        // Pins only: HttpEngine.Builder has no custom-roots API (the
+        // boundary on record in the plans) — fetches through it trust
+        // the system + network_security_config anchors, and
+        // configureTrust reaches monet-ws and the rustls fallback.
+        match monet_httpengine::HttpengineTransport::new(trust.pins.clone()) {
             Ok(transport) => return Ok(Arc::new(transport)),
             Err(reason) => {
                 // On an httpengine-only build this is fatal (the app
@@ -60,9 +85,10 @@ fn select_http(pins: &PinConfig) -> Result<Arc<dyn Transport>, String> {
             // Platform trust store, not the embedded Mozilla bundle —
             // the transports' default; the system CA store (and any
             // network_security_config anchors the app adds) is what a
-            // platform stack must honor.
-            trust: monet_tls::TlsTrust::PlatformVerifier,
-            pins: pins.clone(),
+            // platform stack must honor. The custom roots extend it
+            // (configureTrust).
+            trust: rustls_trust(&trust.roots),
+            pins: trust.pins.clone(),
             ..monet_rustls::MonetRustlsConfig::default()
         };
         return monet_rustls::MonetRustlsTransport::new(config)
@@ -75,12 +101,15 @@ fn select_http(pins: &PinConfig) -> Result<Arc<dyn Transport>, String> {
     }
     #[cfg(any(target_os = "ios", target_os = "macos"))]
     {
-        // Construction is infallible (`new() -> Self`); pins live in the
-        // shim's process-global registry, last registration wins. EVERY
-        // construction registers — an empty config included: that is how
-        // a clearPins reaches the shim (a bare new() would leave the
-        // previous registration live, enforcing pins the app cleared).
-        let transport = monet_urlsession::UrlsessionTransport::new().with_pins(pins.clone());
+        // Construction is infallible (`new() -> Self`); pins and roots
+        // live in the shim's process-global registry, last registration
+        // wins. EVERY construction registers — an empty config included:
+        // that is how a clearPins/clearTrust reaches the shim (a bare
+        // new() would leave the previous registration live, enforcing
+        // configuration the app cleared).
+        let transport = monet_urlsession::UrlsessionTransport::new()
+            .with_pins(trust.pins.clone())
+            .with_roots(trust.roots.clone());
         Ok(Arc::new(transport) as Arc<dyn Transport>)
     }
     #[cfg(not(any(target_os = "android", target_os = "ios", target_os = "macos")))]
@@ -91,16 +120,17 @@ fn select_http(pins: &PinConfig) -> Result<Arc<dyn Transport>, String> {
 
 /// The WebSocket transport for this platform.
 #[allow(unused_variables)]
-pub fn ws_transport(pins: &PinConfig) -> anyhow::Result<Arc<dyn monet_core::WebSocketTransport>> {
+pub fn ws_transport(trust: &TrustConfig) -> anyhow::Result<Arc<dyn monet_core::WebSocketTransport>> {
     #[cfg(all(target_os = "android", feature = "websocket"))]
     {
         let config = monet_ws::WsConfig {
             // Platform trust store (see select_http's fallback note):
             // the same trust surface as the HttpEngine fetch path — the
             // transports' own default is the embedded Mozilla bundle,
-            // which silently diverges from the platform stacks.
-            trust: monet_tls::TlsTrust::PlatformVerifier,
-            pins: pins.clone(),
+            // which silently diverges from the platform stacks. The
+            // custom roots extend it (configureTrust).
+            trust: rustls_trust(&trust.roots),
+            pins: trust.pins.clone(),
             ..monet_ws::WsConfig::default()
         };
         let transport = monet_ws::MonetWsTransport::new(config)
@@ -109,23 +139,26 @@ pub fn ws_transport(pins: &PinConfig) -> anyhow::Result<Arc<dyn monet_core::WebS
     }
     #[cfg(all(target_os = "android", not(feature = "websocket")))]
     {
-        let _ = pins;
+        let _ = trust;
         Err(anyhow::anyhow!(
             "monet-rn: WebSocket support not compiled in (enable the `websocket` feature)"
         ))
     }
     #[cfg(any(target_os = "ios", target_os = "macos"))]
     {
-        // One UrlsessionTransport type serves both stacks; pins live in
-        // the shim's process-global registry (last registration wins), so
-        // every construction registers — including the empty config a
-        // cleared pin state carries (same reasoning as select_http).
-        let transport = monet_urlsession::UrlsessionTransport::new().with_pins(pins.clone());
+        // One UrlsessionTransport type serves both stacks; pins and
+        // roots live in the shim's process-global registry (last
+        // registration wins), so every construction registers —
+        // including the empty config a cleared state carries (same
+        // reasoning as select_http).
+        let transport = monet_urlsession::UrlsessionTransport::new()
+            .with_pins(trust.pins.clone())
+            .with_roots(trust.roots.clone());
         Ok(Arc::new(transport) as Arc<dyn monet_core::WebSocketTransport>)
     }
     #[cfg(not(any(target_os = "android", target_os = "ios", target_os = "macos")))]
     {
-        let _ = pins;
+        let _ = trust;
         Err(anyhow::anyhow!(
             "monet-rn: no platform stack linked (dev build)"
         ))

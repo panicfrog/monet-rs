@@ -62,6 +62,7 @@ monet-core = { path = "vendor/monet-core" }
 # transport exposes runtime-agnostic BoxFutures (rustls/ws keep private
 # tokio runtimes, urlsession has none), so this is the only executor needed.
 async-global-executor = "2"
+base64.workspace = true
 bytes.workspace = true
 futures-channel.workspace = true
 futures-lite = "2"

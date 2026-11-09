@@ -47,7 +47,9 @@ enum PinningShim {
   }
 
   /// Evaluates `trust` and matches the chain against `hashes`,
-  /// reporting on the evaluation queue.
+  /// reporting on the evaluation queue. Empty `hashes` (an unpinned
+  /// host, challenged only because custom roots are registered) skips
+  /// the pin layer: the evaluation alone decides.
   static func evaluate(
     trust: SecTrust,
     hashes: [Data],
@@ -59,9 +61,51 @@ enum PinningShim {
           completion(.defaultHandling)
           return
         }
+        guard !hashes.isEmpty else {
+          completion(.use)
+          return
+        }
         completion(chainMatches(trust, hashes) ? .use : .reject)
       }
     }
+  }
+
+  // MARK: - Custom roots (configureTrust)
+
+  /// The registered custom trust roots as certificates, ready for
+  /// `SecTrustSetAnchorCertificates`. Queried per challenge: the
+  /// registration is process-global last-wins, same as pins.
+  static func customRoots() -> [SecCertificate] {
+    let count = roots_count()
+    guard count > 0 else { return [] }
+    var certificates: [SecCertificate] = []
+    certificates.reserveCapacity(count)
+    for index in 0..<count {
+      // Two calls per root: size, then copy (the bridge writes nothing
+      // into a too-small buffer and returns the needed length). A zero
+      // from either call is a torn read — the registry was replaced
+      // between the count and the copy — and the slot is skipped, which
+      // fails the handshake closed rather than trusting less.
+      let needed = monet_root_at(index, nil, 0)
+      guard needed > 0 else { continue }
+      var der = [UInt8](repeating: 0, count: needed)
+      let written = der.withUnsafeMutableBufferPointer { buffer in
+        monet_root_at(index, buffer.baseAddress, buffer.count)
+      }
+      guard written == needed,
+        let certificate = SecCertificateCreateWithData(nil, Data(der) as CFData)
+      else { continue }
+      certificates.append(certificate)
+    }
+    return certificates
+  }
+
+  /// Adds `roots` to `trust` as additional anchors. The system's stay
+  /// trusted — `SecTrustSetAnchorCertificatesOnly` is never called —
+  /// the network_security_config semantics. No-op on an empty list.
+  static func apply(_ roots: [SecCertificate], to trust: SecTrust) {
+    guard !roots.isEmpty else { return }
+    SecTrustSetAnchorCertificates(trust, roots as CFArray)
   }
 
   /// A chain passes when any certificate in it (leaf, intermediate, or

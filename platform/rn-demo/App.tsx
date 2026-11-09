@@ -33,7 +33,9 @@ import {
   addResponseObserver,
   clearHooks,
   clearPins,
+  clearTrust,
   configurePins,
+  configureTrust,
   fetch,
   getMonet,
   MonetError,
@@ -716,6 +718,29 @@ async function leafSpki(base: string): Promise<string> {
   return hash;
 }
 
+/** Runs `fn` with the battery CA configured as a custom trust root
+ * (configureTrust). The Rust wss stack (monet-ws) reads the platform
+ * trust store only — on Android it cannot see the fixture CA's
+ * network_security_config anchor, and on iOS the same wrapper makes
+ * the check independent of a device-level CA install: the very surface
+ * configureTrust exists for. The CA is fetched over plain http —
+ * fetching it over TLS would need the trust it carries. */
+async function withBatteryCa(fn: () => Promise<void>): Promise<void> {
+  const response = await fetch(`${DEFAULT_BASE}/ca`);
+  assert(
+    response.status === 200,
+    `/ca answered ${response.status} — is the battery server's TLS pair up?`,
+  );
+  const ca = await response.text();
+  assert(/^[A-Za-z0-9+/]+={0,2}$/.test(ca), `bad /ca payload ${JSON.stringify(ca)}`);
+  try {
+    configureTrust([ca]);
+    await fn();
+  } finally {
+    clearTrust();
+  }
+}
+
 const TLS_CHECKS: Array<{
   name: string;
   timeoutMs?: number;
@@ -790,53 +815,59 @@ const TLS_CHECKS: Array<{
   {
     name: 'wss:pin_mismatch_rejects',
     run: async base => {
-      // The negative path over NWConnection: the same registration and
-      // query service, the wss verify block. A pinned-mismatch connect
-      // must fail with the pin rejection, not open.
+      // The negative path over the wss verify block, with the battery
+      // CA trusted through configureTrust: the chain must first validate
+      // (the roots anchor it), then fail on the pin — the rejection is
+      // the pin's, not a trust failure.
       const hash = await leafSpki(base);
       const perturbed = (hash.startsWith('A') ? 'B' : 'A') + hash.slice(1);
       const host = new URL(base).hostname;
-      try {
-        configurePins(JSON.stringify({[host]: {publicKeyHashes: [perturbed]}}));
-        const ws = new MonetWebSocket(`${tlsWssBase(base)}/echo`);
+      await withBatteryCa(async () => {
         try {
-          await waitForOpen(ws);
-          throw new Error('a pinned-mismatch wss connect opened');
-        } catch (error) {
-          assert(
-            error instanceof MonetError && error.kind === 'Transport',
-            error instanceof MonetError
-              ? `expected kind Transport, got ${error.kind}: ${error.message}`
-              : `expected MonetError, got ${String(error)}`,
-          );
-          assert(
-            /pinning failed|PINNED/i.test(error.message),
-            `error is not a pin rejection: ${error.message}`,
-          );
+          configurePins(JSON.stringify({[host]: {publicKeyHashes: [perturbed]}}));
+          const ws = new MonetWebSocket(`${tlsWssBase(base)}/echo`);
+          try {
+            await waitForOpen(ws);
+            throw new Error('a pinned-mismatch wss connect opened');
+          } catch (error) {
+            assert(
+              error instanceof MonetError && error.kind === 'Transport',
+              error instanceof MonetError
+                ? `expected kind Transport, got ${error.kind}: ${error.message}`
+                : `expected MonetError, got ${String(error)}`,
+            );
+            assert(
+              /pinning failed|PINNED/i.test(error.message),
+              `error is not a pin rejection: ${error.message}`,
+            );
+          }
+        } finally {
+          clearPins();
         }
-      } finally {
-        clearPins();
-      }
+      });
     },
   },
   {
     name: 'wss:trusted_ca_echo',
     run: async base => {
       // The WS trust path over TLS with no pins: the wss handshake
-      // validates against the device's trust store.
-      const ws = new MonetWebSocket(`${tlsWssBase(base)}/echo`);
-      try {
-        await waitForOpen(ws);
-        ws.send('hello-wss-tls');
-        const echo = await nextMessage(ws);
-        assert(
-          echo.data === 'hello-wss-tls',
-          `text echo ${JSON.stringify(echo.data)}, expected "hello-wss-tls"`,
-        );
-      } finally {
-        ws.close(1000, 'done');
-        await waitForClose(ws);
-      }
+      // validates against the configured roots (configureTrust) or the
+      // device's trust store — whichever carries the battery CA.
+      await withBatteryCa(async () => {
+        const ws = new MonetWebSocket(`${tlsWssBase(base)}/echo`);
+        try {
+          await waitForOpen(ws);
+          ws.send('hello-wss-tls');
+          const echo = await nextMessage(ws);
+          assert(
+            echo.data === 'hello-wss-tls',
+            `text echo ${JSON.stringify(echo.data)}, expected "hello-wss-tls"`,
+          );
+        } finally {
+          ws.close(1000, 'done');
+          await waitForClose(ws);
+        }
+      });
     },
   },
   {
@@ -844,27 +875,30 @@ const TLS_CHECKS: Array<{
     run: async base => {
       // The pinned wss path: the same pin config must reach the wss
       // handshake (the verify block consults it), and the pinned
-      // connection round-trips.
+      // connection round-trips — over the configureTrust roots where
+      // the platform store can't see the CA.
       const hash = await leafSpki(base);
       const host = new URL(base).hostname;
-      try {
-        configurePins(JSON.stringify({[host]: {publicKeyHashes: [hash]}}));
-        const ws = new MonetWebSocket(`${tlsWssBase(base)}/echo`);
+      await withBatteryCa(async () => {
         try {
-          await waitForOpen(ws);
-          ws.send('hello-wss-pinned');
-          const echo = await nextMessage(ws);
-          assert(
-            echo.data === 'hello-wss-pinned',
-            `text echo ${JSON.stringify(echo.data)}, expected "hello-wss-pinned"`,
-          );
+          configurePins(JSON.stringify({[host]: {publicKeyHashes: [hash]}}));
+          const ws = new MonetWebSocket(`${tlsWssBase(base)}/echo`);
+          try {
+            await waitForOpen(ws);
+            ws.send('hello-wss-pinned');
+            const echo = await nextMessage(ws);
+            assert(
+              echo.data === 'hello-wss-pinned',
+              `text echo ${JSON.stringify(echo.data)}, expected "hello-wss-pinned"`,
+            );
+          } finally {
+            ws.close(1000, 'done');
+            await waitForClose(ws);
+          }
         } finally {
-          ws.close(1000, 'done');
-          await waitForClose(ws);
+          clearPins();
         }
-      } finally {
-        clearPins();
-      }
+      });
     },
   },
 ];
