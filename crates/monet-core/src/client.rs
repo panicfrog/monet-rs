@@ -71,12 +71,18 @@ impl Client {
     ///   while this method has already returned.
     /// - Hook failures abort the pipeline at the failing hook; the transport
     ///   is never called for a request whose hooks failed.
+    /// - The request's extensions travel to the response: state a request
+    ///   hook stashed (correlation ids, trace context) is readable by the
+    ///   response hooks. No transport reads extensions, so taking them out
+    ///   of the request before the execute changes nothing on the wire.
     pub async fn execute_with_cancel(&self, req: Request, cancel: CancelToken) -> Result<Response> {
         if cancel.is_cancelled() {
             return Err(Error::Cancelled);
         }
-        let req = self.hooks.run_request_hooks(req).await?;
-        let res = self.transport.execute(req, cancel).await?;
+        let mut req = self.hooks.run_request_hooks(req).await?;
+        let extensions = std::mem::take(&mut req.extensions);
+        let mut res = self.transport.execute(req, cancel).await?;
+        res.extensions = extensions;
         self.hooks.run_response_hooks(res).await
     }
 }
@@ -189,6 +195,53 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, Error::Cancelled));
         assert!(transport.recorded().is_empty());
+    }
+
+    /// The request-phase extensions travel to the response phase: a
+    /// request hook's stashed state (correlation ids, trace context) is
+    /// readable by the response hooks.
+    #[test]
+    fn request_extensions_reach_response_hooks() {
+        /// Marker a request hook stashes.
+        #[derive(Debug, Clone, PartialEq)]
+        struct TraceId(u64);
+
+        struct StashHook;
+        impl crate::hook::RequestHook for StashHook {
+            fn name(&self) -> &str {
+                "stash"
+            }
+            fn on_request(&self, mut req: Request) -> crate::transport::BoxFuture<Result<Request>> {
+                Box::pin(async move {
+                    req.extensions.insert(TraceId(42));
+                    Ok(req)
+                })
+            }
+        }
+
+        struct ReadHook(Arc<std::sync::Mutex<Option<TraceId>>>);
+        impl crate::hook::ResponseHook for ReadHook {
+            fn name(&self) -> &str {
+                "read"
+            }
+            fn on_response(&self, res: Response) -> crate::transport::BoxFuture<Result<Response>> {
+                let seen = self.0.clone();
+                Box::pin(async move {
+                    *seen.lock().unwrap() = res.extensions.get::<TraceId>().cloned();
+                    Ok(res)
+                })
+            }
+        }
+
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let mut client = Client::new(mock());
+        client.hooks().add_request_hook(StashHook);
+        client.hooks().add_response_hook(ReadHook(seen.clone()));
+
+        let resp = futures_lite::future::block_on(client.execute(Request::new(Method::Get, url())))
+            .unwrap();
+        assert!(resp.is_success());
+        assert_eq!(*seen.lock().unwrap(), Some(TraceId(42)));
     }
 
     #[test]

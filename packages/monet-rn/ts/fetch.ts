@@ -26,6 +26,9 @@ export interface MonetRequestInit {
     | ReadonlyArray<{name: string; value: string}>;
   /** v1 uploads are fully buffered (nitro parity). */
   body?: string | ArrayBuffer;
+  /** Client-side metadata riding the hook/observer events (the flow tag
+   *  that strings a series of requests together; never on the wire). */
+  metadata?: Record<string, string>;
   signal?: AbortSignal;
   /** Recorded for forward compatibility (core-level knob lands later). */
   timeoutMs?: number;
@@ -61,6 +64,19 @@ function normalizeHeaders(
   return out;
 }
 
+/** The init's metadata bag → the options' KV pairs ({} when absent). */
+function metadataKV(
+  init: MonetRequestInit,
+): Array<{name: string; value: string}> {
+  const out: Array<{name: string; value: string}> = [];
+  if (init.metadata) {
+    for (const [name, value] of Object.entries(init.metadata)) {
+      out.push({name, value});
+    }
+  }
+  return out;
+}
+
 export function fetch(
   input: string | {url: string},
   init: MonetRequestInit = {},
@@ -71,6 +87,7 @@ export function fetch(
     url,
     method: init.method ?? 'GET',
     headers: normalizeHeaders(init),
+    metadata: metadataKV(init),
     timeoutMs: init.timeoutMs ?? 0,
     followRedirects: init.followRedirects ?? true,
   };

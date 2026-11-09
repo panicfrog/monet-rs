@@ -17,6 +17,8 @@ export {
   clearHooks,
 } from './hooks';
 export type {
+  MonetHookContext,
+  MonetHookMetadata,
   MonetHookRequest,
   MonetHookResponse,
   MonetHookRetry,

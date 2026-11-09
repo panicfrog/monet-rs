@@ -34,18 +34,38 @@ export interface MonetHookRetry {
   retry: true;
 }
 
+/**
+ * The call-site metadata bag (`fetch(url, {metadata})`): the flow tag
+ * that strings a series of requests together. Client-side only — never
+ * on the wire; send it as a header too when the server needs it.
+ */
+export type MonetHookMetadata = Record<string, string>;
+
+/** What every hook/observer callback receives next to the value: the
+ *  fetch's pairing key (stable across retries), the attempt number, and
+ *  the call-site metadata. */
+export interface MonetHookContext {
+  correlationId: number;
+  attempt: number;
+  metadata: MonetHookMetadata;
+}
+
 /** The event the native side delivers: the value plus the call context. */
 interface HookRequestEvent {
+  correlationId: number;
   hookCallId: number;
   attempt: number;
+  metadata: Array<{name: string; value: string}>;
   url: string;
   method: string;
   headers: Array<{name: string; value: string}>;
 }
 
 interface HookResponseEvent {
+  correlationId: number;
   hookCallId: number;
   attempt: number;
+  metadata: Array<{name: string; value: string}>;
   status: number;
   headers: Array<{name: string; value: string}>;
 }
@@ -62,17 +82,34 @@ function toResponse(event: HookResponseEvent): MonetHookResponse {
   return {status: event.status, headers: event.headers};
 }
 
+/** Extracts the call context from a native event. */
+function toContext(
+  event: HookRequestEvent | HookResponseEvent,
+): MonetHookContext {
+  const metadata: MonetHookMetadata = {};
+  for (const pair of event.metadata) {
+    metadata[pair.name] = pair.value;
+  }
+  return {
+    correlationId: event.correlationId,
+    attempt: event.attempt,
+    metadata,
+  };
+}
+
 /**
  * Registers a read-only request observer. The callback sees the final
  * request — after every mutating hook, right before it goes on the wire
  * — and cannot affect it: no return value, the pipeline does not wait.
+ * The context carries the fetch's correlationId (pairs with the response
+ * events), the attempt, and the call-site metadata (the flow tag).
  * Use freely for logging, tracing, and metrics.
  */
 export function addRequestObserver(
-  observer: (req: MonetHookRequest) => void,
+  observer: (req: MonetHookRequest, ctx: MonetHookContext) => void,
 ): void {
   getMonet().addRequestObserver((event: HookRequestEvent) => {
-    observer(toRequest(event));
+    observer(toRequest(event), toContext(event));
   });
 }
 
@@ -80,13 +117,14 @@ export function addRequestObserver(
  * Registers a read-only response observer. The callback sees the final
  * response head — after every mutating hook, before it is delivered —
  * with the same cannot-affect, never-waits contract as
- * {@link addRequestObserver}.
+ * {@link addRequestObserver}. The context's correlationId matches the
+ * request events of the same fetch.
  */
 export function addResponseObserver(
-  observer: (res: MonetHookResponse) => void,
+  observer: (res: MonetHookResponse, ctx: MonetHookContext) => void,
 ): void {
   getMonet().addResponseObserver((event: HookResponseEvent) => {
-    observer(toResponse(event));
+    observer(toResponse(event), toContext(event));
   });
 }
 
@@ -98,14 +136,19 @@ export function addResponseObserver(
  * aborted, so keep the async work bounded.
  *
  * Runs on every fetch and every WebSocket connect (the upgrade request),
- * in registration order together with any other request hooks.
+ * in registration order together with any other request hooks. The
+ * context carries correlationId/attempt/metadata (read-only — the
+ * metadata bag comes from the call site, not the hook).
  */
 export function addRequestHook(
-  hook: (req: MonetHookRequest) => MonetHookRequest | Promise<MonetHookRequest>,
+  hook: (
+    req: MonetHookRequest,
+    ctx: MonetHookContext,
+  ) => MonetHookRequest | Promise<MonetHookRequest>,
 ): void {
   getMonet().addRequestHook(async (event: HookRequestEvent) => {
     try {
-      const modified = await hook(toRequest(event));
+      const modified = await hook(toRequest(event), toContext(event));
       getMonet().resolveRequestHook(event.hookCallId, {
         url: modified.url,
         method: modified.method,
@@ -129,18 +172,23 @@ export function addRequestHook(
  *   token), up to the module's hard cap,
  * - throw → the fetch fails with a `Hook` error.
  *
- * The second argument is the attempt number (0 on the first run), so a
- * hook can give up after its own bound instead of leaning on the cap.
+ * The context's `attempt` (0 on the first run) lets a hook give up
+ * after its own bound instead of leaning on the cap; `correlationId`
+ * pairs with the request events of the same fetch, `metadata` carries
+ * the call-site flow tag.
  */
 export function addResponseHook(
   hook: (
     res: MonetHookResponse,
-    attempt: number,
-  ) => MonetHookResponse | MonetHookRetry | Promise<MonetHookResponse | MonetHookRetry>,
+    ctx: MonetHookContext,
+  ) =>
+    | MonetHookResponse
+    | MonetHookRetry
+    | Promise<MonetHookResponse | MonetHookRetry>,
 ): void {
   getMonet().addResponseHook(async (event: HookResponseEvent) => {
     try {
-      const outcome = await hook(toResponse(event), event.attempt);
+      const outcome = await hook(toResponse(event), toContext(event));
       if ('retry' in outcome) {
         getMonet().retryResponseHook(event.hookCallId);
         return;

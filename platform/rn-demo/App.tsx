@@ -483,9 +483,9 @@ const CHECKS: Array<{
             {name: 'Authorization', value: `Bearer ${token}`},
           ],
         }));
-        addResponseHook((res, attempt) => {
+        addResponseHook((res, ctx) => {
           if (res.status === 401) {
-            retryAttempt = attempt;
+            retryAttempt = ctx.attempt;
             token = 'token2'; // the "refresh"
             return {retry: true};
           }
@@ -581,6 +581,85 @@ const CHECKS: Array<{
           ws.close(1000, 'done');
           await waitForClose(ws);
         }
+      } finally {
+        clearHooks();
+      }
+    },
+  },
+  {
+    name: 'http:metadata_flow_tracking',
+    run: async base => {
+      // The bank-flow scenario end to end: a series of requests (a, b, d,
+      // c — completion order varies under Promise.all) tagged with one
+      // call-site flowId plus a step. The observers must reconstruct the
+      // flow: every event carries the flowId, the correlationId pairs
+      // each request with its own response (different fetches never
+      // cross-pair), and the response side sees the same metadata the
+      // request side saw (extensions threading).
+      type Event = {
+        phase: 'req' | 'res';
+        step: string;
+        correlationId: number;
+        status?: number;
+      };
+      const events: Event[] = [];
+      try {
+        addRequestObserver((_req, ctx) => {
+          events.push({
+            phase: 'req',
+            step: ctx.metadata.step,
+            correlationId: ctx.correlationId,
+          });
+        });
+        addResponseObserver((res, ctx) => {
+          events.push({
+            phase: 'res',
+            step: ctx.metadata.step,
+            correlationId: ctx.correlationId,
+            status: res.status,
+          });
+        });
+        const flow = {flowId: 'account-open-1'};
+        const results = await Promise.all(
+          ['a', 'b', 'd', 'c'].map(async step => {
+            const response = await fetch(`${base}/plain`, {
+              metadata: {...flow, step},
+            });
+            return {step, status: response.status};
+          }),
+        );
+        for (const result of results) {
+          assert(
+            result.status === 200,
+            `step ${result.step} failed (status ${result.status})`,
+          );
+        }
+        assert(events.length === 8, `saw ${events.length} events, expected 8`);
+        // Every event carries the flow's steps.
+        const steps = new Set(events.map(event => event.step));
+        assert(
+          steps.size === 4 && ['a', 'b', 'c', 'd'].every(s => steps.has(s)),
+          `flow steps ${[...steps].sort()}, expected all of a/b/c/d`,
+        );
+        // Every request pairs with exactly one response of the SAME step
+        // and correlationId (completion order may interleave — pairing
+        // must not).
+        for (const step of ['a', 'b', 'c', 'd']) {
+          const mine = events.filter(event => event.step === step);
+          assert(
+            mine.length === 2,
+            `step ${step} saw ${mine.length} events, expected 2`,
+          );
+          const [req, res] = mine;
+          assert(req.phase === 'req' && res.phase === 'res', `step ${step} phases`);
+          assert(
+            req.correlationId === res.correlationId,
+            `step ${step} correlation mismatch: ${req.correlationId} vs ${res.correlationId}`,
+          );
+        }
+        // Different fetches have different correlationIds.
+        const ids = new Set(events.map(event => event.correlationId));
+        assert(ids.size === 4, `correlationIds ${ids.size}, expected 4 distinct`);
       } finally {
         clearHooks();
       }

@@ -111,6 +111,13 @@ pub struct FetchOptions {
     pub url: String,
     pub method: String,
     pub headers: Vec<HeaderKV>,
+    /// The call-site metadata bag: rides the request's extensions
+    /// (client-side only, never on the wire; the call site can
+    /// additionally send it as a header when the server needs it too),
+    /// reported by every hook/observer event of this fetch — the flow
+    /// tag that strings a series of requests together.
+    #[serde(default)]
+    pub metadata: Vec<HeaderKV>,
     /// v1 records these for forward compatibility; the runtime applies
     /// the client-level configuration only (per-request lands with the
     /// core-level timeout/redirect knob).
@@ -382,6 +389,12 @@ impl Monet {
             let _keep_engine = transport.clone();
 
             let mut attempt: u32 = 0;
+            // The fetch's pairing key: stable across retries, carried in
+            // the request extensions and threaded to the response, so
+            // the request-phase and response-phase events of this fetch
+            // report the same correlationId (and Rust-native hooks can
+            // stash their own state the same way).
+            let correlation_id = crate::hooks::next_correlation_id();
             let response = loop {
                 let mut request = match build_request(&options, &body_bytes) {
                     Ok(request) => request,
@@ -392,23 +405,32 @@ impl Monet {
                     }
                 };
                 request.extensions.insert(hooks::HookAttempt(attempt));
+                request
+                    .extensions
+                    .insert(hooks::CorrelationId(correlation_id));
+                request
+                    .extensions
+                    .insert(crate::hooks::metadata_bag(&options.metadata));
 
                 // Request hooks, raced with the cancel token — a stuck
                 // JS hook must not outlive the fetch's abort.
                 match race_cancel(hooks.run_request_hooks(request), &cancel).await {
-                    RaceOutcome::Done(Ok(request)) => {
+                    RaceOutcome::Done(Ok(mut request)) => {
                         let transport = transport.clone();
                         let hooks = hooks.clone();
                         let cancel_for_execute = cancel.clone();
                         match race_cancel(
                             // Response hooks wrap the transport result:
-                            // they see the head before on_head delivers it.
+                            // they see the head before on_head delivers
+                            // it. The request's extensions travel with it
+                            // (no transport reads them — nothing on the
+                            // wire changes).
                             async move {
-                                hooks
-                                    .run_response_hooks(
-                                        transport.execute(request, cancel_for_execute).await?,
-                                    )
-                                    .await
+                                let extensions = std::mem::take(&mut request.extensions);
+                                let mut response =
+                                    transport.execute(request, cancel_for_execute).await?;
+                                response.extensions = extensions;
+                                hooks.run_response_hooks(response).await
                             },
                             &cancel,
                         )
@@ -584,7 +606,11 @@ impl Monet {
             // Request hooks on the upgrade request (attempt is always 0
             // here — no retry), raced with the cancel token: dropping
             // the JS object mid-hook tears the connect down with it.
+            // A fresh correlation id tags this connection's events.
             request.extensions.insert(crate::hooks::HookAttempt(0));
+            request.extensions.insert(crate::hooks::CorrelationId(
+                crate::hooks::next_correlation_id(),
+            ));
             let request = match race_cancel(hooks.run_request_hooks(request), &cancel).await {
                 RaceOutcome::Done(Ok(request)) => request,
                 RaceOutcome::Done(Err(error)) => {
