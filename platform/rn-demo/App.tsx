@@ -32,6 +32,8 @@ import {
   addResponseHook,
   addResponseObserver,
   clearHooks,
+  clearPins,
+  configurePins,
   fetch,
   getMonet,
   MonetError,
@@ -45,11 +47,25 @@ type CheckState = {name: string; status: CheckStatus; detail: string};
 
 const DEFAULT_BASE =
   Platform.OS === 'android' ? 'http://10.0.2.2:8964' : 'http://127.0.0.1:8964';
-const DEFAULT_WS_BASE =
-  Platform.OS === 'android' ? 'ws://10.0.2.2:8965' : 'ws://127.0.0.1:8965';
 const CHECK_TIMEOUT_MS = 10_000;
+// The TLS battery target: the battery server's TLS pair (https :8966 /
+// wss :8967). The base must be the server host's mDNS name — pin config
+// keys are hostnames (monet-core rejects IPs), and a `.local` name is
+// what an iPhone on the LAN resolves AND can key pins on.
+const DEFAULT_TLS_BASE = 'https://xieyongpingdeMacBook-Pro-2.local:8966';
+const TLS_WS_PORT = '8967';
 
-function assert(condition: unknown, message: string): void {
+/** The ws twin of a plain base: same host, the battery server's ws port —
+ * one above the http port (the server binds 8964/8965 by default).
+ * Derived, not defaulted: the checks must follow the base the user aims at
+ * a device run, where 127.0.0.1 would be the phone itself. */
+function wsBaseFrom(base: string): string {
+  const url = new URL(base);
+  const wsPort = Number(url.port || '80') + 1;
+  return `ws://${url.hostname}:${wsPort}`;
+}
+
+function assert(condition: unknown, message: string): asserts condition {
   if (!condition) {
     throw new Error(message);
   }
@@ -231,8 +247,8 @@ const CHECKS: Array<{
   // ---- WebSocket checks (names mirror monet-conformance/src/ws.rs) ----
   {
     name: 'ws:round_trips',
-    run: async _base => {
-      const ws = new MonetWebSocket(`${DEFAULT_WS_BASE}/echo`);
+    run: async base => {
+      const ws = new MonetWebSocket(`${wsBaseFrom(base)}/echo`);
       try {
         await waitForOpen(ws);
         // Text round-trip: send first, then wait for the echo.
@@ -264,8 +280,8 @@ const CHECKS: Array<{
   },
   {
     name: 'ws:close_code_fidelity',
-    run: async _base => {
-      const ws = new MonetWebSocket(`${DEFAULT_WS_BASE}/close-1012`);
+    run: async base => {
+      const ws = new MonetWebSocket(`${wsBaseFrom(base)}/close-1012`);
       const close = await waitForClose(ws);
       assert(
         close.code === 1012,
@@ -280,8 +296,8 @@ const CHECKS: Array<{
   },
   {
     name: 'ws:ping_surfaced',
-    run: async _base => {
-      const ws = new MonetWebSocket(`${DEFAULT_WS_BASE}/ping`);
+    run: async base => {
+      const ws = new MonetWebSocket(`${wsBaseFrom(base)}/ping`);
       try {
         await waitForOpen(ws);
         // The server sends a ping; the transport answers it and surfaces
@@ -317,7 +333,7 @@ const CHECKS: Array<{
       const openCount = async (): Promise<number> =>
         Number(await (await fetch(`${base}/ws-open`)).text());
       let ws: MonetWebSocket | undefined = new MonetWebSocket(
-        `${DEFAULT_WS_BASE}/gc-probe`,
+        `${wsBaseFrom(base)}/gc-probe`,
       );
       await waitForOpen(ws);
       const probe = new WeakRef(ws);
@@ -560,7 +576,7 @@ const CHECKS: Array<{
   },
   {
     name: 'ws:request_hook_headers',
-    run: async _base => {
+    run: async base => {
       try {
         // The same request-hook chain runs on the WebSocket upgrade
         // request: the header it injects must arrive at the server, which
@@ -569,7 +585,7 @@ const CHECKS: Array<{
           ...req,
           headers: [...req.headers, {name: 'x-ws-hook', value: 'injected'}],
         }));
-        const ws = new MonetWebSocket(`${DEFAULT_WS_BASE}/hook-echo`);
+        const ws = new MonetWebSocket(`${wsBaseFrom(base)}/hook-echo`);
         try {
           await waitForOpen(ws);
           const first = await nextMessage(ws);
@@ -667,23 +683,223 @@ const CHECKS: Array<{
   },
 ];
 
-function App(): React.JSX.Element {
+// ---- TLS/pins checks — the on-device manual verification battery
+// (docs/plans/2026-11-monet-rn.md M5). Prerequisites: the battery server
+// with its TLS pair, the fixture CA installed AND fully trusted on the
+// device (Settings → General → About → Certificate Trust Settings), and
+// the base pointing at the server's mDNS name. Pin config keys are
+// hostnames, so an IP base cannot exercise the pin checks. ----
+
+/** The wss twin of a TLS base (same host, the TLS ws port). */
+function tlsWssBase(base: string): string {
+  const url = new URL(base);
+  return `wss://${url.hostname}:${TLS_WS_PORT}`;
+}
+
+/** The leaf SPKI SHA-256 the battery server currently serves — a fresh
+ * leaf key every start, so the hash is fetched at /leaf-spki, never
+ * baked in. */
+async function leafSpki(base: string): Promise<string> {
+  const response = await fetch(`${base}/leaf-spki`);
+  assert(
+    response.status === 200,
+    `/leaf-spki answered ${response.status} — is the battery server's TLS pair up?`,
+  );
+  const hash = await response.text();
+  assert(/^[A-Za-z0-9+/]{43}=$/.test(hash), `bad /leaf-spki payload ${JSON.stringify(hash)}`);
+  return hash;
+}
+
+const TLS_CHECKS: Array<{
+  name: string;
+  timeoutMs?: number;
+  run: (base: string) => Promise<void>;
+}> = [
+  {
+    name: 'https:trusted_ca_get',
+    run: async base => {
+      // The plain SecTrust positive path: a fetch over TLS against a CA
+      // the device trusts (installed + full-trust enabled).
+      const response = await fetch(`${base}/plain`);
+      assert(response.status === 200, `status ${response.status}, expected 200`);
+      const body = await response.text();
+      assert(body === 'plain', `body ${JSON.stringify(body)}, expected "plain"`);
+    },
+  },
+  {
+    name: 'https:pin_match_allows',
+    run: async base => {
+      // The pinned host with the right hash: the challenge handler
+      // evaluates trust AND matches the chain's leaf SPKI — the fetch
+      // goes through. A unique query string keeps the URLCache (the
+      // session is .default) from answering without a handshake.
+      const hash = await leafSpki(base);
+      const host = new URL(base).hostname;
+      try {
+        configurePins(JSON.stringify({[host]: {publicKeyHashes: [hash]}}));
+        const response = await fetch(`${base}/plain?pin-match=1`);
+        assert(response.status === 200, `status ${response.status}, expected 200`);
+        const body = await response.text();
+        assert(body === 'plain', `body ${JSON.stringify(body)}, expected "plain"`);
+      } finally {
+        clearPins();
+      }
+    },
+  },
+  {
+    name: 'https:pin_mismatch_rejects',
+    run: async base => {
+      // A pinned host with a hash that matches nothing in the chain must
+      // fail closed — a certificate error, never a hang and never a
+      // silent success. The unique query string defeats the URLCache so
+      // the fetch is a real handshake (the battery server issues no
+      // session tickets, so resumption cannot skip the challenge either).
+      const hash = await leafSpki(base);
+      const perturbed = (hash.startsWith('A') ? 'B' : 'A') + hash.slice(1);
+      const host = new URL(base).hostname;
+      try {
+        configurePins(JSON.stringify({[host]: {publicKeyHashes: [perturbed]}}));
+        try {
+          const response = await fetch(`${base}/plain?pin-mismatch=1`);
+          throw new Error(
+            `a pinned-mismatch fetch resolved (status ${response.status})`,
+          );
+        } catch (error) {
+          assert(
+            error instanceof MonetError && error.kind === 'Transport',
+            error instanceof MonetError
+              ? `expected kind Transport, got ${error.kind}: ${error.message}`
+              : `expected MonetError, got ${String(error)}`,
+          );
+          assert(
+            /pinning failed|PINNED/i.test(error.message),
+            `error is not a pin rejection: ${error.message}`,
+          );
+        }
+      } finally {
+        clearPins();
+      }
+    },
+  },
+  {
+    name: 'wss:pin_mismatch_rejects',
+    run: async base => {
+      // The negative path over NWConnection: the same registration and
+      // query service, the wss verify block. A pinned-mismatch connect
+      // must fail with the pin rejection, not open.
+      const hash = await leafSpki(base);
+      const perturbed = (hash.startsWith('A') ? 'B' : 'A') + hash.slice(1);
+      const host = new URL(base).hostname;
+      try {
+        configurePins(JSON.stringify({[host]: {publicKeyHashes: [perturbed]}}));
+        const ws = new MonetWebSocket(`${tlsWssBase(base)}/echo`);
+        try {
+          await waitForOpen(ws);
+          throw new Error('a pinned-mismatch wss connect opened');
+        } catch (error) {
+          assert(
+            error instanceof MonetError && error.kind === 'Transport',
+            error instanceof MonetError
+              ? `expected kind Transport, got ${error.kind}: ${error.message}`
+              : `expected MonetError, got ${String(error)}`,
+          );
+          assert(
+            /pinning failed|PINNED/i.test(error.message),
+            `error is not a pin rejection: ${error.message}`,
+          );
+        }
+      } finally {
+        clearPins();
+      }
+    },
+  },
+  {
+    name: 'wss:trusted_ca_echo',
+    run: async base => {
+      // The WS trust path over TLS with no pins: the wss handshake
+      // validates against the device's trust store.
+      const ws = new MonetWebSocket(`${tlsWssBase(base)}/echo`);
+      try {
+        await waitForOpen(ws);
+        ws.send('hello-wss-tls');
+        const echo = await nextMessage(ws);
+        assert(
+          echo.data === 'hello-wss-tls',
+          `text echo ${JSON.stringify(echo.data)}, expected "hello-wss-tls"`,
+        );
+      } finally {
+        ws.close(1000, 'done');
+        await waitForClose(ws);
+      }
+    },
+  },
+  {
+    name: 'wss:pin_round_trips',
+    run: async base => {
+      // The pinned wss path: the same pin config must reach the wss
+      // handshake (the verify block consults it), and the pinned
+      // connection round-trips.
+      const hash = await leafSpki(base);
+      const host = new URL(base).hostname;
+      try {
+        configurePins(JSON.stringify({[host]: {publicKeyHashes: [hash]}}));
+        const ws = new MonetWebSocket(`${tlsWssBase(base)}/echo`);
+        try {
+          await waitForOpen(ws);
+          ws.send('hello-wss-pinned');
+          const echo = await nextMessage(ws);
+          assert(
+            echo.data === 'hello-wss-pinned',
+            `text echo ${JSON.stringify(echo.data)}, expected "hello-wss-pinned"`,
+          );
+        } finally {
+          ws.close(1000, 'done');
+          await waitForClose(ws);
+        }
+      } finally {
+        clearPins();
+      }
+    },
+  },
+];
+
+/** One battery at a time, process-wide: the hook registry and the pins
+ * are module-global — two batteries running concurrently (an auto-run
+ * main battery racing a manual TLS run) would poison each other's
+ * registrations (a main-battery hook check's callback failing a TLS
+ * fetch with a dropped hook call). A tapped run waits for the active
+ * battery instead of starting alongside it. */
+let batteryActive = false;
+
+/** One battery: a check list run sequentially against a base URL, with
+ * its own rows, base input, and run button. The main battery auto-runs
+ * on mount; the TLS battery is manual by design (it needs the battery
+ * server's TLS pair plus a trusted CA on the device). */
+function useBattery(
+  checks: Array<{name: string; timeoutMs?: number; run: (base: string) => Promise<void>}>,
+  defaultBase: string,
+  autoRun: boolean,
+) {
   const [rows, setRows] = useState<CheckState[]>([]);
-  const [error, setError] = useState<string | null>(null);
-  const [base, setBase] = useState(DEFAULT_BASE);
+  const [base, setBase] = useState(defaultBase);
   const runningRef = useRef(false);
 
-  const runBattery = useCallback(async (baseUrl: string) => {
-    if (runningRef.current) {
-      return;
-    }
-    runningRef.current = true;
-    const trimmed = baseUrl.replace(/\/+$/, '');
-    setRows(CHECKS.map(check => ({name: check.name, status: 'pending', detail: ''})));
-    setError(null);
-    try {
-      for (let i = 0; i < CHECKS.length; i++) {
-        const check = CHECKS[i];
+  const run = useCallback(
+    async (baseUrl: string) => {
+      if (runningRef.current) {
+        return;
+      }
+      // Wait out any active battery (see batteryActive) before touching
+      // the shared registries.
+      while (batteryActive) {
+        await new Promise<void>(resolve => setTimeout(resolve, 200));
+      }
+      runningRef.current = true;
+      batteryActive = true;
+      const trimmed = baseUrl.replace(/\/+$/, '');
+      setRows(checks.map(check => ({name: check.name, status: 'pending', detail: ''})));
+      for (let i = 0; i < checks.length; i++) {
+        const check = checks[i];
         const started = Date.now();
         try {
           await withTimeout(
@@ -708,16 +924,79 @@ function App(): React.JSX.Element {
           ));
         }
       }
-    } catch (setupFailure) {
-      setError(String(setupFailure));
-    } finally {
       runningRef.current = false;
-    }
-  }, []);
+      batteryActive = false;
+    },
+    [checks],
+  );
 
   useEffect(() => {
-    runBattery(DEFAULT_BASE);
-  }, [runBattery]);
+    if (autoRun) {
+      run(defaultBase);
+    }
+    // The mount-time auto-run; `run` is stable (checks are module constants).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  return {rows, base, setBase, run};
+}
+
+/** The battery UI block: base input, summary + run button, result rows. */
+function BatterySection({
+  title,
+  placeholder,
+  battery,
+}: {
+  title: string;
+  placeholder: string;
+  battery: ReturnType<typeof useBattery>;
+}): React.JSX.Element {
+  const passed = battery.rows.filter(row => row.status === 'pass').length;
+  const failed = battery.rows.filter(row => row.status === 'fail').length;
+  return (
+    <>
+      <Text style={styles.section}>{title}</Text>
+      <TextInput
+        style={styles.input}
+        value={battery.base}
+        onChangeText={battery.setBase}
+        autoCapitalize="none"
+        autoCorrect={false}
+        keyboardType="url"
+        placeholder={placeholder}
+      />
+      <View style={styles.controls}>
+        <Text style={styles.summary}>
+          {battery.rows.length === 0 ? '' : `${passed} pass · ${failed} fail`}
+        </Text>
+        <Text style={styles.runButton} onPress={() => battery.run(battery.base)}>
+          run
+        </Text>
+      </View>
+      {battery.rows.map(row => (
+        <View key={row.name} style={styles.checkRow}>
+          <Text
+            style={[
+              styles.checkName,
+              row.status === 'pass' && styles.pass,
+              row.status === 'fail' && styles.fail,
+            ]}>
+            {row.name}
+          </Text>
+          {row.detail !== '' && (
+            <Text style={styles.checkDetail} numberOfLines={3}>
+              {row.detail}
+            </Text>
+          )}
+        </View>
+      ))}
+    </>
+  );
+}
+
+function App(): React.JSX.Element {
+  const battery = useBattery(CHECKS, DEFAULT_BASE, true);
+  const tlsBattery = useBattery(TLS_CHECKS, DEFAULT_TLS_BASE, false);
 
   const monet = useRef<{ping: string; transportStack: string} | null>(null);
   if (monet.current === null) {
@@ -735,9 +1014,6 @@ function App(): React.JSX.Element {
     }
   }
 
-  const passed = rows.filter(row => row.status === 'pass').length;
-  const failed = rows.filter(row => row.status === 'fail').length;
-
   return (
     <SafeAreaView style={styles.container}>
       <StatusBar barStyle="dark-content" />
@@ -751,42 +1027,16 @@ function App(): React.JSX.Element {
           <Text style={styles.key}>Monet.transportStack</Text>
           <Text style={styles.value}>{monet.current.transportStack}</Text>
         </View>
-        <Text style={styles.section}>JS battery — HTTP</Text>
-        <TextInput
-          style={styles.input}
-          value={base}
-          onChangeText={setBase}
-          autoCapitalize="none"
-          autoCorrect={false}
-          keyboardType="url"
+        <BatterySection
+          title="JS battery — HTTP"
           placeholder="http://host:port"
+          battery={battery}
         />
-        <View style={styles.controls}>
-          <Text style={styles.summary}>
-            {rows.length === 0 ? '' : `${passed} pass · ${failed} fail`}
-          </Text>
-          <Text style={styles.runButton} onPress={() => runBattery(base)}>
-            run
-          </Text>
-        </View>
-        {error !== null && <Text style={styles.error}>error: {error}</Text>}
-        {rows.map(row => (
-          <View key={row.name} style={styles.checkRow}>
-            <Text
-              style={[
-                styles.checkName,
-                row.status === 'pass' && styles.pass,
-                row.status === 'fail' && styles.fail,
-              ]}>
-              {row.name}
-            </Text>
-            {row.detail !== '' && (
-              <Text style={styles.checkDetail} numberOfLines={3}>
-                {row.detail}
-              </Text>
-            )}
-          </View>
-        ))}
+        <BatterySection
+          title="TLS battery — device verification (manual)"
+          placeholder="https://host.local:8966"
+          battery={tlsBattery}
+        />
       </ScrollView>
     </SafeAreaView>
   );
@@ -823,7 +1073,6 @@ const styles = StyleSheet.create({
   },
   summary: {fontSize: 13, color: '#666', fontFamily: 'Menlo'},
   runButton: {color: '#007aff', fontSize: 15, fontWeight: '600'},
-  error: {color: 'red', fontFamily: 'Menlo', fontSize: 12, marginBottom: 8},
   checkRow: {marginBottom: 10},
   checkName: {fontSize: 14, fontFamily: 'Menlo', color: '#999'},
   checkDetail: {fontSize: 12, fontFamily: 'Menlo', color: '#b00'},

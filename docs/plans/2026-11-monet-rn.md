@@ -161,7 +161,7 @@ platform/rn-demo/                  # in-repo RN App（jsi-rs example 同款骨�
 - **测试服务器**：monet-conformance 的 HttpServer/echo 服务器目前 `127.0.0.1:0` 随机端口——加 `spawn_on(addr)` 固定端口 + `0.0.0.0` 绑定变体（LAN 真机可达），monet-demo 出一个 `server` bin 跑 HTTP 路由 + WS echo，打印端口。复用同一套服务器代码 = JS 电池与 Rust 电池打的是同一个靶
 - **JS 电池项**（镜像 conformance 命名）：`http:get_plain_body` / `http:get_chunked_content`（断言观察到 ≥2 个独立 chunk）/ `http:post_reaches_server` / `http:redirect_followed` / `http:cancel_after_head_aborts_body` / `http:connection_refused` / `ws:round_trips` / `ws:close_code_fidelity` / `ws:ping_surfaced`
 - 连接地址可配：模拟器默认 `http://localhost:<port>`，Android 模拟器 `10.0.2.2`，真机填 host 的 LAN IP
-- TLS/pins 的 JS 级检查需要受信证书（自签 CA + SPKI hash 预置），标 v1.1 手动项（与 iOS SecTrust 链路验证同批，都用真机做）
+- TLS/pins 的 JS 级检查需要受信证书（自签 CA + SPKI hash 预置），标 v1.1 手动项（与 iOS SecTrust 链路验证同批，都用真机做）。**已实施（2026-11-09）**：`server` bin 默认带 TLS 对（https :8966 / wss :8967，fixture CA 内嵌；leaf SAN 覆盖 server 主机名的 `.local` mDNS 名——pin 键必须是主机名，monet-core 拒绝 IP 键）；leaf SPKI 每次启动现铸、经 `/leaf-spki` 下发（不烤进 App）。TLS 电池 6 项（trusted_ca / pin_match / pin_mismatch fail-closed / wss trusted / wss pin / wss pin_mismatch），iPhone 17 真机 6/6。两个电池侧的确定性前提记录在案：(a) TLS 电池服务器响应带 `Connection: close` 且不发 session ticket——URLSession 按连接池复用已握手的 TLS 连接（resumption 亦然），池内连接不再触发 server-trust challenge，pin 只在首个握手上评估；(b) 电池全局串行——hook/pins 注册表是进程级的，两电池并发互相污染。生产语义（URLSession 栈 pin 为 per-connection，见 urlsession plan）不受影响
 
 ## iOS 集成风险（M2 消解）
 
@@ -178,7 +178,7 @@ monet-urlsession 的 Swift shim 对象会进 superlib `librust_app.a`，最终�
 - **M2**：**首次三端构建全绿**（iOS 模拟器 + Android 模拟器）：Monet 模块带一个 `ping() -> String` 方法，App 调通——一次性消解聚合构建 × monet crates × Swift shim 进 superlib × Android 链接四重集成风险
 - **M3**：fetch 通道全量（configure_pins/timeout/fetch/take_chunk/abort + pump + TS fetch/Response + server bin）+ JS 电池 HTTP 六项：iOS 模拟器、Android 模拟器双绿 + **iPhone 真机跑一次**（补上 transport 矩阵最后一块）
 - **M4**：WS 通道（ws_* + TS WebSocket + 电池 WS 三项）双端绿
-- **M5（v1.1）**：JS hook 回程协议 + TS hook API；TLS/pins 的真机手动验证项。**已实施（2026-11-08）**：observer/hook 双通道（见 docs/plans/2026-11-hooks.md 设计记录），电池 +8 项，双平台 18/18；TLS/pins 真机手动验证仍开放
+- **M5（v1.1）**：JS hook 回程协议 + TS hook API；TLS/pins 的真机手动验证项。**已实施（2026-11-08）**：observer/hook 双通道（见 docs/plans/2026-11-hooks.md 设计记录），电池 +8 项，双平台 18/18。**TLS/pins 真机验证已闭合（2026-11-09）**：iPhone 17 真机主电池 19/19 + TLS 电池 6/6（电池细节见上面"验证形态"节），顺带修掉两个真 bug——`ws_connect` 此前用 `PinConfig::default()` 建 WS transport（pins 到不了 WS 握手），iOS 的 `with_pins` 此前仅非空注册（`clearPins` 后 shim 残留旧 pins 继续生效）
 - 每步：crates/ 内改动照常过 workspace 全套测试 + clippy/fmt；monet-rn crate 本身无 host 测试（jsi 依赖只在 app 环境解析），正确性由 rn-demo 电池承载——**这是与 workspace 内 crate 的验证策略差异，记录在案**
 
 ## 与 DESIGN.md 的对账

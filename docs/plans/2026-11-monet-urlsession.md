@@ -110,6 +110,8 @@ crates/monet-urlsession/
 
 M2 pinning 部分随后落地：Rust 侧 `pin.rs` 全局注册 PinConfig（`UrlsessionTransport::with_pins`；shim 是进程级单例，注册随之全局，last-wins），数据面新增 `pins_for_host(host, out) -> usize`（Swift 提供 64×32 字节缓冲，0 = 未钉、走系统默认处理）；Swift 侧 `PinningShim.swift` 只做机械部分——异步 SecTrustEvaluate + 从 DER 证书直接切出 SubjectPublicKeyInfo 做 SHA-256 比对（nitro `CertificatePinning.swift` 同款），拒绝的 challenge 会以 -999 完成任务，didCompleteWithError 据此重映射为证书错误而非 Cancelled。host 匹配语义（walk-up/includeSubdomains/过期）只在 monet-core 一份，与 Rust transports 完全一致。Rust 侧查询服务有单元测试；Swift 侧 SecTrust 链路的集成验证需要受信证书，按计划留待真机阶段（monet-rn）。
 
+**真机验证闭合（2026-11-09，iPhone 17，iOS 26）**：TLS 电池 6/6（SecTrust 正路径、pin 命中放行、pin 不匹配 fail-closed、wss 三项）。验证暴露一条**生产语义边界**记录在案：URLSession 栈的 pin 执行是 **per-connection** 的——server-trust challenge 只在新握手时触发；连接池内的连接复用（同一 (host, port) 的后续请求）与 TLS resumption 都不再触发 challenge，后续请求骑在首次握手验证过的连接上（nitro-fetch 同款；rustls 侧无连接池语义，每连接全量握手+pin 评估，两端行为不同但不矛盾）。电池侧以确定性处理：conformance 的 TLS 电池服务器响应带 `Connection: close` 且不发 session ticket（`NeverTickets`），每个请求强制全新握手，检查顺序无关。另修 monet-rn 的两个真实缺陷（`ws_connect` 此前以默认空 pins 建 WS transport；iOS `with_pins` 此前仅非空时注册，`clearPins` 后 shim 残留旧注册）。
+
 ## M3 修订：WebSocket 改走 NWConnection + 手写帧（对齐 nitro，2026-11）
 
 原计划用 `URLSessionWebSocketTask`（nitro 的 Info.plist fallback）。用户定调改为对齐 nitro 主路径：**Network.framework `NWConnection` + 手写 RFC 6455 帧**。动机（nitro `NWWebSocketConnection.hpp` 注释原文为证）：URLSessionWebSocketTask 会把 1012/1013/1014 映射成 1005 并丢掉 reason，原始 close 帧不可达——monet-core 的 `CloseFrame` 契约要求 code/reason 精确往返（一致性测试赌注所在），fallback 路线直接违背这一点。NWConnection 仍是 Apple 原生栈（Network.framework），"原生优先"原则不变，只是从"系统做协议"换成"系统做传输、我们做协议"。
