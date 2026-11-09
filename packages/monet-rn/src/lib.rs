@@ -51,10 +51,13 @@ const MAX_HOOK_RETRIES: u32 = 3;
 /// plus the fetch registry and the hook registry. Hooks live here, not
 /// on the client: a pin rebuild swaps the client wholesale, and hook
 /// registrations are app-lifetime state that must survive it. WebSocket
-/// connections carry their own state — no registry needed (see ws.rs).
+/// connections carry their own state — no registry needed (see ws.rs);
+/// they build their transport from the live pin config, which is why it
+/// is retained here alongside the rebuilt HTTP transport.
 pub struct Monet {
     transport: RwLock<Arc<dyn monet_core::Transport>>,
     client: RwLock<Arc<Client>>,
+    pins: RwLock<PinConfig>,
     fetches: FetchRegistry,
     hooks: RwLock<HookRegistry>,
     pending: Arc<Pending>,
@@ -66,6 +69,7 @@ impl Monet {
         Ok(Monet {
             client: RwLock::new(Arc::new(Client::new(transport.clone()))),
             transport: RwLock::new(transport),
+            pins: RwLock::new(PinConfig::default()),
             fetches: FetchRegistry::new(),
             hooks: RwLock::new(HookRegistry::new()),
             pending: Pending::shared(),
@@ -80,6 +84,7 @@ impl Monet {
     /// `shutdown()` on Android) once the last one finishes. Hook
     /// registrations are deliberately untouched.
     fn rebuild(&self, pins: &PinConfig) -> anyhow::Result<()> {
+        *self.pins.write().unwrap() = pins.clone();
         let transport = platform::http_transport(pins);
         let client = Client::new(transport.clone());
         *self.transport.write().unwrap() = transport;
@@ -593,7 +598,10 @@ impl Monet {
         let on_close = Arc::new(on_close);
         let on_error = Arc::new(on_error);
 
-        let transport = platform::ws_transport(&PinConfig::default())?;
+        // The live pin config: pins configured through configurePins must
+        // reach the WS handshake too (the wss verify block consults them),
+        // not just the rebuilt HTTP transport.
+        let transport = platform::ws_transport(&self.pins.read().unwrap().clone())?;
         let hooks = self.hook_snapshot();
         async_global_executor::spawn(async move {
             // Hold the transport for the connection's lifetime: its

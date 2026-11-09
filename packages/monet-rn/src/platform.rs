@@ -70,12 +70,12 @@ fn select_http(pins: &PinConfig) -> Result<Arc<dyn Transport>, String> {
     }
     #[cfg(any(target_os = "ios", target_os = "macos"))]
     {
-        // Construction is infallible (`new() -> Self`); pins are installed
-        // through the shim's process-global registry, last-wins.
-        let transport = monet_urlsession::UrlsessionTransport::new();
-        if !pins.is_empty() {
-            return Ok(Arc::new(transport.with_pins(pins.clone())) as Arc<dyn Transport>);
-        }
+        // Construction is infallible (`new() -> Self`); pins live in the
+        // shim's process-global registry, last registration wins. EVERY
+        // construction registers — an empty config included: that is how
+        // a clearPins reaches the shim (a bare new() would leave the
+        // previous registration live, enforcing pins the app cleared).
+        let transport = monet_urlsession::UrlsessionTransport::new().with_pins(pins.clone());
         Ok(Arc::new(transport) as Arc<dyn Transport>)
     }
     #[cfg(not(any(target_os = "android", target_os = "ios", target_os = "macos")))]
@@ -106,9 +106,11 @@ pub fn ws_transport(pins: &PinConfig) -> anyhow::Result<Arc<dyn monet_core::WebS
     }
     #[cfg(any(target_os = "ios", target_os = "macos"))]
     {
-        // One UrlsessionTransport instance serves both HTTP and WS (the
-        // same type implements both traits).
-        let transport = monet_urlsession::UrlsessionTransport::new();
+        // One UrlsessionTransport type serves both stacks; pins live in
+        // the shim's process-global registry (last registration wins), so
+        // every construction registers — including the empty config a
+        // cleared pin state carries (same reasoning as select_http).
+        let transport = monet_urlsession::UrlsessionTransport::new().with_pins(pins.clone());
         Ok(Arc::new(transport) as Arc<dyn monet_core::WebSocketTransport>)
     }
     #[cfg(not(any(target_os = "android", target_os = "ios", target_os = "macos")))]
