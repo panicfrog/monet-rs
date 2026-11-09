@@ -933,6 +933,7 @@ dependencies = [
  "futures-lite",
  "futures-timer",
  "jni",
+ "log",
  "monet-core",
 ]
 

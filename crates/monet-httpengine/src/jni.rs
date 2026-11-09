@@ -273,11 +273,22 @@ pub fn build_engine(pins: &PinConfig) -> Result<EngineHandle> {
                     &[],
                 )?
                 .l()?;
+            log::info!(
+                "httpengine: engine built ({} pin entries, SDK {})",
+                pins.entries().len(),
+                sdk
+            );
             Ok(EngineHandle {
                 engine: env.new_global_ref(engine)?,
             })
         })
-        .map_err(jni_err("engine build"))
+        .map_err(|e| {
+            // Where a swallowed pin assembly surfaces — without this line
+            // it fails silently into the rustls fallback (or worse, a
+            // pin-less engine).
+            log::info!("httpengine: engine build failed: {e}");
+            jni_err("engine build")(e)
+        })
 }
 
 /// One PinConfig entry → `addPublicKeyPins(host, Set<byte[]>,
@@ -320,6 +331,13 @@ fn install_pins(
             (&instant).into(),
         ],
     )?;
+    log::info!(
+        "httpengine: addPublicKeyPins({} = {} hash(es), subdomains={}, expires {})",
+        entry.host,
+        entry.hashes.len(),
+        entry.include_subdomains,
+        entry.expiration.unix_time_millis()
+    );
     Ok(())
 }
 

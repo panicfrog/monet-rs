@@ -24,6 +24,14 @@ pub extern "system" fn Java_com_monet_rn_httpengine_MonetBootstrap_nativeInit(
     _class: jni::objects::JClass<'_>,
     context: jni::objects::JObject<'_>,
 ) {
+    // First thing: route the `log` facade into logcat. Every monet-rn
+    // and vendored-crate log:: call before this point is lost — there
+    // are none by construction (this is the module's entry). Info level
+    // keeps the battery quiet while wiring failures and pin assembly
+    // stay visible.
+    android_logger::init_once(
+        android_logger::Config::default().with_max_level(log::LevelFilter::Info),
+    );
     let mut captured: Option<(
         jni::JavaVM,
         jni::objects::Global<jni::objects::JObject<'static>>,

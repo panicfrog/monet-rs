@@ -11,6 +11,10 @@ monet-core = { path = "../monet-core" }
 bytes.workspace = true
 futures-channel.workspace = true
 futures-lite.workspace = true
+# Pin assembly and bridge wiring log here; the embedder's bootstrap
+# installs the backend (android_logger on Android, env_logger/stderr
+# in the host tests).
+log = "0.4"
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.22"

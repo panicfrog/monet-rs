@@ -101,6 +101,12 @@ monet-ws = { path = "vendor/monet-ws", optional = true, features = [
 # the transports above).
 monet-tls = { path = "vendor/monet-tls", features = ["platform-verifier"] }
 log = "0.4"
+# The log backend for Android: without it every log:: call in monet-rn
+# and the vendored crates goes nowhere on-device (the day's Android
+# debugging relied on guesswork). init_once in the bootstrap, before
+# anything else; level Info so the battery stays quiet but wiring
+# failures and pin assembly are visible in logcat.
+android_logger = "0.15"
 # The bootstrap JNI entry (MonetBootstrap.nativeInit): present in every
 # configuration — a no-op without the httpengine feature — so the Java
 # side can call it unconditionally.
