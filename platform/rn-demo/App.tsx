@@ -706,9 +706,14 @@ function tlsWssBase(base: string): string {
 
 /** The leaf SPKI SHA-256 the battery server currently serves — a fresh
  * leaf key every start, so the hash is fetched at /leaf-spki, never
- * baked in. */
+ * baked in. The PLAIN twin serves it (the registry is process-global):
+ * fetching over plain http needs no TLS trust — a TLS fetch would die
+ * on a simulator with no device CA before the check even starts (the
+ * four pin checks' first step; device runs have the CA, Android runs
+ * have the NSC anchor, so only the simulator exposed it). */
 async function leafSpki(base: string): Promise<string> {
-  const response = await fetch(`${base}/leaf-spki`);
+  const plainBase = `http://${new URL(base).hostname}:8964`;
+  const response = await fetch(`${plainBase}/leaf-spki`);
   assert(
     response.status === 200,
     `/leaf-spki answered ${response.status} — is the battery server's TLS pair up?`,
