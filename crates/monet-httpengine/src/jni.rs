@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
+use futures_channel::oneshot;
 use jni::JavaVM;
 use jni::objects::{Global, JClass, JClassLoader, JObject, JString};
 use monet_core::cancel::CancelToken;
@@ -393,14 +394,8 @@ pub fn execute(
         ))
         .await?;
 
-        let (id, head_rx) = registry::allocate(cancel.clone());
-        let request = setup_and_start(&engine, id, &req, body).inspect_err(|_| {
-            registry::remove(id);
-        })?;
+        let (id, head_rx) = start_request(&engine, &req, &cancel, body)?;
         let req_timeout_ms = req.timeout_ms.map(std::time::Duration::from_millis);
-
-        // Cancellation any time after start maps to UrlRequest.cancel().
-        registry::arm_native_cancel(id, request_cancel(request));
 
         // The per-request head deadline (Cronet has no timeout API —
         // the deadline races the head here and fires the native cancel).
@@ -445,6 +440,31 @@ pub fn execute(
 
 /// Builds, arms, and starts one UrlRequest. The error path removes the
 /// registry entry (the request never started, so no callback will).
+/// Allocates the request, starts it, and arms both native closures.
+/// Sync on purpose: constructing the JNI closures here keeps the
+/// execute future's async block free of the `vm.scope` HRTB — calling
+/// these constructors directly in the block breaks the future's Send
+/// resolution ("not general enough" over JObject's lifetime), the same
+/// reason `engine`'s global ref is duplicated before the block.
+fn start_request(
+    engine: &Global<JObject<'static>>,
+    req: &Request,
+    cancel: &CancelToken,
+    body: Vec<u8>,
+) -> Result<(u64, oneshot::Receiver<Result<Response>>)> {
+    let (id, head_rx) = registry::allocate(cancel.clone());
+    let request = setup_and_start(engine, id, req, body).inspect_err(|_| {
+        registry::remove(id);
+    })?;
+    // Cancellation any time after start maps to UrlRequest.cancel().
+    registry::arm_native_cancel(id, request_cancel(duplicate_global(&request)));
+    // The read-loop resume (v2/W2b): the body watcher fires it after
+    // draining the consumer's backlog — the same read the callback
+    // path issues, from whatever thread fires it.
+    registry::arm_resume_read(id, request_resume_read(id, request));
+    Ok((id, head_rx))
+}
+
 fn setup_and_start(
     engine: &Global<JObject<'static>>,
     id: u64,
@@ -574,6 +594,16 @@ fn duplicate_global(global: &Global<JObject<'static>>) -> Global<JObject<'static
         .clone();
     vm.scope(|env| -> JniResult<Global<JObject<'static>>> { Ok(env.new_global_ref(&**global)?) })
         .expect("duplicating a live global ref cannot fail")
+}
+
+/// The read-resume closure handed to the registry (v2/W2b): the body
+/// watcher fires it after the consumer has drained the overflow — the
+/// same read the JNI callback issues, re-attaching whatever thread
+/// fires it.
+fn request_resume_read(id: u64, request: Global<JObject<'static>>) -> registry::ResumeRead {
+    Arc::new(move || {
+        issue_read(id, &request);
+    })
 }
 
 /// Issues the next body read: a fresh direct ByteBuffer whose backing

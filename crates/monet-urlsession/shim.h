@@ -26,6 +26,11 @@ void transport_start(
 
 void transport_cancel(std::uint64_t id);
 
+// Resumes a task suspended by the body backpressure valve (v2/W2b):
+// the Rust body watcher calls it after the consumer has drained the
+// overflow. A no-op on finished tasks.
+void transport_resume(std::uint64_t id);
+
 // Control plane, WebSocket: same assemble-then-start ordering as HTTP
 // (add_header first, open sends). ws_close with code 0 sends a close
 // frame without a payload; ws_cancel force-cancels the connection.

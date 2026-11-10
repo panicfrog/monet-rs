@@ -1,29 +1,50 @@
 //! Streaming request/response bodies.
 //!
 //! A [`Body`] is a runtime-agnostic stream of `Bytes` chunks. Transports own
-//! the [`BodySender`] half and push chunks as the network delivers them; the
+//! the sender half and push chunks as the network delivers them; the
 //! consumer polls the [`Body`] as a [`Stream`]. This is the core of the
 //! "response head first, body streamed afterwards" contract every transport
 //! must honor.
 //!
-//! Chunks travel over an unbounded channel, so pushing never blocks a
-//! transport callback thread; backpressure is a frontend concern (the RN
-//! layer paces JS delivery, like nitro-fetch's `onData`/`Promise<bool>`
-//! protocol). The channel ends — `poll_next` returns `None` — when the
-//! sender is dropped or calls [`BodySender::complete`].
+//! Two channel flavors (v2/W2b):
+//!
+//! - [`channel()`] is unbounded, so pushing never blocks a transport
+//!   callback thread — the shape request bodies and sync feeders need
+//!   (the RN layer paces upload producers itself).
+//! - [`bounded()`] caps the queue: an async feeder awaiting [`BoundedBodySender::send`]
+//!   pauses at capacity, which is how a slow consumer propagates to
+//!   network reads (the response-side contract — a consumer that stops
+//!   polling must stop the download, not buffer the whole body). Sync
+//!   feeders probe with [`BoundedBodySender::try_send`] and arrange
+//!   their own resume (a stalled read loop, a suspended task).
+//!
+//! The channel ends — `poll_next` returns `None` — when the sender is
+//! dropped or calls `complete`.
 
 use bytes::Bytes;
-use futures_channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
+use futures_channel::mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender, unbounded};
 use futures_core::Stream;
 use std::fmt;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use crate::error::{Error, Result};
 
 /// The receiving half of a streaming body.
 pub struct Body {
-    receiver: UnboundedReceiver<Result<Bytes>>,
+    receiver: BodyReceiver,
+}
+
+enum BodyReceiver {
+    Unbounded(UnboundedReceiver<Result<Bytes>>),
+    Bounded {
+        receiver: Receiver<Result<Bytes>>,
+        /// The abort slot of a bounded pair: `abort` cannot queue behind
+        /// a full buffer (an error must not wait out the data), so it
+        /// lands here and surfaces at end-of-stream.
+        aborted: Arc<Mutex<Option<Error>>>,
+    },
 }
 
 impl fmt::Debug for Body {
@@ -37,11 +58,53 @@ pub struct BodySender {
     sender: UnboundedSender<Result<Bytes>>,
 }
 
+/// The sending half of a bounded channel (response bodies). Cheap to
+/// clone: clones share one channel (and one sender handle), and
+/// `complete`/`abort` close it for all of them — a drain loop can hold
+/// a clone while the registry owns another.
+#[derive(Clone)]
+pub struct BoundedBodySender {
+    /// `poll_ready`/`try_send` take `&mut self` on futures-channel's
+    /// sender; the registry/callback callers reach this through shared
+    /// locks. One handle behind an Arc, so every clone parks and unparks
+    /// the same sender.
+    sender: Arc<Mutex<Sender<Result<Bytes>>>>,
+    aborted: Arc<Mutex<Option<Error>>>,
+}
+
 /// Creates a connected body channel. The transport keeps the sender and
 /// pushes chunks after delivering the response head.
 pub fn channel() -> (Body, BodySender) {
     let (sender, receiver) = unbounded();
-    (Body { receiver }, BodySender { sender })
+    (
+        Body {
+            receiver: BodyReceiver::Unbounded(receiver),
+        },
+        BodySender { sender },
+    )
+}
+
+/// [`channel()`] with a capacity — the response-side flavor. An async
+/// feeder awaiting [`BoundedBodySender::send`] pauses when the queue is
+/// full; a sync feeder probes with [`BoundedBodySender::try_send`] and
+/// keeps the chunk on [`Delivery::Full`]. The effective capacity is
+/// `cap + 1` (futures-channel's semantics: the send that crosses the
+/// buffer still lands, then parks the sender).
+pub fn bounded(cap: usize) -> (Body, BoundedBodySender) {
+    let (sender, receiver) = futures_channel::mpsc::channel(cap);
+    let aborted = Arc::new(Mutex::new(None));
+    (
+        Body {
+            receiver: BodyReceiver::Bounded {
+                receiver,
+                aborted: aborted.clone(),
+            },
+        },
+        BoundedBodySender {
+            sender: Arc::new(Mutex::new(sender)),
+            aborted,
+        },
+    )
 }
 
 impl Body {
@@ -79,7 +142,24 @@ impl Stream for Body {
     type Item = Result<Bytes>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.receiver).poll_next(cx)
+        match &mut self.receiver {
+            BodyReceiver::Unbounded(receiver) => Pin::new(receiver).poll_next(cx),
+            BodyReceiver::Bounded { receiver, aborted } => {
+                match Pin::new(receiver).poll_next(cx) {
+                    // End of stream: a bounded abort could not queue behind
+                    // a full buffer, so its error surfaces here — once,
+                    // then the stream ends.
+                    Poll::Ready(None) => {
+                        let error = aborted.lock().unwrap().take();
+                        match error {
+                            Some(error) => Poll::Ready(Some(Err(error))),
+                            None => Poll::Ready(None),
+                        }
+                    }
+                    poll => poll,
+                }
+            }
+        }
     }
 }
 
@@ -104,6 +184,73 @@ impl BodySender {
         let _ = self.sender.unbounded_send(Err(error));
         self.sender.close_channel();
     }
+}
+
+impl BoundedBodySender {
+    /// Pushes one chunk, waiting for room at capacity — the async
+    /// feeder's natural pause point (a transport pump awaiting this
+    /// stops reading its network stream, and the flow control
+    /// downstream follows). The park/wake is futures-channel's own:
+    /// the receiver unparks a sender on every take. Fails if the
+    /// channel is closed.
+    pub async fn send(&self, chunk: impl Into<Bytes>) -> Result<()> {
+        let chunk = chunk.into();
+        std::future::poll_fn(|cx| {
+            let mut sender = self.sender.lock().unwrap();
+            match sender.poll_ready(cx) {
+                Poll::Ready(Ok(())) => match sender.start_send(Ok(chunk.clone())) {
+                    Ok(()) => Poll::Ready(Ok(())),
+                    Err(_) => Poll::Ready(Err(Error::Body("body channel closed".into()))),
+                },
+                Poll::Ready(Err(_)) => Poll::Ready(Err(Error::Body("body channel closed".into()))),
+                Poll::Pending => Poll::Pending,
+            }
+        })
+        .await
+    }
+
+    /// The sync feeder's probe: [`Delivery::Full`] means the chunk was
+    /// NOT queued — the caller keeps it and arranges its own resume
+    /// (a stalled read loop, a suspended task), because the consumer
+    /// will only make room at its own pace.
+    pub fn try_send(&self, chunk: Bytes) -> Delivery {
+        match self.sender.lock().unwrap().try_send(Ok(chunk)) {
+            Ok(()) => Delivery::Sent,
+            Err(error) if error.is_disconnected() => Delivery::Closed,
+            Err(error) => match error.into_inner() {
+                Ok(chunk) => Delivery::Full(chunk),
+                Err(_) => Delivery::Closed,
+            },
+        }
+    }
+
+    /// Ends the stream successfully: the buffered chunks drain, then
+    /// the consumer sees end-of-stream. Close-based, so it holds for
+    /// every clone of the sender (a drain loop may hold one).
+    pub fn complete(&self) {
+        self.sender.lock().unwrap().close_channel();
+    }
+
+    /// Ends the stream with an error. The error lands in the abort slot
+    /// (it cannot queue behind a full buffer) and surfaces after the
+    /// buffered chunks drain.
+    pub fn abort(&self, error: Error) {
+        *self.aborted.lock().unwrap() = Some(error);
+        self.sender.lock().unwrap().close_channel();
+    }
+}
+
+/// The outcome of a sync [`BoundedBodySender::try_send`] probe.
+#[derive(Debug)]
+pub enum Delivery {
+    /// The chunk is queued.
+    Sent,
+    /// The channel is at capacity; the chunk is handed back — hold it
+    /// and resume when the consumer has drained.
+    Full(Bytes),
+    /// The receiver is gone: stop the request (the v1 semantic of a
+    /// failed `send_chunk` — the consumer dropped the body).
+    Closed,
 }
 
 #[cfg(test)]
@@ -163,5 +310,88 @@ mod tests {
         let (body, sender) = channel();
         drop(body);
         assert!(matches!(sender.send_chunk("x"), Err(Error::Body(_))));
+    }
+
+    #[test]
+    fn bounded_try_send_signals_capacity() {
+        // futures-channel's capacity is cap + 1: the send that crosses
+        // the buffer still lands, then parks the sender.
+        let (mut body, sender) = bounded(2);
+        assert!(matches!(sender.try_send(Bytes::from("a")), Delivery::Sent));
+        assert!(matches!(sender.try_send(Bytes::from("b")), Delivery::Sent));
+        assert!(matches!(sender.try_send(Bytes::from("c")), Delivery::Sent));
+        // Parked: the chunk comes back — the caller holds it.
+        match sender.try_send(Bytes::from("d")) {
+            Delivery::Full(chunk) => assert_eq!(chunk, Bytes::from("d")),
+            other => panic!("expected Full, got {other:?}"),
+        }
+        // One receive unparks exactly one send.
+        let first = futures_lite::future::block_on(body.next())
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, Bytes::from("a"));
+        assert!(matches!(sender.try_send(Bytes::from("d")), Delivery::Sent));
+        drop(sender);
+        let rest = futures_lite::future::block_on(body.map(|c| c.unwrap()).collect::<Vec<_>>());
+        assert_eq!(rest, ["b", "c", "d"]);
+    }
+
+    #[test]
+    fn bounded_send_awaits_capacity() {
+        let (body, sender) = bounded(1);
+        // Fill to the effective capacity (cap + 1 = 2).
+        sender.try_send(Bytes::from("a"));
+        sender.try_send(Bytes::from("b"));
+        let sending = std::thread::spawn(move || {
+            // Blocks until the receiver makes room, then completes the
+            // stream — the async feeder's pause point.
+            futures_lite::future::block_on(async {
+                sender.send(Bytes::from("c")).await.unwrap();
+                sender.complete();
+            });
+        });
+        // Give the sender time to park on the full channel.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let out = futures_lite::future::block_on(body.map(|c| c.unwrap()).collect::<Vec<_>>());
+        assert_eq!(out, ["a", "b", "c"]);
+        sending.join().unwrap();
+    }
+
+    #[test]
+    fn bounded_abort_surfaces_after_buffered_data() {
+        let (body, sender) = bounded(1);
+        sender.try_send(Bytes::from("a"));
+        sender.try_send(Bytes::from("b"));
+        // Full buffer: the abort cannot queue — it must still surface,
+        // behind the buffered chunks, not be lost to a clean EOF.
+        sender.abort(Error::Body("late failure".into()));
+
+        let mut body = body;
+        let drained = futures_lite::future::block_on(body.next())
+            .unwrap()
+            .unwrap();
+        assert_eq!(drained, Bytes::from("a"));
+        let second = futures_lite::future::block_on(body.next())
+            .unwrap()
+            .unwrap();
+        assert_eq!(second, Bytes::from("b"));
+        let terminal = futures_lite::future::block_on(body.next()).unwrap();
+        assert!(
+            matches!(&terminal, Err(Error::Body(m)) if m.contains("late failure")),
+            "got: {terminal:?}"
+        );
+        assert!(futures_lite::future::block_on(body.next()).is_none());
+    }
+
+    #[test]
+    fn bounded_reports_dropped_receiver() {
+        let (body, sender) = bounded(1);
+        drop(body);
+        assert!(matches!(
+            sender.try_send(Bytes::from("x")),
+            Delivery::Closed
+        ));
+        let send = futures_lite::future::block_on(sender.send(Bytes::from("y")));
+        assert!(send.is_err());
     }
 }

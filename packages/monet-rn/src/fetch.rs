@@ -11,20 +11,39 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Poll, Waker};
 
 use jsi::JsiArrayBuffer;
 use jsi::RuntimeHandle;
 use monet_core::CancelToken;
+
+/// The JS-facing queue's high watermark (v2/W2b): at this many queued
+/// chunks the pump stops pulling the transport body. With pump-side
+/// chunks of 16–64KB the bound is ~256KB in flight per fetch — a slow
+/// consumer bounds memory, it does not buffer the whole response.
+const QUEUE_HIGH: usize = 4;
+
+/// The resume watermark: takes bring the queue down to this before the
+/// pump pulls again (hysteresis — resume at 2, pause at 4, no
+/// thrash around one boundary).
+const QUEUE_LOW: usize = 2;
 
 struct FetchState {
     /// The fetch's cancel token — cloned into the transport call; abort
     /// fires it.
     cancel: CancelToken,
     /// Queued chunks waiting for `take_chunk` (FIFO — body order is
-    /// meaningful).
-    queue: Mutex<VecDeque<Vec<u8>>>,
+    /// meaningful), plus the pump's waker while it waits for capacity.
+    queue: Mutex<ChunkQueue>,
     /// Set at termination (on_done / on_error fired).
     finished: bool,
+}
+
+struct ChunkQueue {
+    chunks: VecDeque<Vec<u8>>,
+    /// The pump's waker while it waits out a full queue; `take_chunk`
+    /// wakes it at the low watermark.
+    capacity_waker: Option<Waker>,
 }
 
 #[derive(Clone)]
@@ -62,7 +81,10 @@ impl FetchRegistry {
             id,
             FetchState {
                 cancel: cancel.clone(),
-                queue: Mutex::new(VecDeque::new()),
+                queue: Mutex::new(ChunkQueue {
+                    chunks: VecDeque::new(),
+                    capacity_waker: None,
+                }),
                 finished: false,
             },
         );
@@ -75,27 +97,60 @@ impl FetchRegistry {
         let mut states = self.inner.states.lock().unwrap();
         match states.get_mut(&f64_to_u64(id)) {
             Some(state) => {
-                state.queue.lock().unwrap().push_back(chunk);
+                state.queue.lock().unwrap().chunks.push_back(chunk);
                 true
             }
             None => false,
         }
     }
 
+    /// Waits until the fetch's queue is below the high watermark — the
+    /// pump's pull gate (v2/W2b). `false` when the state is gone (the
+    /// fetch was cleaned up — stop pulling). The pump races this with
+    /// its cancel token: an aborted fetch with a full queue must not
+    /// wait for takes that will never come.
+    pub async fn wait_for_capacity(&self, id: f64) -> bool {
+        std::future::poll_fn(|cx| {
+            let states = self.inner.states.lock().unwrap();
+            let Some(state) = states.get(&f64_to_u64(id)) else {
+                return Poll::Ready(false);
+            };
+            let mut queue = state.queue.lock().unwrap();
+            if queue.chunks.len() < QUEUE_HIGH {
+                return Poll::Ready(true);
+            }
+            queue.capacity_waker = Some(cx.waker().clone());
+            Poll::Pending
+        })
+        .await
+    }
+
     /// Takes one queued chunk as a zero-copy ArrayBuffer; `None` when
     /// the queue is empty (check `is_done` to tell "no data yet" from
-    /// "finished").
+    /// "finished"). A take that brings the queue to the low watermark
+    /// wakes the pump — the gate's resume edge.
     pub fn take_chunk<'rt>(
         &self,
         id: f64,
         rt: &mut RuntimeHandle<'rt>,
     ) -> Option<JsiArrayBuffer<'rt>> {
-        let states = self.inner.states.lock().unwrap();
-        let state = states.get(&f64_to_u64(id))?;
-        let mut queue = state.queue.lock().unwrap();
-        queue
-            .pop_front()
-            .map(|chunk| JsiArrayBuffer::from_vec(chunk, rt))
+        let woken = {
+            let states = self.inner.states.lock().unwrap();
+            let state = states.get(&f64_to_u64(id))?;
+            let mut queue = state.queue.lock().unwrap();
+            let taken = queue.chunks.pop_front();
+            let waker = if queue.chunks.len() <= QUEUE_LOW {
+                queue.capacity_waker.take()
+            } else {
+                None
+            };
+            (taken, waker)
+        };
+        // Wake outside the locks: the pump's re-poll takes them itself.
+        if let Some(waker) = woken.1 {
+            waker.wake();
+        }
+        woken.0.map(|chunk| JsiArrayBuffer::from_vec(chunk, rt))
     }
 
     /// Marks the fetch terminated (the terminal callback has fired).
@@ -111,7 +166,7 @@ impl FetchRegistry {
     pub fn is_done(&self, id: f64) -> bool {
         let states = self.inner.states.lock().unwrap();
         match states.get(&f64_to_u64(id)) {
-            Some(state) => state.finished && state.queue.lock().unwrap().is_empty(),
+            Some(state) => state.finished && state.queue.lock().unwrap().chunks.is_empty(),
             None => true,
         }
     }
@@ -132,7 +187,17 @@ impl FetchRegistry {
     /// Drops a finished fetch's state (JS signals it's done pulling).
     /// Idempotent; late events on the id are ignored afterwards.
     pub fn cleanup(&self, id: f64) {
-        self.inner.states.lock().unwrap().remove(&f64_to_u64(id));
+        // Wakes a pump parked on capacity so it can observe the removal
+        // — it would otherwise wait for a take that can no longer come.
+        let waker = {
+            let mut states = self.inner.states.lock().unwrap();
+            states
+                .remove(&f64_to_u64(id))
+                .and_then(|state| state.queue.lock().unwrap().capacity_waker.take())
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
     }
 
     /// ---- streaming uploads (fetch_stream) ----

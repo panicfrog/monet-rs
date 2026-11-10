@@ -110,6 +110,24 @@ final class TransportShim {
     task?.cancel()
   }
 
+  /// The body backpressure valve (v2/W2b): Rust probed the bounded
+  /// channel full, so data delivery pauses until the consumer drains.
+  func suspend(id: UInt64) {
+    lock.lock()
+    let task = boxes[id]?.task
+    lock.unlock()
+    task?.suspend()
+  }
+
+  /// The valve's resume edge: the Rust body watcher calls it after
+  /// draining the overflow. A no-op on finished tasks.
+  func resume(id: UInt64) {
+    lock.lock()
+    let task = boxes[id]?.task
+    lock.unlock()
+    task?.resume()
+  }
+
   /// Called by a task delegate on completion so the box doesn't leak.
   func completed(id: UInt64) {
     lock.lock()
@@ -198,7 +216,14 @@ final class TaskDelegate: NSObject, URLSessionDataDelegate {
   }
 
   func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-    notifyChunk(id, data: data)
+    let paused = notifyChunk(id, data: data)
+    if paused {
+      // The bounded body channel is full (v2/W2b): stop data delivery
+      // until the consumer drains — the Rust body watcher resumes
+      // through transportResume. Suspend only pauses delivery; the
+      // task's lifecycle (cancel, completion) is untouched.
+      TransportShim.shared.suspend(id: id)
+    }
   }
 
   func urlSession(
@@ -280,4 +305,9 @@ public func monetTransportStart(
 @_expose(Cxx)
 public func monetTransportCancel(_ id: UInt64) {
   TransportShim.shared.cancel(id: id)
+}
+
+@_expose(Cxx)
+public func monetTransportResume(_ id: UInt64) {
+  TransportShim.shared.resume(id: id)
 }

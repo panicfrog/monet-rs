@@ -35,6 +35,10 @@ void transport_cancel(std::uint64_t id) {
   MonetUrlsessionBridge::monetTransportCancel(id);
 }
 
+void transport_resume(std::uint64_t id) {
+  MonetUrlsessionBridge::monetTransportResume(id);
+}
+
 void ws_add_header(
     std::uint64_t id,
     rust::Slice<const std::uint8_t> name,

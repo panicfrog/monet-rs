@@ -52,9 +52,9 @@ fn main() {
              \x20 on_header(id, rust::Slice<const ::std::uint8_t>(name, name_len), \n\
              \x20                       rust::Slice<const ::std::uint8_t>(value, value_len));\n\
              }}\n\
-             inline void monet_on_chunk(\
+             inline bool monet_on_chunk(\
              ::std::uint64_t id, const ::std::uint8_t *data, ::std::size_t len) noexcept {{\n\
-             \x20 on_chunk(id, rust::Slice<const ::std::uint8_t>(data, len));\n\
+             \x20 return on_chunk(id, rust::Slice<const ::std::uint8_t>(data, len));\n\
              }}\n\
              inline void monet_on_redirect(\
              ::std::uint64_t id, const ::std::uint8_t *location, ::std::size_t len) noexcept {{\n\

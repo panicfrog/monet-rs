@@ -14,7 +14,7 @@ use hyper::{Method as HyperMethod, Request as HyperRequest, Uri};
 use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
-use monet_core::body::{Body, BodySender, channel as body_channel};
+use monet_core::body::{Body, BoundedBodySender, bounded as body_bounded};
 use monet_core::cancel::CancelToken;
 use monet_core::error::{Error, Result};
 use monet_core::pin::PinConfig;
@@ -339,7 +339,11 @@ fn into_response(
     }
     let status = response.status().as_u16();
 
-    let (body, sender) = body_channel();
+    // The response channel is bounded (v2/W2b): the pump below awaits
+    // `send` at capacity, and not polling hyper's stream pauses the
+    // download — the flow control (HTTP window, then TCP) follows. The
+    // effective capacity is cap + 1 (futures-channel semantics).
+    let (body, sender) = body_bounded(4);
     handle.spawn(pump_body(response.into_body(), sender, cancel));
     Response::new(status, headers_out, body)
 }
@@ -354,9 +358,14 @@ fn request_body(body: Body) -> BoxRequestBody {
 
 /// Pumps the hyper response body into our channel, chunk by chunk; the
 /// cancel token aborts the stream mid-body.
-async fn pump_body(mut incoming: Incoming, sender: BodySender, cancel: CancelToken) {
+async fn pump_body(mut incoming: Incoming, sender: BoundedBodySender, cancel: CancelToken) {
     enum Step<T> {
         Frame(Option<Result<T, hyper::Error>>),
+        Cancelled,
+    }
+    enum Delivery {
+        Sent,
+        ConsumerGone,
         Cancelled,
     }
     loop {
@@ -374,10 +383,34 @@ async fn pump_body(mut incoming: Incoming, sender: BodySender, cancel: CancelTok
         };
         match frame {
             Some(Ok(frame)) => {
-                if let Ok(data) = frame.into_data()
-                    && sender.send_chunk(data).is_err()
-                {
-                    return; // consumer dropped the response body
+                if let Ok(data) = frame.into_data() {
+                    // The awaited send at capacity: while the consumer
+                    // is slow this parks, hyper's stream goes unpolled,
+                    // and the download pauses (v2/W2b) — hyper's flow
+                    // control (HTTP window, then TCP) does the
+                    // propagating. Raced with cancel so an aborted
+                    // fetch never hangs on a full channel.
+                    match race(
+                        async {
+                            match sender.send(data).await {
+                                Ok(()) => Delivery::Sent,
+                                Err(_) => Delivery::ConsumerGone,
+                            }
+                        },
+                        async {
+                            cancel.cancelled().await;
+                            Delivery::Cancelled
+                        },
+                    )
+                    .await
+                    {
+                        Delivery::Sent => {}
+                        Delivery::ConsumerGone => return,
+                        Delivery::Cancelled => {
+                            sender.abort(Error::Cancelled);
+                            return;
+                        }
+                    }
                 }
                 // trailers are ignored in v1
             }

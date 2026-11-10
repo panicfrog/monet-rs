@@ -327,6 +327,23 @@ async fn respond_route(
                 boxed(http_body_util::StreamBody::new(stream)),
             )
         }
+        // The slow-consumer battery's body (v2/W2b): enough chunks, fast
+        // enough, to fill a bounded response channel and engage the
+        // pull gate while the JS consumer deliberately lags — 24 × 4KB,
+        // one every 10ms (the check's consumer takes one per 60ms).
+        "/backpressure" => {
+            let stream = futures_lite::stream::iter(
+                (0..24u8).map(|i| Ok(Frame::data(Bytes::from(vec![b'a' + (i % 26); 4096])))),
+            )
+            .then(|frame| async move {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                frame
+            });
+            ok(
+                StatusCode::OK,
+                boxed(http_body_util::StreamBody::new(stream)),
+            )
+        }
         // The hook-retry target: 401 unless the request carries the
         // "refreshed" token, with an `x-retry` response header so a
         // response hook can key its decision on more than the status.

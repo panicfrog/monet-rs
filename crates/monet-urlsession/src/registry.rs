@@ -6,15 +6,16 @@
 //! events for unknown ids — late arrivals after cancellation — are
 //! ignored.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
+use futures_channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use futures_channel::oneshot;
 
-use monet_core::body::{BodySender, channel as body_channel};
+use monet_core::body::{BoundedBodySender, Delivery, bounded as body_bounded};
 use monet_core::cancel::CancelToken;
 use monet_core::error::{Error, PlatformErrorCode, Result};
 use monet_core::headers::HeaderMap;
@@ -25,19 +26,46 @@ use crate::bridge;
 /// `NSURLErrorCancelled` — the code a `transport_cancel`ed task reports.
 const URL_ERROR_CANCELLED: i32 = -999;
 
+/// The body watcher's wake reasons.
+enum Wake {
+    /// A chunk did not fit the bounded channel: drain the overflow,
+    /// then resume the suspended task.
+    Stall,
+    /// A terminal event was staged: drain, then apply it.
+    Terminal,
+}
+
+/// A terminal event, staged by `on_done`/`on_error` and applied by the
+/// watcher after the overflow drains — a terminal must not cut in front
+/// of stalled data, and applying it may need awaited sends (the bounded
+/// channel can be full when the response ends).
+enum Terminal {
+    Done,
+    Fail(Error),
+}
+
 struct RequestState {
     /// Resolves the execute future; taken by `on_response_head`.
     head_tx: Option<oneshot::Sender<Result<Response>>>,
     /// Accumulates headers between `on_header` and `on_response_head`.
     headers: HeaderMap,
     /// Body channel half, present between `on_response_head` and the
-    /// terminal event.
-    body_tx: Option<BodySender>,
+    /// terminal's application. Bounded (v2/W2b): a full channel
+    /// suspends the task (Swift side), so a slow consumer pauses the
+    /// download instead of buffering the whole response. The effective
+    /// capacity is cap + 1 (futures-channel semantics).
+    body_tx: Option<BoundedBodySender>,
+    /// Chunks that did not fit the bounded channel — at most one in
+    /// practice, because the task is suspended after the Full probe
+    /// until the watcher has drained it.
+    overflow: Mutex<VecDeque<Bytes>>,
+    /// Wakes the body watcher (a stall or a staged terminal). Dropping
+    /// the sender — the state's removal — ends the watcher's stream.
+    wake_tx: Option<UnboundedSender<Wake>>,
+    /// The staged terminal, applied by the watcher post-drain.
+    terminal: Mutex<Option<Terminal>>,
     /// The request's cancel token, watched during the body phase.
     cancel: CancelToken,
-    /// Dropping this shuts the body-phase cancel watcher down; it lives
-    /// exactly as long as the state.
-    watcher_done: Option<oneshot::Sender<()>>,
 }
 
 #[derive(Default)]
@@ -59,8 +87,10 @@ pub(crate) fn allocate(cancel: CancelToken) -> (u64, oneshot::Receiver<Result<Re
             head_tx: Some(head_tx),
             headers: HeaderMap::new(),
             body_tx: None,
+            overflow: Mutex::new(VecDeque::new()),
+            wake_tx: None,
+            terminal: Mutex::new(None),
             cancel,
-            watcher_done: None,
         },
     );
     (id, head_rx)
@@ -95,7 +125,7 @@ pub(crate) fn on_response_head(id: u64, status: u16) {
             headers: HeaderMap,
             body: monet_core::body::Body,
             cancel: CancelToken,
-            done_rx: oneshot::Receiver<()>,
+            wake_rx: UnboundedReceiver<Wake>,
         },
     }
     let staged = {
@@ -106,16 +136,16 @@ pub(crate) fn on_response_head(id: u64, status: u16) {
         let headers = std::mem::take(&mut state.headers);
         match state.head_tx.take() {
             Some(head_tx) => {
-                let (body, body_tx) = body_channel();
+                let (body, body_tx) = body_bounded(4);
                 state.body_tx = Some(body_tx);
-                let (done_tx, done_rx) = oneshot::channel();
-                state.watcher_done = Some(done_tx);
+                let (wake_tx, wake_rx) = unbounded();
+                state.wake_tx = Some(wake_tx);
                 Staged::Deliver {
                     head_tx,
                     headers,
                     body,
                     cancel: state.cancel.clone(),
-                    done_rx,
+                    wake_rx,
                 }
             }
             // Head already delivered; a duplicate event violates the
@@ -129,13 +159,13 @@ pub(crate) fn on_response_head(id: u64, status: u16) {
             headers,
             body,
             cancel,
-            done_rx,
+            wake_rx,
         } => {
             if head_tx
                 .send(Ok(Response::new(status, headers, body)))
                 .is_ok()
             {
-                spawn_body_watcher(id, cancel, done_rx);
+                spawn_body_watcher(id, cancel, wake_rx);
             } else {
                 // The execute future is gone (its cancel path won the
                 // race): stop the native task and drop the orphaned state.
@@ -147,50 +177,121 @@ pub(crate) fn on_response_head(id: u64, status: u16) {
     }
 }
 
-pub(crate) fn on_chunk(id: u64, data: &[u8]) {
-    let delivered = {
+/// Delivers one body chunk from the delegate's data event. `true` means
+/// paused (v2/W2b): the bounded channel is full, so Swift suspends the
+/// task; the body watcher resumes it once the consumer has drained the
+/// overflow.
+pub(crate) fn on_chunk(id: u64, data: &[u8]) -> bool {
+    enum After {
+        Continue,
+        Stalled,
+        ConsumerGone,
+    }
+    let after = {
         let states = REGISTRY.states.lock().unwrap();
         match states.get(&id) {
             // Unknown id: a late chunk after cancellation — nothing to do.
-            None => true,
+            None => After::Continue,
             Some(state) => match &state.body_tx {
-                Some(sender) => sender.send_chunk(Bytes::copy_from_slice(data)).is_ok(),
+                Some(sender) => match sender.try_send(Bytes::copy_from_slice(data)) {
+                    Delivery::Sent => After::Continue,
+                    Delivery::Full(chunk) => {
+                        state.overflow.lock().unwrap().push_back(chunk);
+                        After::Stalled
+                    }
+                    Delivery::Closed => After::ConsumerGone,
+                },
                 // Chunks before the head violate the ordering contract;
                 // ignore rather than crash a delegate thread.
-                None => true,
+                None => After::Continue,
             },
         }
     };
-    if !delivered {
+    match after {
+        After::Continue => false,
+        After::Stalled => {
+            // Outside the states lock: notify wakes the watcher, which
+            // drains at the consumer's pace and resumes the task.
+            if let Some(wake_tx) = REGISTRY
+                .states
+                .lock()
+                .unwrap()
+                .get(&id)
+                .and_then(|state| state.wake_tx.as_ref())
+            {
+                let _ = wake_tx.unbounded_send(Wake::Stall);
+            }
+            true
+        }
         // The consumer dropped the response body: stop the native task.
         // The cancellation error arrives later through on_error.
-        bridge::transport_cancel(id);
+        After::ConsumerGone => {
+            bridge::transport_cancel(id);
+            true
+        }
     }
 }
 
 pub(crate) fn on_done(id: u64) {
-    if let Some(state) = REGISTRY.states.lock().unwrap().remove(&id) {
-        if let Some(sender) = state.body_tx {
-            sender.complete();
-        }
-        if let Some(head_tx) = state.head_tx {
-            // Completion without a head: report instead of hanging the
-            // execute future.
-            let _ = head_tx.send(Err(Error::transport(
-                "urlsession: request completed without a response head",
-            )));
-        }
-    }
+    stage_terminal(
+        id,
+        Terminal::Done,
+        "urlsession: request completed without a response head",
+    );
 }
 
 pub(crate) fn on_error(id: u64, code: i32, message: &[u8]) {
-    let error = map_error(code, message);
-    if let Some(state) = REGISTRY.states.lock().unwrap().remove(&id) {
-        if let Some(head_tx) = state.head_tx {
-            let _ = head_tx.send(Err(error));
-        } else if let Some(sender) = state.body_tx {
-            sender.abort(error);
+    stage_terminal(id, Terminal::Fail(map_error(code, message)), "");
+}
+
+/// One terminal event, either side of the head. Post-head the terminal
+/// is staged for the body watcher (it must wait out the overflow, and
+/// applying it may need awaited sends on a full channel); pre-head it
+/// resolves the head future directly. The first terminal wins — a
+/// spurious didComplete after a delivered one must not overwrite it.
+fn stage_terminal(id: u64, terminal: Terminal, pre_head_note: &str) {
+    // The terminal travels with the act: the staging branch moves it
+    // into the slot, the pre-head branch carries it to the head error.
+    enum Act {
+        Staged,
+        PreHead {
+            head_tx: Option<oneshot::Sender<Result<Response>>>,
+            terminal: Terminal,
+        },
+    }
+    let act = {
+        let mut states = REGISTRY.states.lock().unwrap();
+        let post_head = states.get(&id).is_some_and(|state| state.body_tx.is_some());
+        if post_head {
+            let state = states.get_mut(&id).expect("just checked");
+            let mut slot = state.terminal.lock().unwrap();
+            if slot.is_none() {
+                *slot = Some(terminal);
+                if let Some(wake_tx) = &state.wake_tx {
+                    let _ = wake_tx.unbounded_send(Wake::Terminal);
+                }
+            }
+            Act::Staged
+        } else {
+            Act::PreHead {
+                head_tx: states.remove(&id).and_then(|state| state.head_tx),
+                terminal,
+            }
         }
+    };
+    match act {
+        Act::Staged => {}
+        Act::PreHead {
+            head_tx: Some(head_tx),
+            terminal,
+        } => {
+            let error = match terminal {
+                Terminal::Fail(error) => error,
+                Terminal::Done => Error::transport(pre_head_note),
+            };
+            let _ = head_tx.send(Err(error));
+        }
+        Act::PreHead { head_tx: None, .. } => {}
     }
 }
 
@@ -206,33 +307,145 @@ fn map_error(code: i32, message: &[u8]) -> Error {
     )
 }
 
-/// Watches the cancel token during the body phase. Once the head is
-/// delivered, nothing else polls the token — no runtime here, unlike
-/// monet-rustls's pump task — so a parked thread (woken by the token's
-/// waker) maps a late cancellation to `transport_cancel`. Removing the
-/// request state drops the shutdown sender, which also wakes the thread
-/// so it exits; a spawn failure only delays cancellation (the
-/// dropped-body path still stops the task on the next chunk event).
-fn spawn_body_watcher(id: u64, cancel: CancelToken, done: oneshot::Receiver<()>) {
+/// The body watcher. Once the head is delivered, nothing else polls the
+/// cancel token — no runtime here, unlike monet-rustls's pump task — so
+/// a parked thread (woken by the token's waker) maps a late
+/// cancellation to `transport_cancel`. It also owns the backpressure
+/// machinery (v2/W2b): on a stall it drains the overflow into the
+/// bounded channel at the consumer's pace and resumes the suspended
+/// task; on a staged terminal it drains first, then applies it. The
+/// wake stream ends (and the watcher exits) when the state is removed;
+/// cancel exits it too.
+fn spawn_body_watcher(id: u64, cancel: CancelToken, mut wake_rx: UnboundedReceiver<Wake>) {
     let spawned = std::thread::Builder::new()
-        .name("monet-urlsession-cancel".into())
+        .name("monet-urlsession-body".into())
         .spawn(move || {
-            futures_lite::future::block_on(futures_lite::future::race(
-                async {
-                    let _ = done.await;
-                },
-                async {
-                    cancel.cancelled().await;
-                },
-            ));
-            if cancel.is_cancelled() {
-                // The task's didCompleteWithError(-999) then reports
-                // through on_error, aborting the body with Cancelled.
-                bridge::transport_cancel(id);
-            }
+            futures_lite::future::block_on(async {
+                use futures_lite::StreamExt as _;
+                // Cancel is observed once: it fires the native cancel,
+                // but the watcher keeps waiting — the terminal the
+                // cancellation produces arrives asynchronously (the
+                // delegate's didCompleteWithError), and applying it is
+                // this loop's job.
+                let mut cancelled = false;
+                loop {
+                    enum Step {
+                        Wake(Option<Wake>),
+                        Cancelled,
+                    }
+                    let step = if cancelled {
+                        Step::Wake(wake_rx.next().await)
+                    } else {
+                        futures_lite::future::race(
+                            async { Step::Wake(wake_rx.next().await) },
+                            async {
+                                cancel.cancelled().await;
+                                Step::Cancelled
+                            },
+                        )
+                        .await
+                    };
+                    match step {
+                        // The state is gone (removed elsewhere): exit.
+                        Step::Wake(None) => return,
+                        Step::Cancelled => {
+                            // The task's didCompleteWithError(-999) then
+                            // reports through on_error, which stages the
+                            // terminal this loop applies.
+                            bridge::transport_cancel(id);
+                            cancelled = true;
+                        }
+                        Step::Wake(Some(reason)) => {
+                            // Every path drains first: a terminal must
+                            // not cut in front of stalled data, and a
+                            // stall resumes only what it actually
+                            // delivered.
+                            match drain_overflow(id).await {
+                                // The consumer is gone: stop the task.
+                                None => {
+                                    bridge::transport_cancel(id);
+                                    return;
+                                }
+                                Some(0) if matches!(reason, Wake::Stall) => {
+                                    // The stall was drained by another
+                                    // wake (a terminal pass); nothing to
+                                    // resume here.
+                                }
+                                // Only a live request resumes: a cancel was
+                                // observed, so the task's terminal is on its
+                                // way — resuming would race it (a suspended
+                                // task's cancel may deliver late).
+                                Some(_) if matches!(reason, Wake::Stall) && !cancelled => {
+                                    bridge::transport_resume(id);
+                                }
+                                Some(_) => {
+                                    apply_terminal(id);
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+            });
         });
     if let Err(e) = spawned {
         // Thread-starved environment; degrade to event-driven cleanup.
         let _ = e;
     }
+}
+
+/// Drains the overflow into the bounded channel, one awaited send per
+/// chunk — the consumer's pace is the pause the suspended task is
+/// spending. Returns how many chunks were delivered; `None` when the
+/// consumer is gone (the channel closed).
+async fn drain_overflow(id: u64) -> Option<usize> {
+    let mut drained = 0;
+    loop {
+        let (chunk, sender) = {
+            let states = REGISTRY.states.lock().unwrap();
+            let Some(state) = states.get(&id) else {
+                return Some(drained);
+            };
+            let chunk = state.overflow.lock().unwrap().pop_front();
+            match (chunk, state.body_tx.as_ref()) {
+                (Some(chunk), Some(sender)) => (chunk, sender.clone()),
+                // Nothing pending (or already terminated): the drain is
+                // done.
+                (None, _) | (Some(_), None) => return Some(drained),
+            }
+        };
+        // The send awaits outside the registry lock.
+        if sender.send(chunk).await.is_err() {
+            return None;
+        }
+        drained += 1;
+    }
+}
+
+/// Applies the staged terminal: completes or errors the body, then
+/// drops the state (which ends the wake stream). The caller has already
+/// drained the overflow.
+fn apply_terminal(id: u64) {
+    let (terminal, sender) = {
+        let mut states = REGISTRY.states.lock().unwrap();
+        let Some(state) = states.get_mut(&id) else {
+            return;
+        };
+        (state.terminal.lock().unwrap().take(), state.body_tx.take())
+    };
+    match terminal {
+        Some(Terminal::Fail(error)) => {
+            if let Some(sender) = sender {
+                sender.abort(error);
+            }
+        }
+        // Done, or nothing staged (the state was terminal-less — the
+        // wake came from a path that removed it): complete cleanly.
+        Some(Terminal::Done) | None => {
+            if let Some(sender) = sender {
+                sender.complete();
+            }
+        }
+    }
+    remove(id);
 }

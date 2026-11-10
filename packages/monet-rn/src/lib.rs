@@ -822,9 +822,30 @@ fn spawn_fetch_pump(
             use futures_lite::StreamExt;
             let mut body = response.body;
             let mut failure: Option<monet_core::Error> = None;
-            while let Some(chunk) = body.next().await {
-                match chunk {
-                    Ok(bytes) => {
+            loop {
+                // The pull gate (v2/W2b): a slow JS consumer must bound
+                // what's in flight. The queue parks at the high
+                // watermark until takes bring it to the low one — and
+                // behind it the transports' own valves hold (the
+                // bounded response channels). Raced with cancel: an
+                // aborted fetch with a full queue must not wait for
+                // takes that will never come.
+                match race_cancel(fetches.wait_for_capacity(fetch_id), &cancel).await {
+                    RaceOutcome::Done(true) => {}
+                    // State gone (cleanup after terminal): stop pulling.
+                    RaceOutcome::Done(false) => return,
+                    RaceOutcome::Cancelled => {
+                        failure = Some(monet_core::Error::Cancelled);
+                        break;
+                    }
+                }
+                // The pull itself is cancel-raced too: mid-body, the
+                // pump can be parked here for a long stretch (a slow
+                // body, a gated consumer), and the abort must not
+                // depend on the transport tearing the stream down to
+                // be observed.
+                match race_cancel(body.next(), &cancel).await {
+                    RaceOutcome::Done(Some(Ok(bytes))) => {
                         if fetches.push_chunk(fetch_id, bytes.to_vec()) {
                             on_chunk.call_with_no_args();
                         } else {
@@ -833,8 +854,13 @@ fn spawn_fetch_pump(
                             return;
                         }
                     }
-                    Err(error) => {
+                    RaceOutcome::Done(Some(Err(error))) => {
                         failure = Some(error);
+                        break;
+                    }
+                    RaceOutcome::Done(None) => break,
+                    RaceOutcome::Cancelled => {
+                        failure = Some(monet_core::Error::Cancelled);
                         break;
                     }
                 }

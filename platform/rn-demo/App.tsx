@@ -316,6 +316,91 @@ const CHECKS: Array<{
       throw new Error('a fetch to a closed port unexpectedly resolved');
     },
   },
+  {
+    name: 'http:slow_consumer_bounded',
+    timeoutMs: 20_000,
+    run: async base => {
+      // v2/W2b: the pump's pull gate bounds the JS-facing queue — a
+      // slow consumer must not buffer the whole response. The raw
+      // protocol gives the observability: count on_chunk signals
+      // against take_chunk pulls; the difference is the queue depth,
+      // which the gate parks at 4 (hysteresis: pause at 4, resume at 2;
+      // +1 headroom for the in-flight push). The server outpaces the
+      // consumer 6:1 (/backpressure: one chunk per 10ms vs a take every
+      // 60ms), so an unbounded pump would run far ahead.
+      const monet = getMonet();
+      let signaled = 0;
+      let taken = 0;
+      let bytes = 0;
+      let maxDepth = 0;
+      let terminal: 'done' | 'error' | null = null;
+      let errorMessage = '';
+      let headArrived!: () => void;
+      const head = new Promise<void>(resolve => {
+        headArrived = resolve;
+      });
+      const fetchId = monet.fetch(
+        {
+          url: `${base}/backpressure`,
+          method: 'GET',
+          headers: [],
+          metadata: [],
+          timeoutMs: 0,
+          followRedirects: true,
+        },
+        null,
+        () => headArrived(),
+        () => {
+          signaled++;
+        },
+        () => {
+          terminal = 'done';
+        },
+        event => {
+          terminal = 'error';
+          errorMessage = event?.message ?? 'unknown transport error';
+        },
+      );
+      await head;
+      // The slow consumer: one pull per 60ms until the terminal and a
+      // drained queue. (Transports coalesce server chunks into reads —
+      // the signal count is not the body's chunk count; bytes are.)
+      for (;;) {
+        const chunk = monet.takeChunk(fetchId);
+        if (chunk != null) {
+          taken++;
+          bytes += chunk.byteLength;
+          const depth = signaled - taken;
+          if (depth > maxDepth) {
+            maxDepth = depth;
+          }
+          assert(
+            depth <= 5,
+            `queue depth ${depth} exceeds the bound ` +
+              `(signaled ${signaled}, taken ${taken})`,
+          );
+          await new Promise<void>(resolve => setTimeout(resolve, 60));
+          continue;
+        }
+        if (terminal !== null) {
+          break;
+        }
+        await new Promise<void>(resolve => setTimeout(resolve, 10));
+      }
+      assert(terminal === 'done', `expected done, got ${terminal}: ${errorMessage}`);
+      // Byte-exact: nothing queued behind the gate may be lost.
+      assert(
+        bytes === 24 * 4096,
+        `expected the full 98304-byte body, got ${bytes} in ${signaled} signals`,
+      );
+      // The gate must actually have engaged — the server outpaces the
+      // consumer 6:1, so the queue parks at the watermark.
+      assert(
+        maxDepth >= 2,
+        `the gate never engaged (max queue depth ${maxDepth} over ${taken} takes)`,
+      );
+    },
+  },
   // ---- WebSocket checks (names mirror monet-conformance/src/ws.rs) ----
   {
     name: 'ws:round_trips',

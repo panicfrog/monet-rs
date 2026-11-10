@@ -104,7 +104,9 @@ fn main() {
         // be hostnames; 10.0.2.2 is IP-shaped and rejected) — which only
         // resolves through adb reverse, on real devices AND emulators
         // (the reverse set dies with every device reboot).
-        println!("  adb reverse (Android, TLS battery): for p in 8964 8965 8966 8967; do adb reverse tcp:$p tcp:$p; done");
+        println!(
+            "  adb reverse (Android, TLS battery): for p in 8964 8965 8966 8967; do adb reverse tcp:$p tcp:$p; done"
+        );
         let spki: String = {
             use base64::Engine as _;
             base64::engine::general_purpose::STANDARD.encode(ca.leaf_spki_sha256())

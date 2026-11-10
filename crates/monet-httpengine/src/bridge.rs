@@ -148,14 +148,25 @@ pub extern "system" fn native_on_read_completed(
             } else {
                 &[][..]
             };
-            registry::on_chunk(id as u64, data);
+            // The read gate (v2/W2b): the bounded channel's capacity
+            // decides whether this loop continues now or waits for the
+            // body watcher to drain the consumer's backlog.
+            let gate = registry::on_chunk(id as u64, data);
 
             // The slot's buffer is consumed; the next read wraps a fresh
             // one (issue_read replaces the slot).
             drop_read_buffer(id as u64);
-            let guard = requests().lock().unwrap();
-            if let Some(request) = guard.get(&(id as u64)) {
-                issue_read(id as u64, request);
+            match gate {
+                registry::ReadGate::Continue => {
+                    let guard = requests().lock().unwrap();
+                    if let Some(request) = guard.get(&(id as u64)) {
+                        issue_read(id as u64, request);
+                    }
+                }
+                // Full (the watcher resumes the loop after the drain) or
+                // the consumer is gone (the native cancel already
+                // fired): no next read.
+                registry::ReadGate::Pause => {}
             }
             Ok(())
         })
