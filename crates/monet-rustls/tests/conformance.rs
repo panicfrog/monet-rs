@@ -19,4 +19,5 @@ fn http_timeout_conformance() {
     .unwrap();
     let server = http::HttpServer::spawn();
     http::timeout_maps_to_transport_error(&transport, &server);
+    http::per_request_timeout_longer_wins(&transport, &server);
 }

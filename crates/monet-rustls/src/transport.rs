@@ -116,9 +116,22 @@ impl Transport for MonetRustlsTransport {
             }
             let (done_tx, done_rx) = oneshot::channel::<Result<Response>>();
             let spawn_handle = handle.clone();
+            // The per-request deadline wins over the configured one
+            // (None on the request keeps the config).
+            let timeout_ms = req.timeout_ms.or(timeout_ms);
+            let follow_redirects = req.follow_redirects.unwrap_or(true);
             handle.spawn(async move {
-                let _ =
-                    done_tx.send(run_execute(client, req, cancel, spawn_handle, timeout_ms).await);
+                let _ = done_tx.send(
+                    run_execute(
+                        client,
+                        req,
+                        cancel,
+                        spawn_handle,
+                        timeout_ms,
+                        follow_redirects,
+                    )
+                    .await,
+                );
             });
             done_rx
                 .await
@@ -169,6 +182,7 @@ async fn run_execute(
     cancel: CancelToken,
     handle: tokio::runtime::Handle,
     timeout_ms: Option<u64>,
+    follow_redirects: bool,
 ) -> Result<Response> {
     let mut url = req.url;
     let mut method = req.method;
@@ -208,9 +222,10 @@ async fn run_execute(
         // 301/302/303 switch to GET, dropping the body; 307/308 preserve
         // the method but a consumed stream cannot be replayed, so bodied
         // methods get the 3xx response delivered instead of a doomed
-        // retry. Authorization never crosses an origin change.
+        // retry. Authorization never crosses an origin change. A
+        // per-request `follow_redirects: false` delivers the 3xx itself.
         let status = response.status();
-        if ![301u16, 302, 303, 307, 308].contains(&status.as_u16()) {
+        if !follow_redirects || ![301u16, 302, 303, 307, 308].contains(&status.as_u16()) {
             return Ok(into_response(response, &handle, cancel));
         }
         let Some(location) = response

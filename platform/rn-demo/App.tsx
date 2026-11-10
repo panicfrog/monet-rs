@@ -238,6 +238,43 @@ const CHECKS: Array<{
     },
   },
   {
+    name: 'http:per_request_timeout',
+    run: async base => {
+      // The per-request deadline fires: /slow-head answers after 500ms,
+      // the request asks for 100ms.
+      try {
+        await fetch(`${base}/slow-head`, {timeoutMs: 100});
+      } catch (error) {
+        assert(
+          error instanceof MonetError && error.kind === 'Transport',
+          error instanceof MonetError
+            ? `expected kind Transport, got ${error.kind}: ${error.message}`
+            : `expected MonetError, got ${String(error)}`,
+        );
+        return;
+      }
+      throw new Error('a 100ms deadline against a 500ms head resolved');
+    },
+  },
+  {
+    name: 'http:per_request_no_follow',
+    run: async base => {
+      // followRedirects: false delivers the 3xx itself — status and
+      // location readable, no second hop.
+      const response = await fetch(`${base}/redirect`, {
+        followRedirects: false,
+      });
+      assert(
+        response.status === 302,
+        `status ${response.status}, expected 302 — the redirect was followed`,
+      );
+      assert(
+        response.headers.get('location') === '/redirect-final',
+        `location ${JSON.stringify(response.headers.get('location'))}`,
+      );
+    },
+  },
+  {
     name: 'http:connection_refused',
     run: async _base => {
       try {

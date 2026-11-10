@@ -55,7 +55,7 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(Registry::default);
 /// Cancels the native request for `id` if one is armed. The closure is
 /// cloned out of the lock first — it re-enters the JVM, which may in
 /// turn fire callbacks into the registry.
-fn cancel_native(id: u64) {
+pub(crate) fn cancel_native(id: u64) {
     let cancel = {
         let states = REGISTRY.states.lock().unwrap();
         states

@@ -17,6 +17,7 @@ fn http_timeout_conformance() {
     let transport = UrlsessionTransport::new().with_timeout_ms(100);
     let server = http::HttpServer::spawn();
     http::timeout_maps_to_transport_error(&transport, &server);
+    http::per_request_timeout_longer_wins(&transport, &server);
 }
 
 #[test]

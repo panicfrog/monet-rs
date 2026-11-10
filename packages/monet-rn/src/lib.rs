@@ -128,9 +128,9 @@ pub struct FetchOptions {
     /// tag that strings a series of requests together.
     #[serde(default)]
     pub metadata: Vec<HeaderKV>,
-    /// v1 records these for forward compatibility; the runtime applies
-    /// the client-level configuration only (per-request lands with the
-    /// core-level timeout/redirect knob).
+    /// The per-request knobs (v2/W1): 0 / true keep the transport's
+    /// default; anything else rides the core Request's Option overrides
+    /// and wins over configured values.
     pub timeout_ms: f64,
     pub follow_redirects: bool,
 }
@@ -743,6 +743,14 @@ fn build_request(options: &FetchOptions, body: &Option<Vec<u8>>) -> monet_core::
         // A clone per attempt: from_bytes consumes, and a retry rebuilds
         // the request from these bytes.
         request.body = monet_core::body::Body::from_bytes(bytes.clone());
+    }
+    // The per-request knobs (0 / true = keep the transport default —
+    // the fields ride the core Request's Option overrides).
+    if options.timeout_ms > 0.0 {
+        request.timeout_ms = Some(options.timeout_ms as u64);
+    }
+    if !options.follow_redirects {
+        request.follow_redirects = Some(false);
     }
     Ok(request)
 }

@@ -397,25 +397,48 @@ pub fn execute(
         let request = setup_and_start(&engine, id, &req, body).inspect_err(|_| {
             registry::remove(id);
         })?;
+        let req_timeout_ms = req.timeout_ms.map(std::time::Duration::from_millis);
 
         // Cancellation any time after start maps to UrlRequest.cancel().
         registry::arm_native_cancel(id, request_cancel(request));
 
+        // The per-request head deadline (Cronet has no timeout API —
+        // the deadline races the head here and fires the native cancel).
+        let deadline = req_timeout_ms.map(futures_timer::Delay::new);
         enum Step<T> {
             Head(T),
             Cancelled,
+            TimedOut,
         }
-        match futures_lite::future::race(async { Step::Head(head_rx.await) }, async {
-            cancel.cancelled().await;
-            Step::Cancelled
-        })
-        .await
-        {
+        let head = async { Step::Head(head_rx.await) };
+        let early = async {
+            futures_lite::future::race(
+                async {
+                    cancel.cancelled().await;
+                    Step::Cancelled
+                },
+                async {
+                    match deadline {
+                        Some(mut delay) => {
+                            delay.await;
+                            Step::TimedOut
+                        }
+                        None => std::future::pending().await,
+                    }
+                },
+            )
+            .await
+        };
+        match futures_lite::future::race(head, early).await {
             Step::Head(Ok(response)) => response,
             Step::Head(Err(_)) => Err(Error::transport(
                 "httpengine: request state dropped before the response head",
             )),
             Step::Cancelled => Err(Error::Cancelled),
+            Step::TimedOut => {
+                registry::cancel_native(id);
+                Err(Error::transport("httpengine: response head timed out"))
+            }
         }
     })
 }
@@ -428,6 +451,11 @@ fn setup_and_start(
     req: &Request,
     body: Vec<u8>,
 ) -> Result<Global<JObject<'static>>> {
+    // The per-request no-follow policy rides the bridge's redirect
+    // callback (the platform builder has no redirect knob).
+    if req.follow_redirects == Some(false) {
+        bridge::mark_no_follow(id);
+    }
     let globals = GLOBALS
         .get()
         .ok_or_else(|| Error::transport("httpengine: init(vm, context) must run first"))?;

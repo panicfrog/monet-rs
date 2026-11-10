@@ -574,6 +574,67 @@ pub fn redirect_followed_by_default(t: &dyn Transport, server: &HttpServer) {
     assert_eq!(server.seen_for("/redirect-final").method, "GET");
 }
 
+/// A per-request deadline shorter than the (unconfigured) default must
+/// fire: `/slow-head` answers after 500ms, the request asks for 100ms.
+/// Run this with a transport that has no timeout configured — the
+/// request's own value is the only deadline in play.
+pub fn per_request_timeout_shorter_wins(t: &dyn Transport, server: &HttpServer) {
+    let request = get(server.url("/slow-head")).with_timeout_ms(100);
+    let err = wait_for(
+        "per-request timeout outcome",
+        t.execute(request, CancelToken::new()),
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::Transport { .. }), "got: {err:?}");
+}
+
+/// A per-request deadline longer than the configured one must win: the
+/// transport is configured for 100ms, the request asks for 5000ms, and
+/// `/slow-head` (answering after 500ms) resolves in full. Run this
+/// with a timeout-configured instance (the same one
+/// [`timeout_maps_to_transport_error`] uses).
+pub fn per_request_timeout_longer_wins(t: &dyn Transport, server: &HttpServer) {
+    let request = get(server.url("/slow-head")).with_timeout_ms(5000);
+    let response = wait_for(
+        "per-request extended deadline",
+        t.execute(request, CancelToken::new()),
+    )
+    .unwrap();
+    assert_eq!(response.status, 200, "the configured timeout fired instead");
+    let body = wait_for(
+        "late head body",
+        response.body.map(|c| c.unwrap()).collect::<Vec<_>>(),
+    );
+    assert_eq!(body.concat(), b"late head".to_vec());
+}
+
+/// A per-request `follow_redirects: false` delivers the 3xx itself:
+/// status 302 with the location header readable, no second hop.
+pub fn per_request_no_follow_delivers_redirect(t: &dyn Transport, server: &HttpServer) {
+    let request = get(server.url("/redirect")).with_follow_redirects(false);
+    let response = wait_for(
+        "no-follow redirect outcome",
+        t.execute(request, CancelToken::new()),
+    )
+    .unwrap();
+    assert_eq!(response.status, 302, "the redirect was followed");
+    let location = response
+        .headers
+        .get("location")
+        .expect("the 3xx carries its location header");
+    assert_eq!(location, "/redirect-final");
+    // The redirect-final hop never happened.
+    assert_eq!(server.seen_for("/redirect").method, "GET");
+    let seen_final = server.seen.lock().unwrap();
+    assert!(
+        !seen_final
+            .backlog
+            .iter()
+            .any(|seen| seen.uri == "/redirect-final"),
+        "the no-follow request still made the second hop"
+    );
+}
+
 /// A token cancelled before `execute` fails fast without touching the
 /// network.
 pub fn pre_cancelled_fails_fast(t: &dyn Transport, server: &HttpServer) {
@@ -731,6 +792,8 @@ pub fn slow_upload_does_not_block_new_requests(t: &dyn Transport, server: &HttpS
 /// instance but takes no server; `timeout…` needs a timeout-configured
 /// instance).
 pub fn run_suite(t: &dyn Transport, server: &HttpServer) {
+    per_request_timeout_shorter_wins(t, server);
+    per_request_no_follow_delivers_redirect(t, server);
     get_plain_body(t, server);
     get_chunked_content(t, server);
     post_reaches_server(t, server);

@@ -98,8 +98,11 @@ impl Default for UrlsessionTransport {
 
 impl Transport for UrlsessionTransport {
     fn execute(&self, req: Request, cancel: CancelToken) -> BoxFuture<Result<Response>> {
-        let follow_redirects = self.follow_redirects;
-        let timeout_ms = self.timeout_ms;
+        // Per-request overrides win; the instance values are the
+        // defaults (nitro's per-request-only knobs ride the same
+        // per-call control-plane parameters).
+        let follow_redirects = req.follow_redirects.unwrap_or(self.follow_redirects);
+        let timeout_ms = req.timeout_ms.unwrap_or(self.timeout_ms);
         Box::pin(async move {
             if cancel.is_cancelled() {
                 return Err(Error::Cancelled);
