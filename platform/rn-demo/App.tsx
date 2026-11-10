@@ -725,8 +725,12 @@ async function leafSpki(base: string): Promise<string> {
  * the check independent of a device-level CA install: the very surface
  * configureTrust exists for. The CA is fetched over plain http —
  * fetching it over TLS would need the trust it carries. */
-async function withBatteryCa(fn: () => Promise<void>): Promise<void> {
-  const response = await fetch(`${DEFAULT_BASE}/ca`);
+async function withBatteryCa(base: string, fn: () => Promise<void>): Promise<void> {
+  // The plain-battery twin of the TLS base (same host, the plain port):
+  // derived, not defaulted — on a real device the platform constant
+  // (127.0.0.1 / 10.0.2.2) is the device itself, unreachable.
+  const plainBase = `http://${new URL(base).hostname}:8964`;
+  const response = await fetch(`${plainBase}/ca`);
   assert(
     response.status === 200,
     `/ca answered ${response.status} — is the battery server's TLS pair up?`,
@@ -822,7 +826,7 @@ const TLS_CHECKS: Array<{
       const hash = await leafSpki(base);
       const perturbed = (hash.startsWith('A') ? 'B' : 'A') + hash.slice(1);
       const host = new URL(base).hostname;
-      await withBatteryCa(async () => {
+      await withBatteryCa(base, async () => {
         try {
           configurePins(JSON.stringify({[host]: {publicKeyHashes: [perturbed]}}));
           const ws = new MonetWebSocket(`${tlsWssBase(base)}/echo`);
@@ -853,7 +857,7 @@ const TLS_CHECKS: Array<{
       // The WS trust path over TLS with no pins: the wss handshake
       // validates against the configured roots (configureTrust) or the
       // device's trust store — whichever carries the battery CA.
-      await withBatteryCa(async () => {
+      await withBatteryCa(base, async () => {
         const ws = new MonetWebSocket(`${tlsWssBase(base)}/echo`);
         try {
           await waitForOpen(ws);
@@ -879,7 +883,7 @@ const TLS_CHECKS: Array<{
       // the platform store can't see the CA.
       const hash = await leafSpki(base);
       const host = new URL(base).hostname;
-      await withBatteryCa(async () => {
+      await withBatteryCa(base, async () => {
         try {
           configurePins(JSON.stringify({[host]: {publicKeyHashes: [hash]}}));
           const ws = new MonetWebSocket(`${tlsWssBase(base)}/echo`);

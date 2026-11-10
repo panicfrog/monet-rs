@@ -41,7 +41,10 @@ pub struct TrustConfig {
 
 /// The rustls trust for the configured roots: the platform store plus
 /// the app's own anchors (network_security_config semantics), or the
-/// bare platform store when none are configured.
+/// bare platform store when none are configured. Android only — the
+/// Apple stacks take pins and roots through the Swift shim, not
+/// monet-tls.
+#[cfg(target_os = "android")]
 fn rustls_trust(roots: &[Vec<u8>]) -> monet_tls::TlsTrust {
     if roots.is_empty() {
         monet_tls::TlsTrust::PlatformVerifier
