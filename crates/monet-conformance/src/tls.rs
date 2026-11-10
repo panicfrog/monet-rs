@@ -132,9 +132,7 @@ pub fn spawn_https_on(ca: &LocalCa, bind: &str) -> HttpServer {
     // configureTrust — the Rust stacks (monet-ws, the rustls fallback)
     // cannot see the network_security_config anchor the platform stacks
     // read.
-    crate::http::set_tls_ca(
-        base64::engine::general_purpose::STANDARD.encode(ca.der()),
-    );
+    crate::http::set_tls_ca(base64::engine::general_purpose::STANDARD.encode(ca.der()));
     // Every response closes its connection: a pooled TLS connection
     // performs no handshake, so the server-trust challenge (and with it
     // pin evaluation) would fire only for the first fetch to a host.

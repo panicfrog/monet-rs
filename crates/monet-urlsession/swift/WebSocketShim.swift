@@ -329,12 +329,15 @@ final class WebSocketConnection {
         return
       }
     }
-    if !parsed.extensions.isEmpty {
-      finish(
-        code: 0, reason: "", wasClean: false,
-        error: "there was a bad response from the server")
-      return
-    }
+    // Sec-WebSocket-Extensions in the response is deliberately NOT
+    // rejected here even though we never offer any (RFC 6455 §4.1 step
+    // 5 says fail): tungstenite — the other WS implementation this
+    // transport mirrors — implements that step as an upstream TODO and
+    // accepts the handshake. Consistency wins (the conformance check
+    // `unrequested_deflate_offer_round_trips` pins this on both
+    // engines); the framing stays plain either way, and the day
+    // tungstenite lands step 5, that check trips and both sides
+    // tighten together.
 
     open = true
     cancelTimer()

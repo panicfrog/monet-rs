@@ -27,6 +27,10 @@ enum Script {
     ServerClose(u16, &'static str),
     /// Send a ping, wait for the client's pong, then report it.
     PingThenReport,
+    /// Include permessage-deflate in the 101 response — an extension
+    /// the client never offered — then mirror like Echo. What the
+    /// client does with it is the check's question.
+    OfferDeflate,
 }
 
 /// What the server observed.
@@ -85,6 +89,7 @@ async fn serve_scripted(
     // Negotiate the subprotocol like a well-behaved server: strict
     // clients (tungstenite) fail the handshake if a protocol was
     // requested but none is selected in the response.
+    let offer_deflate = matches!(script, Script::OfferDeflate);
     let mut ws = tokio_tungstenite::accept_hdr_async(
         stream,
         |request: &tokio_tungstenite::tungstenite::http::Request<()>,
@@ -99,13 +104,23 @@ async fn serve_scripted(
                     .headers_mut()
                     .insert("sec-websocket-protocol", "chat".parse().unwrap());
             }
+            if offer_deflate {
+                // The battery's permessage-deflate scenario: the server
+                // "accepts" an extension the client never offered (ours
+                // never offer it — neither implementation supports
+                // compression in v1).
+                response.headers_mut().insert(
+                    "sec-websocket-extensions",
+                    "permessage-deflate".parse().unwrap(),
+                );
+            }
             Ok(response)
         },
     )
     .await?;
     let _ = seen_tx.send(Seen::Connected);
     match script {
-        Script::Echo => {
+        Script::Echo | Script::OfferDeflate => {
             while let Some(Ok(message)) = ws.next().await {
                 match message {
                     Message::Text(text) => {
@@ -456,6 +471,30 @@ pub fn pre_cancelled_fails_fast(t: &dyn WebSocketTransport) {
     assert!(matches!(err, Error::Cancelled), "got: {err:?}");
 }
 
+/// A server that includes permessage-deflate in its 101 — an extension
+/// the client never offered. RFC 6455 §4.1 step 5 says the client MUST
+/// fail the connection; tungstenite (monet-ws's engine) implements that
+/// step as an upstream TODO, so strictness is unenforceable on one side.
+/// The battery therefore pins the **consistent** v1 behavior: every
+/// implementation completes the handshake and round-trips a message in
+/// plain framing — the connection is uncompressed regardless of the
+/// lying header. This check is the tripwire: the day tungstenite lands
+/// step 5, it fails here first, and both sides tighten together.
+pub fn unrequested_deflate_offer_round_trips(t: &dyn WebSocketTransport) {
+    let (url, seen) = spawn_server(Script::OfferDeflate, 1);
+    let mut stream = connect(t, &url);
+    stream
+        .send(WsMessage::Text("uncompressed hello".into()))
+        .unwrap();
+    let echoed = wait_for("deflate-offer echo", stream.next_message()).unwrap();
+    assert_eq!(
+        echoed,
+        Some(WsMessage::Text("uncompressed hello".into())),
+        "the round-trip broke: the client treated the extension offer as real"
+    );
+    seen_connected(&seen);
+}
+
 /// A refused connection maps to a transport error.
 pub fn connection_refused_maps_to_transport_error(t: &dyn WebSocketTransport) {
     let url = Url::parse("ws://127.0.0.1:1/socket").unwrap();
@@ -469,6 +508,7 @@ pub fn connection_refused_maps_to_transport_error(t: &dyn WebSocketTransport) {
 /// (`client_close_reaches_server`, `ping_surfaced_and_auto_ponged`)
 /// spawn their own servers and are called separately.
 pub fn run_suite(t: &dyn WebSocketTransport) {
+    unrequested_deflate_offer_round_trips(t);
     text_and_binary_round_trip(t);
     server_close_code_and_reason_round_trip_exactly(t);
     pre_cancelled_fails_fast(t);
