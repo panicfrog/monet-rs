@@ -413,7 +413,6 @@ impl Monet {
             .map_err(|e| anyhow::anyhow!("invalid URL: {e}"))?;
 
         let (fetch_id, cancel) = self.fetches.allocate();
-        let fetches = self.fetches.clone();
         let on_head = Arc::new(on_head);
         let on_chunk = Arc::new(on_chunk);
         let on_done = Arc::new(on_done);
@@ -425,138 +424,105 @@ impl Monet {
         // fetches. The Arc clone keeps it alive until this pump ends.
         let transport = self.transport.read().unwrap().clone();
         let hooks = self.hook_snapshot();
-        async_global_executor::spawn(async move {
-            // Hold one Arc for the pump's lifetime: a pin-config rebuild
-            // swaps the module's transport, and the old engine's
-            // shutdown() must wait until this pump is done with it. The
-            // original stays usable for the per-attempt executes.
-            let _keep_engine = transport.clone();
-
-            let mut attempt: u32 = 0;
-            // The fetch's pairing key: stable across retries, carried in
-            // the request extensions and threaded to the response, so
-            // the request-phase and response-phase events of this fetch
-            // report the same correlationId (and Rust-native hooks can
-            // stash their own state the same way).
-            let correlation_id = crate::hooks::next_correlation_id();
-            let response = loop {
-                let mut request = match build_request(&options, &body_bytes) {
-                    Ok(request) => request,
-                    Err(error) => {
-                        fetches.finish(fetch_id);
-                        on_error.call(ErrorEvent::from(error));
-                        return;
-                    }
-                };
-                request.extensions.insert(hooks::HookAttempt(attempt));
-                request
-                    .extensions
-                    .insert(hooks::CorrelationId(correlation_id));
-                request
-                    .extensions
-                    .insert(crate::hooks::metadata_bag(&options.metadata));
-
-                // Request hooks, raced with the cancel token — a stuck
-                // JS hook must not outlive the fetch's abort.
-                match race_cancel(hooks.run_request_hooks(request), &cancel).await {
-                    RaceOutcome::Done(Ok(mut request)) => {
-                        let transport = transport.clone();
-                        let hooks = hooks.clone();
-                        let cancel_for_execute = cancel.clone();
-                        match race_cancel(
-                            // Response hooks wrap the transport result:
-                            // they see the head before on_head delivers
-                            // it. The request's extensions travel with it
-                            // (no transport reads them — nothing on the
-                            // wire changes).
-                            async move {
-                                let extensions = std::mem::take(&mut request.extensions);
-                                let mut response =
-                                    transport.execute(request, cancel_for_execute).await?;
-                                response.extensions = extensions;
-                                hooks.run_response_hooks(response).await
-                            },
-                            &cancel,
-                        )
-                        .await
-                        {
-                            RaceOutcome::Done(Ok(response)) => break response,
-                            RaceOutcome::Done(Err(error)) => {
-                                if crate::hooks::is_hook_retry(&error) && attempt < MAX_HOOK_RETRIES
-                                {
-                                    // The response hook asked for a retry:
-                                    // rebuild from the original inputs and
-                                    // run the whole pipeline again. The
-                                    // aborted attempt's body is dropped
-                                    // with it.
-                                    attempt += 1;
-                                    continue;
-                                }
-                                fetches.finish(fetch_id);
-                                on_error.call(ErrorEvent::from(error));
-                                return;
-                            }
-                            RaceOutcome::Cancelled => {
-                                fetches.finish(fetch_id);
-                                on_error.call(ErrorEvent::from(monet_core::Error::Cancelled));
-                                return;
-                            }
-                        }
-                    }
-                    RaceOutcome::Done(Err(error)) => {
-                        fetches.finish(fetch_id);
-                        on_error.call(ErrorEvent::from(error));
-                        return;
-                    }
-                    RaceOutcome::Cancelled => {
-                        fetches.finish(fetch_id);
-                        on_error.call(ErrorEvent::from(monet_core::Error::Cancelled));
-                        return;
-                    }
-                }
-            };
-
-            let status = f64::from(response.status);
-            let headers = response
-                .headers
-                .iter_flattened()
-                .map(|(name, value)| HeaderKV {
-                    name: name.to_string(),
-                    value: value.to_string(),
-                })
-                .collect();
-            on_head.call(HeadEvent { status, headers });
-
-            use futures_lite::StreamExt;
-            let mut body = response.body;
-            let mut failure: Option<monet_core::Error> = None;
-            while let Some(chunk) = body.next().await {
-                match chunk {
-                    Ok(bytes) => {
-                        if fetches.push_chunk(fetch_id, bytes.to_vec()) {
-                            on_chunk.call_with_no_args();
-                        } else {
-                            // State gone (cleanup after terminal):
-                            // stop pulling.
-                            return;
-                        }
-                    }
-                    Err(error) => {
-                        failure = Some(error);
-                        break;
-                    }
-                }
-            }
-            fetches.finish(fetch_id);
-            match failure {
-                None => on_done.call_with_no_args(),
-                Some(error) => on_error.call(ErrorEvent::from(error)),
-            }
-        })
-        .detach();
+        spawn_fetch_pump(
+            self.fetches.clone(),
+            transport,
+            hooks,
+            fetch_id,
+            cancel,
+            options,
+            PumpBody::Buffered(body_bytes),
+            on_head,
+            on_chunk,
+            on_done,
+            on_error,
+        );
 
         Ok(fetch_id)
     }
+
+    /// Starts a fetch whose request body is STREAMED from JS: the body
+    /// rides a core channel whose sending half the JS producer feeds
+    /// through [`Monet::fetch_stream_chunk`] and closes with
+    /// [`Monet::fetch_stream_complete`] (or
+    /// [`Monet::fetch_stream_error`]). The transport streams it to the
+    /// wire as chunks arrive (on the rustls stack; the buffered stacks
+    /// collect it — see the v2 plan's W2 carve-outs). A response-hook
+    /// retry cannot replay a consumed stream: the fetch fails with an
+    /// explicit error instead of silently re-sending an empty body.
+    pub fn fetch_stream(
+        &self,
+        options: FetchOptions,
+        on_head: jsi_turbo::TurboCallback,
+        on_chunk: jsi_turbo::TurboCallback,
+        on_done: jsi_turbo::TurboCallback,
+        on_error: jsi_turbo::TurboCallback,
+    ) -> anyhow::Result<f64> {
+        // Same fail-fast contract as fetch: malformed inputs throw
+        // synchronously instead of surfacing through on_error.
+        let _ = options
+            .url
+            .parse::<monet_core::Url>()
+            .map_err(|e| anyhow::anyhow!("invalid URL: {e}"))?;
+
+        let (fetch_id, cancel) = self.fetches.allocate();
+        // The receiving half rides the request; the JS producer holds
+        // the sending half through the module methods.
+        let (body, feed) = monet_core::body::channel();
+        self.fetches.attach_stream_feed(fetch_id, feed);
+        let on_head = Arc::new(on_head);
+        let on_chunk = Arc::new(on_chunk);
+        let on_done = Arc::new(on_done);
+        let on_error = Arc::new(on_error);
+        let transport = self.transport.read().unwrap().clone();
+        let hooks = self.hook_snapshot();
+        spawn_fetch_pump(
+            self.fetches.clone(),
+            transport,
+            hooks,
+            fetch_id,
+            cancel,
+            options,
+            PumpBody::Stream(Some(body)),
+            on_head,
+            on_chunk,
+            on_done,
+            on_error,
+        );
+
+        Ok(fetch_id)
+    }
+
+    /// Pushes one producer chunk into a streaming body.
+    pub fn fetch_stream_chunk<'rt>(
+        &self,
+        rt: &mut RuntimeHandle<'rt>,
+        id: f64,
+        chunk: jsi::JsiArrayBuffer<'rt>,
+    ) -> anyhow::Result<()> {
+        let bytes = chunk.data(rt).to_vec();
+        if !self.fetches.stream_chunk(id, bytes) {
+            anyhow::bail!("no streaming body for fetch {id} (completed, errored, or cleaned up)");
+        }
+        Ok(())
+    }
+
+    /// Ends a streaming body successfully: the request's upload
+    /// completes with everything pushed so far.
+    pub fn fetch_stream_complete(&self, id: f64) -> anyhow::Result<()> {
+        let _ = self.fetches.stream_complete(id);
+        Ok(())
+    }
+
+    /// Ends a streaming body with an error (the JS producer threw):
+    /// the upload aborts and the fetch fails.
+    pub fn fetch_stream_error(&self, id: f64, message: String) -> anyhow::Result<()> {
+        let _ = self
+            .fetches
+            .stream_error(id, monet_core::Error::transport(message));
+        Ok(())
+    }
+
 
     /// Takes one queued chunk (zero-copy into a JS ArrayBuffer).
     /// `None` means the queue is empty — check `body_done` to tell "no
@@ -722,6 +688,188 @@ fn der_from_pem_or_base64(input: &str) -> anyhow::Result<Vec<u8>> {
 /// attempt — a retry must re-run from the original request, and a `Body`
 /// is a stream that cannot be cloned, so the buffered upload bytes stay
 /// with the pump.
+/// The fetch pump shared by both entry points ([`Monet::fetch`] for
+/// buffered bodies, [`Monet::fetch_stream`] for streamed ones): the full
+/// hook pipeline per attempt, then head + chunked body delivery over the
+/// registry.
+#[allow(clippy::too_many_arguments)]
+fn spawn_fetch_pump(
+    fetches: FetchRegistry,
+    transport: Arc<dyn monet_core::Transport>,
+    hooks: HookRegistry,
+    fetch_id: f64,
+    cancel: monet_core::CancelToken,
+    options: FetchOptions,
+    mut body: PumpBody,
+    on_head: Arc<jsi_turbo::TurboCallback>,
+    on_chunk: Arc<jsi_turbo::TurboCallback>,
+    on_done: Arc<jsi_turbo::TurboCallback>,
+    on_error: Arc<jsi_turbo::TurboCallback>,
+) {
+    async_global_executor::spawn(async move {
+            // Hold one Arc for the pump's lifetime: a pin-config rebuild
+            // swaps the module's transport, and the old engine's
+            // shutdown() must wait until this pump is done with it. The
+            // original stays usable for the per-attempt executes.
+            let _keep_engine = transport.clone();
+
+            let mut attempt: u32 = 0;
+            // The fetch's pairing key: stable across retries, carried in
+            // the request extensions and threaded to the response, so
+            // the request-phase and response-phase events of this fetch
+            // report the same correlationId (and Rust-native hooks can
+            // stash their own state the same way).
+            let correlation_id = crate::hooks::next_correlation_id();
+            let response = loop {
+                let mut request = match &mut body {
+                    PumpBody::Buffered(bytes) => build_request(&options, bytes),
+                    // The stream was consumed by the first attempt; a
+                    // hook-driven retry cannot replay it.
+                    PumpBody::Stream(slot) => match slot.take() {
+                        Some(stream) => build_request_streaming(&options, stream),
+                        None => Err(monet_core::Error::transport(
+                            "monet-rn: a streamed body cannot be retried — the stream was consumed by the first attempt",
+                        )),
+                    },
+                };
+                let mut request = match request {
+                    Ok(request) => request,
+                    Err(error) => {
+                        fetches.finish(fetch_id);
+                        on_error.call(ErrorEvent::from(error));
+                        return;
+                    }
+                };
+                request.extensions.insert(hooks::HookAttempt(attempt));
+                request
+                    .extensions
+                    .insert(hooks::CorrelationId(correlation_id));
+                request
+                    .extensions
+                    .insert(crate::hooks::metadata_bag(&options.metadata));
+
+                // Request hooks, raced with the cancel token — a stuck
+                // JS hook must not outlive the fetch's abort.
+                match race_cancel(hooks.run_request_hooks(request), &cancel).await {
+                    RaceOutcome::Done(Ok(mut request)) => {
+                        let transport = transport.clone();
+                        let hooks = hooks.clone();
+                        let cancel_for_execute = cancel.clone();
+                        match race_cancel(
+                            // Response hooks wrap the transport result:
+                            // they see the head before on_head delivers
+                            // it. The request's extensions travel with it
+                            // (no transport reads them — nothing on the
+                            // wire changes).
+                            async move {
+                                let extensions = std::mem::take(&mut request.extensions);
+                                let mut response =
+                                    transport.execute(request, cancel_for_execute).await?;
+                                response.extensions = extensions;
+                                hooks.run_response_hooks(response).await
+                            },
+                            &cancel,
+                        )
+                        .await
+                        {
+                            RaceOutcome::Done(Ok(response)) => break response,
+                            RaceOutcome::Done(Err(error)) => {
+                                if crate::hooks::is_hook_retry(&error) && attempt < MAX_HOOK_RETRIES
+                                {
+                                    // The response hook asked for a retry:
+                                    // rebuild from the original inputs and
+                                    // run the whole pipeline again. The
+                                    // aborted attempt's body is dropped
+                                    // with it.
+                                    attempt += 1;
+                                    continue;
+                                }
+                                fetches.finish(fetch_id);
+                                on_error.call(ErrorEvent::from(error));
+                                return;
+                            }
+                            RaceOutcome::Cancelled => {
+                                fetches.finish(fetch_id);
+                                on_error.call(ErrorEvent::from(monet_core::Error::Cancelled));
+                                return;
+                            }
+                        }
+                    }
+                    RaceOutcome::Done(Err(error)) => {
+                        fetches.finish(fetch_id);
+                        on_error.call(ErrorEvent::from(error));
+                        return;
+                    }
+                    RaceOutcome::Cancelled => {
+                        fetches.finish(fetch_id);
+                        on_error.call(ErrorEvent::from(monet_core::Error::Cancelled));
+                        return;
+                    }
+                }
+            };
+
+            let status = f64::from(response.status);
+            let headers = response
+                .headers
+                .iter_flattened()
+                .map(|(name, value)| HeaderKV {
+                    name: name.to_string(),
+                    value: value.to_string(),
+                })
+                .collect();
+            on_head.call(HeadEvent { status, headers });
+
+            use futures_lite::StreamExt;
+            let mut body = response.body;
+            let mut failure: Option<monet_core::Error> = None;
+            while let Some(chunk) = body.next().await {
+                match chunk {
+                    Ok(bytes) => {
+                        if fetches.push_chunk(fetch_id, bytes.to_vec()) {
+                            on_chunk.call_with_no_args();
+                        } else {
+                            // State gone (cleanup after terminal):
+                            // stop pulling.
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
+                    }
+                }
+            }
+            fetches.finish(fetch_id);
+            match failure {
+                None => on_done.call_with_no_args(),
+                Some(error) => on_error.call(ErrorEvent::from(error)),
+            }
+        })
+        .detach();
+}
+
+/// The pump's request body source.
+enum PumpBody {
+    /// Buffered bytes: cloned per attempt, so a hook-driven retry
+    /// rebuilds the request from them.
+    Buffered(Option<Vec<u8>>),
+    /// A streamed upload ([`Monet::fetch_stream`]): the channel's
+    /// receiving half, consumed by the first attempt — a retry cannot
+    /// replay it and fails the fetch with an explicit error.
+    Stream(Option<monet_core::body::Body>),
+}
+
+/// [`build_request`] with a streaming body: the channel rides the
+/// request as-is; the transport polls it chunk by chunk.
+fn build_request_streaming(
+    options: &FetchOptions,
+    body: monet_core::body::Body,
+) -> monet_core::Result<Request> {
+    let mut request = build_request(options, &None)?;
+    request.body = body;
+    Ok(request)
+}
+
 fn build_request(options: &FetchOptions, body: &Option<Vec<u8>>) -> monet_core::Result<Request> {
     // `FromStr::Err` is `Infallible`; unknown verbs land in `Method::Other`.
     let method = options

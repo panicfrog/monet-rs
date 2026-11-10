@@ -35,6 +35,11 @@ pub struct FetchRegistry {
 struct Inner {
     next_id: AtomicU64,
     states: Mutex<HashMap<u64, FetchState>>,
+    /// The upload feeds of streaming-body fetches (fetch_stream): JS
+    /// pushes chunks through the module methods; the pump's request
+    /// carries the receiving half. Dropped by completion, error, and
+    /// the fetch's terminal cleanup alike.
+    stream_feeds: Mutex<HashMap<u64, monet_core::body::BodySender>>,
 }
 
 impl FetchRegistry {
@@ -43,6 +48,7 @@ impl FetchRegistry {
             inner: Arc::new(Inner {
                 next_id: AtomicU64::new(0),
                 states: Mutex::new(HashMap::new()),
+                stream_feeds: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -127,6 +133,59 @@ impl FetchRegistry {
     /// Idempotent; late events on the id are ignored afterwards.
     pub fn cleanup(&self, id: f64) {
         self.inner.states.lock().unwrap().remove(&f64_to_u64(id));
+    }
+
+    /// ---- streaming uploads (fetch_stream) ----
+
+    /// Stores the sending half of a streaming body; the pump carries the
+    /// receiving half in its request.
+    pub(crate) fn attach_stream_feed(
+        &self,
+        id: f64,
+        feed: monet_core::body::BodySender,
+    ) {
+        self.inner
+            .stream_feeds
+            .lock()
+            .unwrap()
+            .insert(f64_to_u64(id), feed);
+    }
+
+    /// Pushes one JS-fed chunk into the upload stream; `false` when the
+    /// feed is gone (already completed, errored, or the fetch cleaned
+    /// up — a late producer chunk is dropped, not fatal).
+    pub(crate) fn stream_chunk(&self, id: f64, chunk: Vec<u8>) -> bool {
+        let feeds = self.inner.stream_feeds.lock().unwrap();
+        match feeds.get(&f64_to_u64(id)) {
+            Some(feed) => feed
+                .send_chunk(chunk)
+                .map_err(|_| ())
+                .is_ok(),
+            None => false,
+        }
+    }
+
+    /// Ends the upload stream successfully; `false` when the feed is
+    /// gone (idempotent-ish: a second complete is a no-op).
+    pub(crate) fn stream_complete(&self, id: f64) -> bool {
+        self.inner
+            .stream_feeds
+            .lock()
+            .unwrap()
+            .remove(&f64_to_u64(id))
+            .is_some()
+    }
+
+    /// Ends the upload stream with an error (the JS producer threw).
+    pub(crate) fn stream_error(&self, id: f64, error: monet_core::Error) -> bool {
+        let mut feeds = self.inner.stream_feeds.lock().unwrap();
+        match feeds.remove(&f64_to_u64(id)) {
+            Some(feed) => {
+                feed.abort(error);
+                true
+            }
+            None => false,
+        }
     }
 }
 

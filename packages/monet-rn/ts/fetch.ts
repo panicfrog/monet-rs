@@ -3,10 +3,12 @@
 //
 //   fetch(url, init) → Promise<MonetResponse>
 //
-// init: { method, headers, body (string | ArrayBuffer), signal
-//         (AbortSignal), timeoutMs, followRedirects } — v1 records the
-//         last two for forward compatibility; the runtime applies the
-//         client-level configuration only.
+// init: { method, headers, body (string | ArrayBuffer |
+//         AsyncIterable<string | ArrayBuffer>), signal (AbortSignal),
+//         timeoutMs, followRedirects }. A streaming body rides a channel
+//         the producer feeds chunk by chunk (fetchStream + friends); a
+//         streamed body cannot be retried by a response hook — the fetch
+//         fails instead of silently re-sending an empty body.
 
 import { getMonet } from '../generated/rust-turbo/Monet';
 import type { FetchOptions } from '../generated/rust-turbo/structs/FetchOptions';
@@ -24,8 +26,9 @@ export interface MonetRequestInit {
     | Record<string, string>
     | ReadonlyArray<readonly [string, string]>
     | ReadonlyArray<{name: string; value: string}>;
-  /** v1 uploads are fully buffered (nitro parity). */
-  body?: string | ArrayBuffer;
+  /** Buffered (string | ArrayBuffer) or streamed (AsyncIterable of
+   *  either) — the streaming form feeds the wire chunk by chunk. */
+  body?: string | ArrayBuffer | AsyncIterable<string | ArrayBuffer>;
   /** Client-side metadata riding the hook/observer events (the flow tag
    *  that strings a series of requests together; never on the wire). */
   metadata?: Record<string, string>;
@@ -94,9 +97,16 @@ export function fetch(
   let body: ArrayBuffer | null = null;
   if (typeof init.body === 'string') {
     body = utf8Encode(init.body);
-  } else if (init.body != null) {
-    body = init.body;
+  } else if (
+    init.body != null &&
+    typeof (init.body as ArrayBuffer).byteLength === 'number'
+  ) {
+    body = init.body as ArrayBuffer;
   }
+  const streamingBody: AsyncIterable<string | ArrayBuffer> | null =
+    init.body != null && body == null
+      ? (init.body as AsyncIterable<string | ArrayBuffer>)
+      : null;
 
   const channel = new BodyChannel();
   let headResolved = false;
@@ -105,9 +115,16 @@ export function fetch(
     // The pump's callbacks are marshalled back to this (JS) thread, so
     // they cannot run before this executor returns — wiring the abort
     // listener after fetch() is race-free.
-    const fetchId = monet.fetch(
-      options,
-      body,
+    const wireCallbacks = (
+      head: (event: HeadEvent) => void,
+      chunk: () => void,
+      done: () => void,
+      error: (event: {kind: string; message: string}) => void,
+    ): number =>
+      streamingBody != null
+        ? monet.fetchStream(options, head, chunk, done, error)
+        : monet.fetch(options, body, head, chunk, done, error);
+    const fetchId = wireCallbacks(
       (head: HeadEvent) => {
         headResolved = true;
         // NOTE: the abort listener stays attached — a signal aborts the
@@ -140,6 +157,21 @@ export function fetch(
         channel.fail(error);
       },
     );
+
+    if (streamingBody != null) {
+      // The producer loop: chunks cross the bridge as they arrive; the
+      // stream ends with complete, a producer error aborts the upload.
+      (async () => {
+        for await (const chunk of streamingBody) {
+          const bytes =
+            typeof chunk === 'string' ? utf8Encode(chunk) : chunk;
+          monet.fetchStreamChunk(fetchId, bytes);
+        }
+        monet.fetchStreamComplete(fetchId);
+      })().catch(producerError => {
+        monet.fetchStreamError(fetchId, String(producerError));
+      });
+    }
 
     const onAbort = () => {
       monet.abort(fetchId);

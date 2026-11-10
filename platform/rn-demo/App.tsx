@@ -275,6 +275,33 @@ const CHECKS: Array<{
     },
   },
   {
+    name: 'http:streaming_upload',
+    run: async base => {
+      // The JS mirror of the Rust slow_upload check: a streaming body
+      // fed slowly — an upload that cannot possibly have finished —
+      // while a second request completes. If the channel serialized
+      // requests, the plain fetch would wait out the feed gap.
+      async function* slowBody(): AsyncGenerator<string> {
+        yield 'part-';
+        await new Promise<void>(resolve => setTimeout(resolve, 150));
+        yield 'two';
+      }
+      const upload = fetch(`${base}/upload`, {
+        method: 'POST',
+        headers: {'content-type': 'application/octet-stream'},
+        body: slowBody(),
+      });
+      // Let the upload reach mid-feed, then prove no head-of-line block.
+      await new Promise<void>(resolve => setTimeout(resolve, 150));
+      const plain = await fetch(`${base}/plain`);
+      assert(plain.status === 200, `plain fetch blocked: ${plain.status}`);
+      const response = await upload;
+      assert(response.status === 200, `status ${response.status}`);
+      const body = await response.text();
+      assert(body === 'uploaded', `body ${JSON.stringify(body)}`);
+    },
+  },
+  {
     name: 'http:connection_refused',
     run: async _base => {
       try {
