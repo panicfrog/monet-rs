@@ -51,5 +51,8 @@ dependencies {
     // loads it through the app classloader (initialized by the native
     // bootstrap). Version-matched to the native crate via the
     // rustls-platform-verifier-android version-sync crate (0.2.0 ↔ 0.7.x).
-    implementation files("libs/rustls-platform-verifier-0.2.0.aar")
+    // Shipped as the extracted classes.jar, not the .aar: the verifier is
+    // pure Kotlin (no resources), and a local .aar dependency breaks this
+    // module's own AAR builds (AGP refuses to package them).
+    implementation files("libs/rustls-platform-verifier-0.2.0.jar")
 }

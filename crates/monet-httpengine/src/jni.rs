@@ -454,7 +454,7 @@ fn setup_and_start(
     // The per-request no-follow policy rides the bridge's redirect
     // callback (the platform builder has no redirect knob).
     if req.follow_redirects == Some(false) {
-        bridge::mark_no_follow(id);
+        crate::bridge::mark_no_follow(id);
     }
     let globals = GLOBALS
         .get()
