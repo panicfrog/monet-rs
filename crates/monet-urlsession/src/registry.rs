@@ -9,7 +9,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::LazyLock;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use futures_channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
@@ -201,7 +201,6 @@ pub(crate) fn on_chunk(id: u64, data: &[u8]) {
         Overflow,
         ConsumerGone,
     }
-    let _ = 0; // (the match arms below stay expression-typed)
     let after = {
         let states = REGISTRY.states.lock().unwrap();
         match states.get(&id) {
@@ -337,12 +336,12 @@ fn map_error(code: i32, message: &[u8]) -> Error {
 /// The body watcher. Once the head is delivered, nothing else polls the
 /// cancel token — no runtime here, unlike monet-rustls's pump task — so
 /// a parked thread (woken by the token's waker) maps a late
-/// cancellation to `transport_cancel`. It also owns the backpressure
-/// machinery (v2/W2b): on a stall it drains the overflow into the
-/// bounded channel at the consumer's pace and resumes the suspended
-/// task; on a staged terminal it drains first, then applies it. The
-/// wake stream ends (and the watcher exits) when the state is removed;
-/// cancel exits it too.
+/// cancellation to `transport_cancel`. It also owns the overflow
+/// machinery (v2/W2b redesign): on a stall it drains the overflow into
+/// the bounded channel at the consumer's pace (the drain IS the pause —
+/// nothing suspends the task); on a staged terminal it drains first,
+/// then applies it. The wake stream ends (and the watcher exits) when
+/// the state is removed; cancel exits it too.
 fn spawn_body_watcher(id: u64, cancel: CancelToken, mut wake_rx: UnboundedReceiver<Wake>) {
     let spawned = std::thread::Builder::new()
         .name("monet-urlsession-body".into())
@@ -404,23 +403,14 @@ fn spawn_body_watcher(id: u64, cancel: CancelToken, mut wake_rx: UnboundedReceiv
                                         bridge::transport_cancel(id);
                                         return;
                                     }
-                                    // A stall wake on a live request: the drain
-                                    // reached empty (this pass delivered the
-                                    // chunks, or a previous pass already did —
-                                    // Some(0) must ALSO attempt the resume: a
-                                    // suspend that landed after that pass's
-                                    // clear, against an opener whose chunk the
-                                    // pass drained, is outstanding with only
-                                    // this wake left to resume it; the Swift
-                                    // count gates the actual resume to
-                                    // one-per-suspend). A cancel was observed:
-                                    // no resume — the task's terminal is on its
-                                    // way (a suspended task's cancel may deliver
-                                    // late).
+                                    // A stall wake on a live request: the
+                                    // drain reached empty — this pass
+                                    // delivered the chunks, or a previous
+                                    // pass already did (the Some(0) case).
+                                    // The drain IS the consumer's pace;
+                                    // nothing was suspended, so there is
+                                    // nothing to resume.
                                     Some(n) if matches!(reason, Wake::Stall) && !cancelled => {
-                                        // The drain IS the consumer's pace
-                                        // (v2/W2b redesign: no task resume —
-                                        // nothing was suspended).
                                         crate::valve_log(&format!(
                                             "WATCH id={id} {reason_tag} drained={n}"
                                         ));

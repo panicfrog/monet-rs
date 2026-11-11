@@ -115,18 +115,17 @@ fn valve_log(line: &str) {
     // calls whose interleaving corrupts (and loses) lines.
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _guard = LOCK.lock().unwrap();
-    if let Ok(home) = std::env::var("HOME") {
-        if let Ok(mut file) = std::fs::OpenOptions::new()
+    if let Ok(home) = std::env::var("HOME")
+        && let Ok(mut file) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(format!("{home}/monet-valve.log"))
-        {
-            let ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0);
-            let _ = file.write_all(format!("{ms} {line}\n").as_bytes());
-        }
+    {
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let _ = file.write_all(format!("{ms} {line}\n").as_bytes());
     }
 }
 

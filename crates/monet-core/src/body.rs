@@ -83,6 +83,19 @@ impl RoomWaiter {
     }
 }
 
+impl Drop for Body {
+    fn drop(&mut self) {
+        if let BodyReceiver::Bounded { room, .. } = &self.receiver {
+            // The consumer is gone: wake a sender parked on the buffer
+            // (it re-probes, sees the closed channel, and exits its
+            // drain). futures-channel did this natively for its own
+            // parked senders; the pair's room notification needs it
+            // spelled out.
+            room.notify_room();
+        }
+    }
+}
+
 impl fmt::Debug for Body {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Body").finish_non_exhaustive()
@@ -487,6 +500,27 @@ mod tests {
         assert!(send.is_err());
     }
 
+    /// A waker that records being woken (std::task::Wake — no unsafe
+    /// boilerplate).
+    struct RecordingWake(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+    impl std::task::Wake for RecordingWake {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn recording_waker() -> (
+        std::task::Waker,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        (
+            std::task::Waker::from(std::sync::Arc::new(RecordingWake(flag.clone()))),
+            flag,
+        )
+    }
+
     #[test]
     fn sync_probes_do_not_erase_the_async_senders_wake() {
         // The regression: a delegate-thread try_send on a full buffer
@@ -505,9 +539,15 @@ mod tests {
             sender.try_send(Bytes::from("probe")),
             Delivery::Full(_)
         ));
-        // The async sender parks (a drain task's view). The boxed form
-        // is Unpin, so block_on can re-poll it after the take.
+        // Park the async sender FIRST — its waker registers against the
+        // full buffer (the boxed form is Unpin, so it can be re-polled).
         let mut send_fut = Box::pin(sender.send(Bytes::from("d")));
+        let (waker, woke) = recording_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(
+            send_fut.as_mut().poll(&mut cx).is_pending(),
+            "the send must park on the full buffer"
+        );
         // The prober's Full probes — the waker-erasing calls.
         for _ in 0..3 {
             assert!(matches!(
@@ -515,14 +555,18 @@ mod tests {
                 Delivery::Full(_)
             ));
         }
-        // The consumer takes one chunk: the parked send must complete.
+        // The consumer takes one chunk: the parked send's waker must
+        // fire (the lost wakeup left it silent) and the send must
+        // complete.
         let mut body = body;
         let first = futures_lite::future::block_on(body.next())
             .unwrap()
             .unwrap();
         assert_eq!(&first[..], b"a");
-        // Drive the send future to completion on a fresh executor view
-        // (block_on re-polls; a lost wake would hang here).
+        assert!(
+            woke.load(std::sync::atomic::Ordering::SeqCst),
+            "the take never woke the parked send"
+        );
         let sent = futures_lite::future::block_on(send_fut.as_mut());
         assert!(sent.is_ok(), "the parked send never completed: {sent:?}");
         // The buffered chunks drain first, then the sent one ("b", "c"
@@ -538,6 +582,29 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(&fourth[..], b"d");
+    }
+
+    #[test]
+    fn dropping_the_receiver_wakes_a_parked_send() {
+        // The vanished-consumer wake: futures-channel unparked its own
+        // senders on disconnect natively; the pair's room notification
+        // needs the receiver's Drop to spell it out. Without it, a
+        // drain parked on a full buffer leaks its thread (and the
+        // registry state behind it) when the consumer walks away.
+        let (body, sender) = bounded(1);
+        assert!(matches!(sender.try_send(Bytes::from("a")), Delivery::Sent));
+        assert!(matches!(sender.try_send(Bytes::from("b")), Delivery::Sent));
+        let mut send_fut = Box::pin(sender.send(Bytes::from("c")));
+        let (waker, woke) = recording_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(send_fut.as_mut().poll(&mut cx).is_pending());
+        drop(body);
+        assert!(
+            woke.load(std::sync::atomic::Ordering::SeqCst),
+            "the drop never woke the parked send"
+        );
+        let sent = futures_lite::future::block_on(send_fut.as_mut());
+        assert!(sent.is_err(), "the send must see the closed channel");
     }
 
     #[test]
