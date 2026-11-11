@@ -40,6 +40,8 @@ import {
   getMonet,
   MonetError,
   MonetWebSocket,
+  MonetExchange,
+  addExchangeRecorder,
   MonetHookRequest,
   MonetHookResponse,
 } from 'monet-rn';
@@ -779,6 +781,78 @@ const CHECKS: Array<{
           body: 'still-real',
         });
         assert(plain.status === 200, `passthrough status ${plain.status}`);
+      } finally {
+        clearHooks();
+      }
+    },
+  },
+  {
+    name: 'http:exchange_record',
+    run: async base => {
+      try {
+        // v2/W3b: one complete record per fetch at its terminal — the
+        // final (post-hook) request, the delivered response, both bodies
+        // (text prefix + full size), duration, and the error when it
+        // failed. A streamed request body has no complete form at any
+        // single point: the record leaves it out.
+        const records: MonetExchange[] = [];
+        addExchangeRecorder(record => {
+          records.push(record);
+        });
+        const echoed = await fetch(`${base}/echo`, {
+          method: 'POST',
+          headers: {'content-type': 'text/plain'},
+          body: 'exchange-probe',
+        });
+        await echoed.text();
+        assert(
+          records.length === 1,
+          `expected one record after the echo fetch, got ${records.length}`,
+        );
+        const record = records[0];
+        assert(record.method === 'POST', `method ${record.method}`);
+        assert(record.url.endsWith('/echo'), `url ${record.url}`);
+        assert(
+          record.requestBody?.text === 'exchange-probe' &&
+            record.requestBody.size === 'exchange-probe'.length,
+          `request body ${JSON.stringify(record.requestBody)}`,
+        );
+        assert(record.status === 200, `status ${record.status}`);
+        assert(
+          record.responseBody?.text != null &&
+            record.responseBody.text.includes('exchange-probe'),
+          `response body ${JSON.stringify(record.responseBody)}`,
+        );
+        assert(record.error === null, `error ${JSON.stringify(record.error)}`);
+        assert(record.durationMs >= 0, `duration ${record.durationMs}`);
+
+        // A failed fetch records the error and nothing else.
+        records.length = 0;
+        await fetch('http://127.0.0.1:1/plain').catch(() => undefined);
+        assert(records.length === 1, `expected one failure record`);
+        const failed = records[0];
+        assert(failed.status === 0, `failed status ${failed.status}`);
+        assert(
+          failed.error !== null && failed.error.length > 0,
+          `failed error ${JSON.stringify(failed.error)}`,
+        );
+
+        // A streamed request body records as absent.
+        records.length = 0;
+        async function* streamBody(): AsyncGenerator<string> {
+          yield 'a';
+        }
+        const streamed = await fetch(`${base}/upload`, {
+          method: 'POST',
+          headers: {'content-type': 'text/plain'},
+          body: streamBody(),
+        });
+        await streamed.text();
+        assert(records.length === 1, `expected one streamed record`);
+        assert(
+          records[0].requestBody === null,
+          `streamed request body ${JSON.stringify(records[0].requestBody)}`,
+        );
       } finally {
         clearHooks();
       }

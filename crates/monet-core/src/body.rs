@@ -180,6 +180,27 @@ pub enum Completeness {
     Failed(Error),
 }
 
+/// A UTF-8 text view of a body prefix for debug/telemetry surfaces:
+/// `Some` when the bytes read as text (a multi-byte character cut at
+/// the end of the prefix is trimmed, not fatal), `None` for binary
+/// content — callers pair it with the byte count so a binary body
+/// still reports its size.
+pub fn utf8_debug_prefix(bytes: &[u8]) -> Option<String> {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => Some(text.to_string()),
+        Err(error) => {
+            let valid = error.valid_up_to();
+            // A cut multi-byte tail (up to 3 bytes) still reads as text
+            // once trimmed; anything earlier means binary content.
+            if bytes.len() - valid <= 3 {
+                Some(String::from_utf8_lossy(&bytes[..valid]).into_owned())
+            } else {
+                None
+            }
+        }
+    }
+}
+
 impl Body {
     /// Drains a body that is already complete, without parking on its
     /// producer. Transports use this to pick the wire shape: a complete
@@ -605,6 +626,30 @@ mod tests {
         );
         let sent = futures_lite::future::block_on(send_fut.as_mut());
         assert!(sent.is_err(), "the send must see the closed channel");
+    }
+
+    #[test]
+    fn utf8_debug_prefix_reads_text_and_flags_binary() {
+        assert_eq!(utf8_debug_prefix(b"hello"), Some("hello".to_string()));
+        // A multi-byte character cut at the prefix's end still reads as
+        // text (trimmed), not as binary.
+        let emoji = "🎉".as_bytes(); // 4 bytes
+        assert_eq!(
+            utf8_debug_prefix(&emoji[..3]),
+            Some(String::new()),
+            "a cut tail trims to the valid prefix"
+        );
+        assert_eq!(utf8_debug_prefix(emoji), Some("🎉".to_string()));
+        // Binary content: the invalid byte is early, not a cut tail.
+        assert_eq!(utf8_debug_prefix(&[0xff, 0xfe, 0xfd, 0xfc]), None);
+        // Text with a cut tail after valid content keeps the content.
+        let mut json = br#"{"ok":true}"#.to_vec();
+        json.extend_from_slice(&emoji[..2]);
+        assert_eq!(
+            utf8_debug_prefix(&json),
+            Some(r#"{"ok":true}"#.to_string()),
+            "the cut tail is trimmed, the valid prefix survives"
+        );
     }
 
     #[test]

@@ -30,6 +30,7 @@ use monet_core::HookRegistry;
 
 #[cfg(target_os = "android")]
 mod bootstrap;
+pub mod exchange;
 mod fetch;
 /// The JS hook/observer channel: TurboCallbacks adapted onto core's hook
 /// traits, with the pending-map resolve protocol (see docs/plans/2026-11-hooks.md).
@@ -95,6 +96,10 @@ pub struct Monet {
     fetches: FetchRegistry,
     hooks: RwLock<HookRegistry>,
     pending: Arc<Pending>,
+    /// The exchange recorders (v2/W3b): one record per fetch at its
+    /// terminal. Snapshot semantics like the hooks — a pump in flight
+    /// keeps firing at the recorders that existed when it spawned.
+    recorders: RwLock<Vec<Arc<jsi_turbo::TurboCallback>>>,
 }
 
 impl Monet {
@@ -111,6 +116,7 @@ impl Monet {
             fetches: FetchRegistry::new(),
             hooks: RwLock::new(HookRegistry::new()),
             pending: Pending::shared(),
+            recorders: RwLock::new(Vec::new()),
         })
     }
 
@@ -333,11 +339,27 @@ impl Monet {
         Ok(())
     }
 
+    /// Registers an exchange recorder (v2/W3b): one complete record
+    /// per fetch at its terminal — the final (post-hook) request, the
+    /// response head the pump delivered, a capped text prefix of both
+    /// bodies (binary reports size only), duration, and the terminal
+    /// error. Fire-and-forget like the observers; `clear_hooks` drops
+    /// these too.
+    pub fn add_exchange_recorder(&self, on_record: jsi_turbo::TurboCallback) -> anyhow::Result<()> {
+        self.recorders
+            .write()
+            .unwrap()
+            .push(Arc::new(on_record));
+        Ok(())
+    }
+
     /// Drops every hook and observer registration (the `clear_pins`
-    /// symmetry), and every outstanding hook call.
+    /// symmetry), every outstanding hook call, and the exchange
+    /// recorders.
     pub fn clear_hooks(&self) -> anyhow::Result<()> {
         self.hooks.write().unwrap().clear();
         self.pending.clear();
+        self.recorders.write().unwrap().clear();
         Ok(())
     }
 
@@ -458,10 +480,12 @@ impl Monet {
         // fetches. The Arc clone keeps it alive until this pump ends.
         let transport = self.transport.read().unwrap().clone();
         let hooks = self.hook_snapshot();
+        let recorders = self.recorders.read().unwrap().clone();
         spawn_fetch_pump(
             self.fetches.clone(),
             transport,
             hooks,
+            recorders,
             fetch_id,
             cancel,
             options,
@@ -511,10 +535,12 @@ impl Monet {
         let on_error = Arc::new(on_error);
         let transport = self.transport.read().unwrap().clone();
         let hooks = self.hook_snapshot();
+        let recorders = self.recorders.read().unwrap().clone();
         spawn_fetch_pump(
             self.fetches.clone(),
             transport,
             hooks,
+            recorders,
             fetch_id,
             cancel,
             options,
@@ -741,10 +767,26 @@ fn der_from_pem_or_base64(input: &str) -> anyhow::Result<Vec<u8>> {
 /// hook pipeline per attempt, then head + chunked body delivery over the
 /// registry.
 #[allow(clippy::too_many_arguments)]
+/// One error exit of the fetch pump: records the exchange's terminal
+/// error, then fires the JS error event — the two always travel together.
+fn fail_fetch(
+    exchange: &mut crate::exchange::ExchangeGuard,
+    on_error: &Arc<jsi_turbo::TurboCallback>,
+    error: monet_core::Error,
+) {
+    let event = ErrorEvent::from(error);
+    exchange.fail(&event.kind, &event.message);
+    // The record fires before the JS callback: an awaiting consumer can
+    // resume before the guard's Drop would run.
+    exchange.fire();
+    on_error.call(event);
+}
+
 fn spawn_fetch_pump(
     fetches: FetchRegistry,
     transport: Arc<dyn monet_core::Transport>,
     hooks: HookRegistry,
+    recorders: Vec<Arc<jsi_turbo::TurboCallback>>,
     fetch_id: f64,
     cancel: monet_core::CancelToken,
     options: FetchOptions,
@@ -769,6 +811,17 @@ fn spawn_fetch_pump(
             // report the same correlationId (and Rust-native hooks can
             // stash their own state the same way).
             let correlation_id = crate::hooks::next_correlation_id();
+            // The exchange record (v2/W3b): the guard fires it on drop,
+            // at every exit path, exactly once. Seeded from the call
+            // site so the earliest exits (a build failure) still record
+            // what was asked for; every later observation overwrites.
+            let mut exchange = crate::exchange::ExchangeGuard::new(
+                recorders,
+                correlation_id,
+                &options.url,
+                &options.method,
+                &options.headers,
+            );
             let response = loop {
                 let mut request = match &mut body {
                     PumpBody::Buffered(bytes) => build_request(&options, bytes),
@@ -785,10 +838,17 @@ fn spawn_fetch_pump(
                     Ok(request) => request,
                     Err(error) => {
                         fetches.finish(fetch_id);
-                        on_error.call(ErrorEvent::from(error));
+                        fail_fetch(&mut exchange, &on_error, error);
                         return;
                     }
                 };
+                // The pre-hook head: the best-available form for exits
+                // before the hooks ran (overwritten by the final form
+                // when they succeed).
+                exchange.observe_request(&request);
+                if let PumpBody::Buffered(bytes) = &body {
+                    exchange.observe_request_body(bytes.as_deref().unwrap_or_default());
+                }
                 request.extensions.insert(hooks::HookAttempt(attempt));
                 request
                     .extensions
@@ -814,7 +874,11 @@ fn spawn_fetch_pump(
                         let attempted: futures_lite::future::Boxed<
                             monet_core::Result<monet_core::Response>,
                         > = match outcome {
-                            monet_core::hook::HookOutcome::Modified(mut request) => {
+                            monet_core::hook::HookOutcome::Modified(request) => {
+                                // The final (post-hook) request form —
+                                // what the exchange record reports.
+                                exchange.observe_request(&request);
+                                let mut request = request;
                                 let transport = transport.clone();
                                 Box::pin(async move {
                                     let extensions =
@@ -856,31 +920,31 @@ fn spawn_fetch_pump(
                                     continue;
                                 }
                                 fetches.finish(fetch_id);
-                                on_error.call(ErrorEvent::from(error));
+                                fail_fetch(&mut exchange, &on_error, error);
                                 return;
                             }
                             RaceOutcome::Cancelled => {
                                 fetches.finish(fetch_id);
-                                on_error.call(ErrorEvent::from(monet_core::Error::Cancelled));
+                                fail_fetch(&mut exchange, &on_error, monet_core::Error::Cancelled);
                                 return;
                             }
                         }
                     }
                     RaceOutcome::Done(Err(error)) => {
                         fetches.finish(fetch_id);
-                        on_error.call(ErrorEvent::from(error));
+                        fail_fetch(&mut exchange, &on_error, error);
                         return;
                     }
                     RaceOutcome::Cancelled => {
                         fetches.finish(fetch_id);
-                        on_error.call(ErrorEvent::from(monet_core::Error::Cancelled));
+                        fail_fetch(&mut exchange, &on_error, monet_core::Error::Cancelled);
                         return;
                     }
                 }
             };
 
             let status = f64::from(response.status);
-            let headers = response
+            let headers: Vec<HeaderKV> = response
                 .headers
                 .iter_flattened()
                 .map(|(name, value)| HeaderKV {
@@ -889,6 +953,7 @@ fn spawn_fetch_pump(
                 })
                 .collect();
             valve_log(&format!("PUMP-HEAD-READY id={fetch_id} status={status}"));
+            exchange.observe_response_head(response.status, &headers);
             on_head.call(HeadEvent { status, headers });
             valve_log(&format!("PUMP-BODY-ENTER id={fetch_id}"));
 
@@ -921,6 +986,7 @@ fn spawn_fetch_pump(
                 match race_cancel(body.next(), &cancel).await {
                     RaceOutcome::Done(Some(Ok(bytes))) => {
                         valve_log(&format!("PUMP-GOT id={fetch_id} len={}", bytes.len()));
+                        exchange.observe_response_chunk(&bytes);
                         if fetches.push_chunk(fetch_id, bytes.to_vec()) {
                             on_chunk.call_with_no_args();
                         } else {
@@ -942,8 +1008,11 @@ fn spawn_fetch_pump(
             }
             fetches.finish(fetch_id);
             match failure {
-                None => on_done.call_with_no_args(),
-                Some(error) => on_error.call(ErrorEvent::from(error)),
+                None => {
+                    exchange.fire();
+                    on_done.call_with_no_args();
+                }
+                Some(error) => fail_fetch(&mut exchange, &on_error, error),
             }
         })
         .detach();

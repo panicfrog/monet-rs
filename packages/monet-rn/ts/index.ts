@@ -24,6 +24,11 @@ export type {
   MonetHookRetry,
   MonetMockedResponse,
 } from './hooks';
+export {
+  addExchangeRecorder,
+  type MonetExchange,
+  type MonetExchangeBody,
+} from './exchange';
 export { MonetError, MonetHeaders, MonetResponse } from './response';
 export type { ErrorEvent, HeadEvent } from './response';
 export { MonetWebSocket } from './websocket';
