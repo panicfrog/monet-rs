@@ -57,6 +57,12 @@ fn valve_log(line: &str) {
     if !*ENABLED {
         return;
     }
+    // One line, one write, under a process-wide lock: the delegate
+    // thread, the watcher threads, and the executor threads all append
+    // here, and a formatted writeln! fragments into multiple write()
+    // calls whose interleaving corrupts (and loses) lines.
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = LOCK.lock().unwrap();
     if let Ok(home) = std::env::var("HOME") {
         if let Ok(mut file) = std::fs::OpenOptions::new()
             .create(true)
@@ -67,7 +73,7 @@ fn valve_log(line: &str) {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis())
                 .unwrap_or(0);
-            let _ = writeln!(file, "{ms} {line}");
+            let _ = file.write_all(format!("{ms} {line}\n").as_bytes());
         }
     }
 }
@@ -440,7 +446,7 @@ impl Monet {
             .map_err(|e| anyhow::anyhow!("invalid URL: {e}"))?;
 
         let (fetch_id, cancel) = self.fetches.allocate();
-        valve_log(&format!("SPAWN fetch id={fetch_id} buffered={}", body_bytes.is_some()));
+        valve_log(&format!("SPAWN fetch id={fetch_id} url={}", options.url));
         let on_head = Arc::new(on_head);
         let on_chunk = Arc::new(on_chunk);
         let on_done = Arc::new(on_done);
@@ -498,7 +504,7 @@ impl Monet {
         // the sending half through the module methods.
         let (body, feed) = monet_core::body::channel();
         self.fetches.attach_stream_feed(fetch_id, feed);
-        crate::valve_log(&format!("SPAWN fetch_stream id={fetch_id}"));
+        crate::valve_log(&format!("SPAWN fetch_stream id={fetch_id} url={}", options.url));
         let on_head = Arc::new(on_head);
         let on_chunk = Arc::new(on_chunk);
         let on_done = Arc::new(on_done);
@@ -782,8 +788,10 @@ fn spawn_fetch_pump(
 
                 // Request hooks, raced with the cancel token — a stuck
                 // JS hook must not outlive the fetch's abort.
+                valve_log(&format!("PUMP-HOOKS id={fetch_id} attempt={attempt}"));
                 match race_cancel(hooks.run_request_hooks(request), &cancel).await {
                     RaceOutcome::Done(Ok(mut request)) => {
+                        valve_log(&format!("PUMP-EXEC id={fetch_id} attempt={attempt}"));
                         let transport = transport.clone();
                         let hooks = hooks.clone();
                         let cancel_for_execute = cancel.clone();
@@ -849,7 +857,9 @@ fn spawn_fetch_pump(
                     value: value.to_string(),
                 })
                 .collect();
+            valve_log(&format!("PUMP-HEAD-READY id={fetch_id} status={status}"));
             on_head.call(HeadEvent { status, headers });
+            valve_log(&format!("PUMP-BODY-ENTER id={fetch_id}"));
 
             use futures_lite::StreamExt;
             let mut body = response.body;
@@ -876,8 +886,10 @@ fn spawn_fetch_pump(
                 // body, a gated consumer), and the abort must not
                 // depend on the transport tearing the stream down to
                 // be observed.
+                valve_log(&format!("PUMP-PULL id={fetch_id} awaiting body.next()"));
                 match race_cancel(body.next(), &cancel).await {
                     RaceOutcome::Done(Some(Ok(bytes))) => {
+                        valve_log(&format!("PUMP-GOT id={fetch_id} len={}", bytes.len()));
                         if fetches.push_chunk(fetch_id, bytes.to_vec()) {
                             on_chunk.call_with_no_args();
                         } else {

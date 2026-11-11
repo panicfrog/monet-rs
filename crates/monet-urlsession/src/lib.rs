@@ -109,6 +109,12 @@ fn valve_log(line: &str) {
     if !*ENABLED {
         return;
     }
+    // One line, one write, under a process-wide lock: the delegate
+    // thread, the watcher threads, and the executor threads all append
+    // here, and a formatted writeln! fragments into multiple write()
+    // calls whose interleaving corrupts (and loses) lines.
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = LOCK.lock().unwrap();
     if let Ok(home) = std::env::var("HOME") {
         if let Ok(mut file) = std::fs::OpenOptions::new()
             .create(true)
@@ -119,7 +125,7 @@ fn valve_log(line: &str) {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis())
                 .unwrap_or(0);
-            let _ = writeln!(file, "{ms} {line}");
+            let _ = file.write_all(format!("{ms} {line}\n").as_bytes());
         }
     }
 }
@@ -195,7 +201,10 @@ impl Transport for UrlsessionTransport {
             })
             .await
             {
-                Step::Head(Ok(response)) => response,
+                Step::Head(Ok(response)) => {
+                    valve_log(&format!("EXEC-HEAD id={id} resolved"));
+                    response
+                }
                 // The state was dropped without a terminal event (only the
                 // registry's defensive paths do this) — report rather than
                 // hang.

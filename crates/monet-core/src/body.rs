@@ -44,7 +44,43 @@ enum BodyReceiver {
         /// a full buffer (an error must not wait out the data), so it
         /// lands here and surfaces at end-of-stream.
         aborted: Arc<Mutex<Option<Error>>>,
+        /// The room-waiter slot (see [`RoomWaiter`]): the receiver wakes
+        /// it on every take, so a `send` parked on a full buffer
+        /// resumes. This is OUR notification — futures-channel's own
+        /// sender-park machinery cannot be shared between a sync prober
+        /// (try_send from a delegate thread) and an async sender (a
+        /// drain task): the prober's poll_unparked(None) ERASES the
+        /// waker the async sender registered, and the receiver's
+        /// unpark then wakes nobody — a lost wakeup that parks the
+        /// drain forever.
+        room: Arc<RoomWaiter>,
     },
+}
+
+/// The bounded pair's own room notification: a single waker slot the
+/// consumer fires on every successful take.
+#[derive(Default)]
+struct RoomWaiter {
+    state: Mutex<RoomWaiterState>,
+}
+
+#[derive(Default)]
+struct RoomWaiterState {
+    waker: Option<std::task::Waker>,
+}
+
+impl RoomWaiter {
+    /// Registers the caller's waker (a send parked on a full buffer).
+    fn register(&self, cx: &mut std::task::Context<'_>) {
+        self.state.lock().unwrap().waker = Some(cx.waker().clone());
+    }
+
+    /// The consumer took a chunk: wake a parked sender, if any.
+    fn notify_room(&self) {
+        if let Some(waker) = self.state.lock().unwrap().waker.take() {
+            waker.wake();
+        }
+    }
 }
 
 impl fmt::Debug for Body {
@@ -70,6 +106,9 @@ pub struct BoundedBodySender {
     /// the same sender.
     sender: Arc<Mutex<Sender<Result<Bytes>>>>,
     aborted: Arc<Mutex<Option<Error>>>,
+    /// The pair's own room notification (see [`RoomWaiter`]) — the only
+    /// wake path [`BoundedBodySender::send`] relies on.
+    room: Arc<RoomWaiter>,
 }
 
 /// Creates a connected body channel. The transport keeps the sender and
@@ -93,16 +132,19 @@ pub fn channel() -> (Body, BodySender) {
 pub fn bounded(cap: usize) -> (Body, BoundedBodySender) {
     let (sender, receiver) = futures_channel::mpsc::channel(cap);
     let aborted = Arc::new(Mutex::new(None));
+    let room = Arc::new(RoomWaiter::default());
     (
         Body {
             receiver: BodyReceiver::Bounded {
                 receiver,
                 aborted: aborted.clone(),
+                room: room.clone(),
             },
         },
         BoundedBodySender {
             sender: Arc::new(Mutex::new(sender)),
             aborted,
+            room,
         },
     )
 }
@@ -185,8 +227,18 @@ impl Stream for Body {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match &mut self.receiver {
             BodyReceiver::Unbounded(receiver) => Pin::new(receiver).poll_next(cx),
-            BodyReceiver::Bounded { receiver, aborted } => {
-                match Pin::new(receiver).poll_next(cx) {
+            BodyReceiver::Bounded {
+                receiver,
+                aborted,
+                room,
+            } => {
+                let poll = Pin::new(receiver).poll_next(cx);
+                if poll.is_ready() {
+                    // A take made room: wake a sender parked on the
+                    // buffer (our own slot — see RoomWaiter).
+                    room.notify_room();
+                }
+                match poll {
                     // End of stream: a bounded abort could not queue behind
                     // a full buffer, so its error surfaces here — once,
                     // then the stream ends.
@@ -231,20 +283,19 @@ impl BoundedBodySender {
     /// Pushes one chunk, waiting for room at capacity — the async
     /// feeder's natural pause point (a transport pump awaiting this
     /// stops reading its network stream, and the flow control
-    /// downstream follows). The park/wake is futures-channel's own:
-    /// the receiver unparks a sender on every take. Fails if the
-    /// channel is closed.
+    /// downstream follows). The wait is the pair's OWN room
+    /// notification: futures-channel's sender-park machinery cannot be
+    /// shared between this async sender and a sync prober (try_send
+    /// from a delegate thread erases the registered waker — the lost
+    /// wakeup that parked drains forever; see [`RoomWaiter`]).
     pub async fn send(&self, chunk: impl Into<Bytes>) -> Result<()> {
         let chunk = chunk.into();
-        std::future::poll_fn(|cx| {
-            let mut sender = self.sender.lock().unwrap();
-            match sender.poll_ready(cx) {
-                Poll::Ready(Ok(())) => match sender.start_send(Ok(chunk.clone())) {
-                    Ok(()) => Poll::Ready(Ok(())),
-                    Err(_) => Poll::Ready(Err(Error::Body("body channel closed".into()))),
-                },
-                Poll::Ready(Err(_)) => Poll::Ready(Err(Error::Body("body channel closed".into()))),
-                Poll::Pending => Poll::Pending,
+        std::future::poll_fn(|cx| match self.try_send(chunk.clone()) {
+            Delivery::Sent => Poll::Ready(Ok(())),
+            Delivery::Closed => Poll::Ready(Err(Error::Body("body channel closed".into()))),
+            Delivery::Full(_) => {
+                self.room.register(cx);
+                Poll::Pending
             }
         })
         .await
@@ -434,6 +485,59 @@ mod tests {
         ));
         let send = futures_lite::future::block_on(sender.send(Bytes::from("y")));
         assert!(send.is_err());
+    }
+
+    #[test]
+    fn sync_probes_do_not_erase_the_async_senders_wake() {
+        // The regression: a delegate-thread try_send on a full buffer
+        // used to run futures-channel's poll_unparked(None), which
+        // ERASED the waker an async send() had registered — the
+        // receiver's unpark then woke nobody and the drain parked
+        // forever. send() now rides the pair's own room notification,
+        // which the prober cannot touch.
+        let (body, sender) = bounded(2);
+        // Fill the buffer exactly (futures-channel's effective capacity
+        // is cap + 1).
+        assert!(matches!(sender.try_send(Bytes::from("a")), Delivery::Sent));
+        assert!(matches!(sender.try_send(Bytes::from("b")), Delivery::Sent));
+        assert!(matches!(sender.try_send(Bytes::from("c")), Delivery::Sent));
+        assert!(matches!(
+            sender.try_send(Bytes::from("probe")),
+            Delivery::Full(_)
+        ));
+        // The async sender parks (a drain task's view). The boxed form
+        // is Unpin, so block_on can re-poll it after the take.
+        let mut send_fut = Box::pin(sender.send(Bytes::from("d")));
+        // The prober's Full probes — the waker-erasing calls.
+        for _ in 0..3 {
+            assert!(matches!(
+                sender.try_send(Bytes::from("probe")),
+                Delivery::Full(_)
+            ));
+        }
+        // The consumer takes one chunk: the parked send must complete.
+        let mut body = body;
+        let first = futures_lite::future::block_on(body.next())
+            .unwrap()
+            .unwrap();
+        assert_eq!(&first[..], b"a");
+        // Drive the send future to completion on a fresh executor view
+        // (block_on re-polls; a lost wake would hang here).
+        let sent = futures_lite::future::block_on(send_fut.as_mut());
+        assert!(sent.is_ok(), "the parked send never completed: {sent:?}");
+        // The buffered chunks drain first, then the sent one ("b", "c"
+        // were already queued ahead of it).
+        let second = futures_lite::future::block_on(body.next())
+            .unwrap()
+            .unwrap();
+        assert_eq!(&second[..], b"b");
+        let _ = futures_lite::future::block_on(body.next())
+            .unwrap()
+            .unwrap();
+        let fourth = futures_lite::future::block_on(body.next())
+            .unwrap()
+            .unwrap();
+        assert_eq!(&fourth[..], b"d");
     }
 
     #[test]

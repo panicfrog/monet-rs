@@ -22,6 +22,7 @@ use monet_core::headers::HeaderMap;
 use monet_core::response::Response;
 
 use crate::bridge;
+use crate::valve_log;
 
 /// `NSURLErrorCancelled` — the code a `transport_cancel`ed task reports.
 const URL_ERROR_CANCELLED: i32 = -999;
@@ -166,15 +167,19 @@ pub(crate) fn on_response_head(id: u64, status: u16) {
                 .send(Ok(Response::new(status, headers, body)))
                 .is_ok()
             {
+                valve_log(&format!("HEAD id={id} delivered; spawning watcher"));
                 spawn_body_watcher(id, cancel, wake_rx);
             } else {
                 // The execute future is gone (its cancel path won the
                 // race): stop the native task and drop the orphaned state.
+                valve_log(&format!("HEAD id={id} execute-gone; cancelling"));
                 bridge::transport_cancel(id);
                 remove(id);
             }
         }
-        Staged::Duplicate => {}
+        Staged::Duplicate => {
+            valve_log(&format!("HEAD id={id} duplicate ignored"));
+        }
     }
 }
 
@@ -201,15 +206,25 @@ pub(crate) fn on_chunk(id: u64, data: &[u8]) {
         let states = REGISTRY.states.lock().unwrap();
         match states.get(&id) {
             // Unknown id: a late chunk after cancellation — nothing to do.
-            None => After::Continue,
+            None => {
+                valve_log(&format!(
+                    "CHUNK id={id} late (state gone) len={}",
+                    data.len()
+                ));
+                After::Continue
+            }
             Some(state) => match &state.body_tx {
                 Some(sender) => match sender.try_send(Bytes::copy_from_slice(data)) {
                     Delivery::Sent => After::Continue,
                     Delivery::Full(chunk) => {
+                        valve_log(&format!("CHUNK id={id} full len={}", data.len()));
                         state.overflow.lock().unwrap().push_back(chunk);
                         After::Overflow
                     }
-                    Delivery::Closed => After::ConsumerGone,
+                    Delivery::Closed => {
+                        valve_log(&format!("CHUNK id={id} consumer-gone len={}", data.len()));
+                        After::ConsumerGone
+                    }
                 },
                 // Chunks before the head violate the ordering contract;
                 // ignore rather than crash a delegate thread.
@@ -275,9 +290,13 @@ fn stage_terminal(id: u64, terminal: Terminal, pre_head_note: &str) {
             let mut slot = state.terminal.lock().unwrap();
             if slot.is_none() {
                 *slot = Some(terminal);
-                if let Some(wake_tx) = &state.wake_tx {
-                    let _ = wake_tx.unbounded_send(Wake::Terminal);
-                }
+                let wake = state
+                    .wake_tx
+                    .as_ref()
+                    .map(|tx| tx.unbounded_send(Wake::Terminal).is_ok());
+                valve_log(&format!("TERMINAL id={id} staged wake={wake:?}"));
+            } else {
+                valve_log(&format!("TERMINAL id={id} duplicate-slot ignored"));
             }
             Act::Staged
         } else {
@@ -328,97 +347,111 @@ fn spawn_body_watcher(id: u64, cancel: CancelToken, mut wake_rx: UnboundedReceiv
     let spawned = std::thread::Builder::new()
         .name("monet-urlsession-body".into())
         .spawn(move || {
-            futures_lite::future::block_on(async {
-                use futures_lite::StreamExt as _;
-                // Cancel is observed once: it fires the native cancel,
-                // but the watcher keeps waiting — the terminal the
-                // cancellation produces arrives asynchronously (the
-                // delegate's didCompleteWithError), and applying it is
-                // this loop's job.
-                let mut cancelled = false;
-                loop {
-                    enum Step {
-                        Wake(Option<Wake>),
-                        Cancelled,
-                    }
-                    let step = if cancelled {
-                        Step::Wake(wake_rx.next().await)
-                    } else {
-                        futures_lite::future::race(
-                            async { Step::Wake(wake_rx.next().await) },
-                            async {
-                                cancel.cancelled().await;
-                                Step::Cancelled
-                            },
-                        )
-                        .await
-                    };
-                    match step {
-                        // The state is gone (removed elsewhere): exit.
-                        Step::Wake(None) => return,
-                        Step::Cancelled => {
-                            // The task's didCompleteWithError(-999) then
-                            // reports through on_error, which stages the
-                            // terminal this loop applies.
-                            crate::valve_log(&format!("WATCH id={id} cancelled"));
-                            bridge::transport_cancel(id);
-                            cancelled = true;
+            valve_log(&format!("WATCHER id={id} thread-entered"));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                futures_lite::future::block_on(async {
+                    use futures_lite::StreamExt as _;
+                    // Cancel is observed once: it fires the native cancel,
+                    // but the watcher keeps waiting — the terminal the
+                    // cancellation produces arrives asynchronously (the
+                    // delegate's didCompleteWithError), and applying it is
+                    // this loop's job.
+                    let mut cancelled = false;
+                    loop {
+                        enum Step {
+                            Wake(Option<Wake>),
+                            Cancelled,
                         }
-                        Step::Wake(Some(reason)) => {
-                            // Every path drains first: a terminal must
-                            // not cut in front of stalled data, and a
-                            // stall resumes only what it actually
-                            // delivered.
-                            let reason_tag = match reason {
-                                Wake::Stall => "stall",
-                                Wake::Terminal => "terminal",
-                            };
-                            match drain_overflow(id).await {
-                                // The consumer is gone: stop the task.
-                                None => {
-                                    crate::valve_log(&format!(
-                                        "WATCH id={id} {reason_tag} consumer-gone"
-                                    ));
-                                    bridge::transport_cancel(id);
-                                    return;
-                                }
-                                // A stall wake on a live request: the drain
-                                // reached empty (this pass delivered the
-                                // chunks, or a previous pass already did —
-                                // Some(0) must ALSO attempt the resume: a
-                                // suspend that landed after that pass's
-                                // clear, against an opener whose chunk the
-                                // pass drained, is outstanding with only
-                                // this wake left to resume it; the Swift
-                                // count gates the actual resume to
-                                // one-per-suspend). A cancel was observed:
-                                // no resume — the task's terminal is on its
-                                // way (a suspended task's cancel may deliver
-                                // late).
-                                Some(n) if matches!(reason, Wake::Stall) && !cancelled => {
-                                    // The drain IS the consumer's pace
-                                    // (v2/W2b redesign: no task resume —
-                                    // nothing was suspended).
-                                    crate::valve_log(&format!(
-                                        "WATCH id={id} {reason_tag} drained={n}"
-                                    ));
-                                }
-                                Some(n) => {
-                                    crate::valve_log(&format!(
-                                        "WATCH id={id} {reason_tag} drained={n} terminal"
-                                    ));
-                                    apply_terminal(id);
-                                    return;
+                        let step = if cancelled {
+                            Step::Wake(wake_rx.next().await)
+                        } else {
+                            futures_lite::future::race(
+                                async { Step::Wake(wake_rx.next().await) },
+                                async {
+                                    cancel.cancelled().await;
+                                    Step::Cancelled
+                                },
+                            )
+                            .await
+                        };
+                        match step {
+                            // The state is gone (removed elsewhere): exit.
+                            Step::Wake(None) => return,
+                            Step::Cancelled => {
+                                // The task's didCompleteWithError(-999) then
+                                // reports through on_error, which stages the
+                                // terminal this loop applies.
+                                crate::valve_log(&format!("WATCH id={id} cancelled"));
+                                bridge::transport_cancel(id);
+                                cancelled = true;
+                            }
+                            Step::Wake(Some(reason)) => {
+                                // Every path drains first: a terminal must
+                                // not cut in front of stalled data, and a
+                                // stall resumes only what it actually
+                                // delivered.
+                                let reason_tag = match reason {
+                                    Wake::Stall => "stall",
+                                    Wake::Terminal => "terminal",
+                                };
+                                valve_log(&format!("WATCHER id={id} woke: {reason_tag}"));
+                                match drain_overflow(id).await {
+                                    // The consumer is gone: stop the task.
+                                    None => {
+                                        crate::valve_log(&format!(
+                                            "WATCH id={id} {reason_tag} consumer-gone"
+                                        ));
+                                        bridge::transport_cancel(id);
+                                        return;
+                                    }
+                                    // A stall wake on a live request: the drain
+                                    // reached empty (this pass delivered the
+                                    // chunks, or a previous pass already did —
+                                    // Some(0) must ALSO attempt the resume: a
+                                    // suspend that landed after that pass's
+                                    // clear, against an opener whose chunk the
+                                    // pass drained, is outstanding with only
+                                    // this wake left to resume it; the Swift
+                                    // count gates the actual resume to
+                                    // one-per-suspend). A cancel was observed:
+                                    // no resume — the task's terminal is on its
+                                    // way (a suspended task's cancel may deliver
+                                    // late).
+                                    Some(n) if matches!(reason, Wake::Stall) && !cancelled => {
+                                        // The drain IS the consumer's pace
+                                        // (v2/W2b redesign: no task resume —
+                                        // nothing was suspended).
+                                        crate::valve_log(&format!(
+                                            "WATCH id={id} {reason_tag} drained={n}"
+                                        ));
+                                    }
+                                    Some(n) => {
+                                        crate::valve_log(&format!(
+                                            "WATCH id={id} {reason_tag} drained={n} terminal"
+                                        ));
+                                        apply_terminal(id);
+                                        return;
+                                    }
                                 }
                             }
                         }
                     }
-                }
-            });
+                });
+            }));
+            match result {
+                Ok(()) => {}
+                Err(payload) => valve_log(&format!(
+                    "WATCHER id={id} PANICKED: {:?}",
+                    payload.downcast_ref::<&str>().copied()
+                )),
+            }
         });
-    if let Err(e) = spawned {
-        // Thread-starved environment; degrade to event-driven cleanup.
-        let _ = e;
+    match spawned {
+        Ok(_) => valve_log(&format!("WATCHER id={id} spawn-ok")),
+        Err(e) => {
+            // Thread-starved environment; degrade to event-driven cleanup.
+            valve_log(&format!("WATCHER id={id} SPAWN FAILED: {e}"));
+        }
     }
 }
 
