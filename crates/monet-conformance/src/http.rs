@@ -475,11 +475,26 @@ async fn respond_route(
         }
         // Answers only after the whole upload arrived (every request body
         // is collected above before responding) — an upload endpoint whose
-        // response itself proves the request finished.
-        "/upload" => ok(
-            StatusCode::OK,
-            boxed(Full::new(Bytes::from_static(b"uploaded"))),
-        ),
+        // response itself proves the request finished. The mode header is
+        // the wire-shape observable (v2/W2d): a body the transport
+        // buffered carries Content-Length; a live stream went out chunked
+        // (hyper consumes transfer-encoding, so the presence of
+        // content-length is the discriminator).
+        "/upload" => {
+            let mut response = ok(
+                StatusCode::OK,
+                boxed(Full::new(Bytes::from_static(b"uploaded"))),
+            );
+            let mode = if request_headers.contains_key("content-length") {
+                "length"
+            } else {
+                "chunked"
+            };
+            response
+                .headers_mut()
+                .insert("x-upload-mode", mode.parse().unwrap());
+            response
+        }
         _ => ok(StatusCode::NOT_FOUND, boxed(Full::new(Bytes::new()))),
     }
 }

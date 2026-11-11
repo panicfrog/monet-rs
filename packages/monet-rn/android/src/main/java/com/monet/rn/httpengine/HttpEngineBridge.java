@@ -37,4 +37,14 @@ public final class HttpEngineBridge {
 
   public static native void onCanceled(
       long id, UrlRequest request, UrlResponseInfo info);
+
+  // The chunked upload provider's reach (v2/W2d): fills `buffer`'s
+  // [position, position + remaining) window from the Rust feeder's
+  // queue — > 0 bytes written, 0 the end, -1 nothing yet (the read
+  // parks), -2 the stream failed.
+  public static native int takeUploadChunk(
+      long id, ByteBuffer buffer, int position, int remaining);
+
+  // The provider's close: ends the Rust-side upload state.
+  public static native void closeUpload(long id);
 }

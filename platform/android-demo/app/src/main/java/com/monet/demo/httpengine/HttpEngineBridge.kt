@@ -30,6 +30,16 @@ object HttpEngineBridge {
     @JvmStatic external fun onFailed(
         id: Long, request: UrlRequest, info: UrlResponseInfo?, error: HttpException)
     @JvmStatic external fun onCanceled(id: Long, request: UrlRequest, info: UrlResponseInfo?)
+
+    // The chunked upload provider's reach (v2/W2d): fills `buffer`'s
+    // [position, position + remaining) window from the Rust feeder's
+    // queue — > 0 bytes written, 0 the end, -1 nothing yet (the read
+    // parks), -2 the stream failed.
+    @JvmStatic external fun takeUploadChunk(
+        id: Long, buffer: ByteBuffer, position: Int, remaining: Int): Int
+
+    // The provider's close: ends the Rust-side upload state.
+    @JvmStatic external fun closeUpload(id: Long)
 }
 
 /** Forwards every callback to [HttpEngineBridge] with the request id. */
@@ -82,6 +92,78 @@ class MonetUploadProvider(private val data: ByteArray) : UploadDataProvider() {
     override fun rewind(sink: UploadDataSink) {
         offset = 0
         sink.onRewindSucceeded()
+    }
+}
+
+/**
+ * Streaming-upload provider (v2/W2d): the chunked shape — getLength()
+ * answers -1 (the length is unknown ahead), reads pull from the Rust
+ * feeder's queue and park when it's empty, and rewind refuses (a
+ * stream cannot replay; redirects that preserve the body fail instead
+ * of re-sending). The Rust side (monet-httpengine's upload module) is
+ * the state machine; this class is the mechanical half.
+ */
+class MonetStreamedProvider(private val id: Long) : UploadDataProvider() {
+    private var pendingSink: UploadDataSink? = null
+    private var pendingBuffer: ByteBuffer? = null
+    private var closed = false
+
+    override fun getLength(): Long = -1L
+
+    override fun read(sink: UploadDataSink, buffer: ByteBuffer) {
+        if (!drain(sink, buffer)) {
+            // Nothing yet: hold the read; the feeder's notify
+            // (onDataAvailable) completes it — the asynchronous
+            // completion the UploadDataProvider contract allows.
+            pendingSink = sink
+            pendingBuffer = buffer
+        }
+    }
+
+    /** Wakes a parked read — called over JNI from the Rust feeder thread. */
+    fun onDataAvailable() {
+        val sink = pendingSink ?: return
+        val buffer = pendingBuffer ?: return
+        pendingSink = null
+        pendingBuffer = null
+        drain(sink, buffer)
+    }
+
+    // One take attempt; returns true when the read completed. Callers
+    // hold this object's monitor (read/onDataAvailable).
+    private fun drain(sink: UploadDataSink, buffer: ByteBuffer): Boolean {
+        if (buffer.remaining() == 0) { // defensive: Cronet asks with room
+            sink.onReadError(java.io.IOException("upload read with a full buffer"))
+            return true
+        }
+        val position = buffer.position()
+        val count = HttpEngineBridge.takeUploadChunk(id, buffer, position, buffer.remaining())
+        if (count > 0) {
+            buffer.position(position + count)
+            sink.onReadSucceeded(false)
+            return true
+        }
+        return when (count) {
+            0 -> { // the stream ended: the final, empty chunk
+                sink.onReadSucceeded(true); true
+            }
+            -1 -> false // nothing yet: park
+            else -> { // -2: the producer's stream failed
+                sink.onReadError(java.io.IOException("upload body failed")); true
+            }
+        }
+    }
+
+    override fun rewind(sink: UploadDataSink) {
+        // A stream cannot replay; onRewindError is the documented answer.
+        sink.onRewindError(java.io.IOException("a streamed upload cannot be rewound"))
+    }
+
+    override fun close() {
+        if (!closed) {
+            closed = true
+            HttpEngineBridge.closeUpload(id)
+        }
     }
 }
 

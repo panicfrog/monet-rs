@@ -161,6 +161,19 @@ pub fn init(
                         jni::jni_str!("(JLandroid/net/http/UrlRequest;Landroid/net/http/UrlResponseInfo;)V"),
                         crate::bridge::native_on_canceled as *mut std::ffi::c_void,
                     ),
+                    // The chunked upload provider's reach (v2/W2d): the
+                    // take fills Cronet's read buffer from the queue; the
+                    // close ends the upload's state.
+                    NativeMethod::from_raw_parts(
+                        jni::jni_str!("takeUploadChunk"),
+                        jni::jni_str!("(JLjava/nio/ByteBuffer;II)I"),
+                        crate::bridge::native_take_upload_chunk as *mut std::ffi::c_void,
+                    ),
+                    NativeMethod::from_raw_parts(
+                        jni::jni_str!("closeUpload"),
+                        jni::jni_str!("(J)V"),
+                        crate::bridge::native_close_upload as *mut std::ffi::c_void,
+                    ),
                 ]
             };
             unsafe { env.register_native_methods(&class, &methods) }?;
@@ -373,9 +386,21 @@ fn read_string(env: &mut jni::Env<'_>, object: &JObject<'_>) -> JniResult<String
     Ok((*string).to_string())
 }
 
-/// Executes one request: buffer the body (v1), set the request up over
-/// JNI, start it, and race the head against the token — the same shape
-/// as every other monet transport.
+/// The upload shape one request takes (v2/W2d): a body that was already
+/// complete stays buffered — `getLength()` carries Content-Length on the
+/// wire and redirects can rewind it — while a live stream goes through
+/// the chunked provider, fed as the producer produces.
+enum UploadBody {
+    Buffered(Vec<u8>),
+    Streamed {
+        body: monet_core::body::Body,
+        drained: Vec<u8>,
+    },
+}
+
+/// Executes one request: pick the upload's wire shape, set the request
+/// up over JNI, start it, and race the head against the token — the
+/// same shape as every other monet transport.
 pub fn execute(
     engine: &EngineHandle,
     mut req: Request,
@@ -387,14 +412,21 @@ pub fn execute(
         if cancel.is_cancelled() {
             return Err(Error::Cancelled);
         }
-        // v1 uploads are fully buffered (nitro-fetch / monet-cronet parity).
-        let body = buffer_body(std::mem::replace(
-            &mut req.body,
-            monet_core::body::Body::empty(),
-        ))
-        .await?;
+        // v2/W2d: the probe decides the wire shape without parking — a
+        // complete body buffers (Content-Length, rewindable), a live one
+        // streams (chunked, `getLength() == -1`), and a failure that
+        // already arrived fails the request outright.
+        let completeness = req.body.take_complete();
+        let upload = match completeness {
+            monet_core::body::Completeness::Complete(bytes) => UploadBody::Buffered(bytes),
+            monet_core::body::Completeness::Live { drained } => UploadBody::Streamed {
+                body: std::mem::replace(&mut req.body, monet_core::body::Body::empty()),
+                drained,
+            },
+            monet_core::body::Completeness::Failed(error) => return Err(error),
+        };
 
-        let (id, head_rx) = start_request(&engine, &req, &cancel, body)?;
+        let (id, head_rx) = start_request(&engine, &req, &cancel, upload)?;
         let req_timeout_ms = req.timeout_ms.map(std::time::Duration::from_millis);
 
         // The per-request head deadline (Cronet has no timeout API —
@@ -414,7 +446,7 @@ pub fn execute(
                 },
                 async {
                     match deadline {
-                        Some(mut delay) => {
+                        Some(delay) => {
                             delay.await;
                             Step::TimedOut
                         }
@@ -450,12 +482,28 @@ fn start_request(
     engine: &Global<JObject<'static>>,
     req: &Request,
     cancel: &CancelToken,
-    body: Vec<u8>,
+    upload: UploadBody,
 ) -> Result<(u64, oneshot::Receiver<Result<Response>>)> {
     let (id, head_rx) = registry::allocate(cancel.clone());
-    let request = setup_and_start(engine, id, req, body).inspect_err(|_| {
+    // The streamed upload's state must exist before the request can
+    // start (the provider reads from it as soon as start() returns).
+    let close_rx = if matches!(upload, UploadBody::Buffered(_)) {
+        None
+    } else {
+        Some(crate::upload::create(id))
+    };
+    let request = setup_and_start(engine, id, req, &upload).inspect_err(|_| {
         registry::remove(id);
+        if close_rx.is_some() {
+            crate::upload::close(id);
+        }
     })?;
+    // The feeder follows once setup hands back a live request; the
+    // notify it relies on was armed inside the setup scope, before
+    // start() — a read that finds the queue empty parks until it fires.
+    if let (UploadBody::Streamed { body, drained }, Some(close_rx)) = (upload, close_rx) {
+        crate::upload::spawn_feeder(id, body, cancel.clone(), close_rx, drained);
+    }
     // Cancellation any time after start maps to UrlRequest.cancel().
     registry::arm_native_cancel(id, request_cancel(duplicate_global(&request)));
     // The read-loop resume (v2/W2b): the body watcher fires it after
@@ -469,7 +517,7 @@ fn setup_and_start(
     engine: &Global<JObject<'static>>,
     id: u64,
     req: &Request,
-    body: Vec<u8>,
+    upload: &UploadBody,
 ) -> Result<Global<JObject<'static>>> {
     // The per-request no-follow policy rides the bridge's redirect
     // callback (the platform builder has no redirect knob).
@@ -524,21 +572,55 @@ fn setup_and_start(
                 )?;
             }
 
-            if !body.is_empty() {
-                let provider_name = env.new_string(format!("{}.MonetUploadProvider", bridge_pkg()))?;
-                let provider_class: JClass<'_> = loader.load_class(env, provider_name)?;
-                let array = env.new_byte_array(body.len())?;
-                array.set_region(env, 0, bytes_as_i8(&body))?;
-                let provider =
-                    env.new_object(&provider_class, jni::jni_sig!("([B)V"), &[(&array).into()])?;
-                env.call_method(
-                    &builder,
-                    jni::jni_str!("setUploadDataProvider"),
-                    jni::jni_sig!(
-                        "(Landroid/net/http/UploadDataProvider;Ljava/util/concurrent/Executor;)Landroid/net/http/UrlRequest$Builder;"
-                    ),
-                    &[(&provider).into(), (&executor).into()],
-                )?;
+            match upload {
+                UploadBody::Buffered(bytes) => {
+                    if !bytes.is_empty() {
+                        let provider_name =
+                            env.new_string(format!("{}.MonetUploadProvider", bridge_pkg()))?;
+                        let provider_class: JClass<'_> = loader.load_class(env, provider_name)?;
+                        let array = env.new_byte_array(bytes.len())?;
+                        array.set_region(env, 0, bytes_as_i8(bytes))?;
+                        let provider = env
+                            .new_object(&provider_class, jni::jni_sig!("([B)V"), &[(&array).into()])?;
+                        env.call_method(
+                            &builder,
+                            jni::jni_str!("setUploadDataProvider"),
+                            jni::jni_sig!(
+                                "(Landroid/net/http/UploadDataProvider;Ljava/util/concurrent/Executor;)Landroid/net/http/UrlRequest$Builder;"
+                            ),
+                            &[(&provider).into(), (&executor).into()],
+                        )?;
+                    }
+                }
+                // v2/W2d: the chunked provider. `getLength()` answers -1
+                // (unknown length), reads pull from the upload queue and
+                // park when it's empty, and rewind refuses — a stream
+                // cannot replay. The notify closure is armed here, before
+                // start() below: the provider can read() the moment the
+                // request starts, and an empty-queue read parks until
+                // this fires.
+                UploadBody::Streamed { .. } => {
+                    let provider_name =
+                        env.new_string(format!("{}.MonetStreamedProvider", bridge_pkg()))?;
+                    let provider_class: JClass<'_> = loader.load_class(env, provider_name)?;
+                    let provider = env
+                        .new_object(&provider_class, jni::jni_sig!("(J)V"), &[(id as i64).into()])?;
+                    // The notify closure owns its own global ref; the
+                    // local handle outlives the call below.
+                    let provider_global = env.new_global_ref(&provider)?;
+                    crate::upload::arm_notify(
+                        id,
+                        provider_notify(globals.vm.clone(), provider_global),
+                    );
+                    env.call_method(
+                        &builder,
+                        jni::jni_str!("setUploadDataProvider"),
+                        jni::jni_sig!(
+                            "(Landroid/net/http/UploadDataProvider;Ljava/util/concurrent/Executor;)Landroid/net/http/UrlRequest$Builder;"
+                        ),
+                        &[(&provider).into(), (&executor).into()],
+                    )?;
+                }
             }
 
             env.call_method(
@@ -606,6 +688,26 @@ fn request_resume_read(id: u64, request: Global<JObject<'static>>) -> registry::
     })
 }
 
+/// The parked-read wake handed to the upload registry (v2/W2d): calls
+/// the provider's `onDataAvailable`, re-attaching whatever thread fires
+/// it (the feeder).
+fn provider_notify(
+    vm: SharedVm,
+    provider: Global<JObject<'static>>,
+) -> crate::upload::NotifyProvider {
+    Arc::new(move || {
+        let _ = vm.scope(|env| -> JniResult<()> {
+            env.call_method(
+                &*provider,
+                jni::jni_str!("onDataAvailable"),
+                jni::jni_sig!("()V"),
+                &[],
+            )?;
+            Ok(())
+        });
+    })
+}
+
 /// Issues the next body read: a fresh direct ByteBuffer whose backing
 /// lives in the slot map until the matching onReadCompleted replaces it.
 pub(crate) fn issue_read(id: u64, request: &Global<JObject<'static>>) {
@@ -641,16 +743,6 @@ pub(crate) fn issue_read(id: u64, request: &Global<JObject<'static>>) {
 /// reads — the buffer global must die after Cronet is done with it).
 pub(crate) fn drop_read_buffer(id: u64) {
     READ_BUFFERS.lock().unwrap().remove(&id);
-}
-
-/// Collects a request body into one buffer (buffered-upload v1).
-async fn buffer_body(mut body: monet_core::body::Body) -> Result<Vec<u8>> {
-    use futures_lite::StreamExt;
-    let mut buf = Vec::new();
-    while let Some(chunk) = body.next().await {
-        buf.extend_from_slice(&chunk?);
-    }
-    Ok(buf)
 }
 
 /// Copies the raw `JavaVM` pointer into a fresh `JavaVM` handle (the

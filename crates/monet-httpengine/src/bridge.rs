@@ -262,6 +262,46 @@ pub extern "system" fn native_on_canceled(
     registry::on_cancelled(id as u64);
 }
 
+/// The chunked provider's take (v2/W2d): fills Cronet's upload read
+/// buffer from the upload queue. The int codes are what
+/// `MonetStreamedProvider.drain` switches on: `> 0` bytes written, `0`
+/// the end of the stream, `-1` nothing yet (the read parks until the
+/// feeder's notify), `-2` the stream failed.
+#[unsafe(no_mangle)]
+pub extern "system" fn native_take_upload_chunk(
+    mut env: EnvUnowned<'_>,
+    _class: JClass<'_>,
+    id: jlong,
+    byte_buffer: JObject<'_>,
+    position: jni::sys::jint,
+    remaining: jni::sys::jint,
+) -> jni::sys::jint {
+    env.with_env(|env| -> Result<jni::sys::jint, jni::errors::Error> {
+        let buffer = env.as_cast::<jni::objects::JByteBuffer>(&byte_buffer)?;
+        let address = env.get_direct_buffer_address(&*buffer)?;
+        // SAFETY: Cronet's upload read buffers are direct (the response
+        // path relies on the same property); the writable window is
+        // [position, position + remaining) from the base.
+        let out: &mut [u8] = unsafe {
+            std::slice::from_raw_parts_mut(address.add(position as usize), remaining as usize)
+        };
+        Ok(match crate::upload::take_chunk(id as u64, out) {
+            crate::upload::Take::Wrote(count) => count as jni::sys::jint,
+            crate::upload::Take::End | crate::upload::Take::Gone => 0,
+            crate::upload::Take::Failed => -2,
+            crate::upload::Take::Empty => -1,
+        })
+    })
+    .resolve::<Policy>()
+}
+
+/// The provider's close (v2/W2d): Cronet is done with the upload — end
+/// the state (the feeder stops, the queue frees).
+#[unsafe(no_mangle)]
+pub extern "system" fn native_close_upload(_env: EnvUnowned<'_>, _class: JClass<'_>, id: jlong) {
+    crate::upload::close(id as u64);
+}
+
 /// Terminal cleanup: drop the read buffer slot and this map's request
 /// handle (the cancel closure owns a separate one).
 fn terminal(id: jlong) {

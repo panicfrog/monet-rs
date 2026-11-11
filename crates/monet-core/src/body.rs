@@ -107,7 +107,48 @@ pub fn bounded(cap: usize) -> (Body, BoundedBodySender) {
     )
 }
 
+/// The outcome of [`Body::take_complete`] — how "finished" a body is
+/// without parking on its producer.
+#[derive(Debug)]
+pub enum Completeness {
+    /// The stream was already complete; holds every byte of it.
+    Complete(Vec<u8>),
+    /// The producer is still live. The caller re-feeds the bytes that
+    /// had already landed (a channel has no peek — the probe consumed
+    /// them) ahead of the stream.
+    Live {
+        /// The bytes the probe pulled before the producer's liveness
+        /// showed; the caller prepends them to the incremental feed.
+        drained: Vec<u8>,
+    },
+    /// The stream already failed; the terminal error.
+    Failed(Error),
+}
+
 impl Body {
+    /// Drains a body that is already complete, without parking on its
+    /// producer. Transports use this to pick the wire shape: a complete
+    /// body is rewindable and carries a length, while a live one must
+    /// stream — and a failure that already arrived fails the request
+    /// outright instead of stalling an upload that can never start.
+    pub fn take_complete(&mut self) -> Completeness {
+        // A noop waker: a Pending poll must not register a wake the real
+        // consumer would rely on — the channel re-registers on the next
+        // (real) poll, so the probe leaves no residue.
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        let mut drained = Vec::new();
+        loop {
+            // Body is Unpin (channel receivers and shared slots only).
+            match Pin::new(&mut *self).poll_next(&mut cx) {
+                Poll::Ready(Some(Ok(bytes))) => drained.extend_from_slice(&bytes),
+                Poll::Ready(Some(Err(error))) => return Completeness::Failed(error),
+                Poll::Ready(None) => return Completeness::Complete(drained),
+                Poll::Pending => return Completeness::Live { drained },
+            }
+        }
+    }
+
     /// A body of one chunk, already complete.
     pub fn from_bytes(bytes: impl Into<Bytes>) -> Body {
         let (body, sender) = channel();
@@ -393,5 +434,48 @@ mod tests {
         ));
         let send = futures_lite::future::block_on(sender.send(Bytes::from("y")));
         assert!(send.is_err());
+    }
+
+    #[test]
+    fn take_complete_drains_a_settled_body() {
+        let mut body = Body::from_chunks(["a", "b"]);
+        match body.take_complete() {
+            Completeness::Complete(bytes) => assert_eq!(bytes, b"ab".to_vec()),
+            other => panic!("expected Complete, got {other:?}"),
+        }
+        let mut empty = Body::empty();
+        match empty.take_complete() {
+            Completeness::Complete(bytes) => assert!(bytes.is_empty()),
+            other => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn take_complete_hands_back_live_drained_bytes() {
+        let (mut body, sender) = channel();
+        // Queued before the probe, but the producer is still live: the
+        // probe must return the bytes it consumed, not lose them.
+        sender.send_chunk("early").unwrap();
+        match body.take_complete() {
+            Completeness::Live { drained } => assert_eq!(drained, b"early".to_vec()),
+            other => panic!("expected Live, got {other:?}"),
+        }
+        sender.send_chunk("late").unwrap();
+        drop(sender);
+        let rest = futures_lite::future::block_on(body.map(|c| c.unwrap()).collect::<Vec<Bytes>>());
+        assert_eq!(rest, [Bytes::from("late")]);
+    }
+
+    #[test]
+    fn take_complete_surfaces_an_already_failed_stream() {
+        let (mut body, sender) = channel();
+        sender.send_chunk("x").unwrap();
+        sender.abort(Error::Body("producer died".into()));
+        match body.take_complete() {
+            Completeness::Failed(error) => {
+                assert!(matches!(error, Error::Body(m) if m.contains("producer died")));
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
     }
 }

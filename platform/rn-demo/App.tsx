@@ -299,6 +299,21 @@ const CHECKS: Array<{
       assert(response.status === 200, `status ${response.status}`);
       const body = await response.text();
       assert(body === 'uploaded', `body ${JSON.stringify(body)}`);
+      // v2/W2d: the wire shape. A live stream goes out through the
+      // chunked provider on Android (getLength() == -1); iOS buffers
+      // until W2c lands. A complete body keeps Content-Length
+      // everywhere — both directions pinned.
+      const mode = response.headers.get('x-upload-mode');
+      const expected = Platform.OS === 'android' ? 'chunked' : 'length';
+      assert(mode === expected, `upload mode ${mode}, expected ${expected}`);
+      const buffered = await fetch(`${base}/upload`, {
+        method: 'POST',
+        body: 'complete-body',
+      });
+      assert(
+        buffered.headers.get('x-upload-mode') === 'length',
+        `buffered upload mode ${buffered.headers.get('x-upload-mode')}`,
+      );
     },
   },
   {

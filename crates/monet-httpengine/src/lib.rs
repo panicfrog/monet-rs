@@ -15,6 +15,8 @@
 
 #[cfg(any(target_os = "android", test))]
 mod registry;
+#[cfg(any(target_os = "android", test))]
+mod upload;
 
 #[cfg(target_os = "android")]
 mod bridge;
