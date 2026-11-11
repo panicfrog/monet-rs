@@ -28,6 +28,7 @@
 use crate::pin;
 use crate::registry;
 use crate::roots;
+use crate::upload;
 use crate::ws;
 
 // ---- data plane: Swift calls these through the generated header ----
@@ -65,6 +66,14 @@ fn on_done(id: u64) {
 /// (`NSURLErrorCancelled`) maps to `Error::Cancelled`.
 fn on_error(id: u64, code: i32, message: &[u8]) {
     registry::on_error(id, code, message);
+}
+
+/// The task holding a streamed upload finished — ends the feeder even
+/// if the producer has nothing more to write (it would otherwise park
+/// in the body stream forever; the write-failure path alone never
+/// reaches a parked producer).
+fn on_upload_done(id: u64) {
+    upload::task_finished(id);
 }
 
 /// Pinning query for the server-trust challenge path: writes up to
@@ -129,6 +138,7 @@ pub mod bridge {
         fn on_redirect(id: u64, location: &[u8]);
         fn on_done(id: u64);
         fn on_error(id: u64, code: i32, message: &[u8]);
+        fn on_upload_done(id: u64);
         fn pins_for_host(host: &[u8], out: &mut [u8]) -> usize;
         fn roots_count() -> usize;
         fn root_at(index: usize, out: &mut [u8]) -> usize;
@@ -153,6 +163,13 @@ pub mod bridge {
         );
         fn transport_cancel(id: u64);
         fn transport_resume(id: u64);
+        // Streaming uploads (v2/W2c): mark the request streamed before
+        // start (the pipe exists from start on), then feed/finish/fail
+        // the pipe's output half.
+        fn transport_set_streaming(id: u64);
+        fn transport_upload_write(id: u64, data: &[u8]) -> bool;
+        fn transport_upload_finish(id: u64);
+        fn transport_upload_fail(id: u64);
         fn ws_add_header(id: u64, name: &[u8], value: &[u8]);
         fn ws_open(id: u64, url: &[u8]);
         fn ws_send(id: u64, is_binary: bool, data: &[u8]);

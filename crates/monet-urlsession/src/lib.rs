@@ -15,13 +15,13 @@ mod ffi;
 mod pin;
 mod registry;
 mod roots;
+mod upload;
 mod ws;
 
 pub use ffi::bridge;
 
-use futures_lite::StreamExt;
 use futures_lite::future::race;
-use monet_core::body::Body;
+use monet_core::body::Completeness;
 use monet_core::cancel::CancelToken;
 use monet_core::error::{Error, Result};
 use monet_core::pin::PinConfig;
@@ -97,7 +97,7 @@ impl Default for UrlsessionTransport {
 }
 
 impl Transport for UrlsessionTransport {
-    fn execute(&self, req: Request, cancel: CancelToken) -> BoxFuture<Result<Response>> {
+    fn execute(&self, mut req: Request, cancel: CancelToken) -> BoxFuture<Result<Response>> {
         // Per-request overrides win; the instance values are the
         // defaults (nitro's per-request-only knobs ride the same
         // per-call control-plane parameters).
@@ -107,16 +107,36 @@ impl Transport for UrlsessionTransport {
             if cancel.is_cancelled() {
                 return Err(Error::Cancelled);
             }
-            // v1 uploads are fully buffered (nitro-fetch parity: the body
-            // is collected before the task starts).
-            let body = buffer_body(req.body).await?;
+            // v2/W2c: the probe decides the upload's shape without
+            // parking — a complete body buffers (httpBody carries
+            // Content-Length and redirects can replay it), a live one
+            // streams through the upload pipe
+            // (uploadTask(withStreamedRequest:) + needNewBodyStream —
+            // chunked on the wire, not replayable), and a failure that
+            // already arrived fails the request outright.
+            enum Upload {
+                Buffered(Vec<u8>),
+                /// The drained prefix; the live stream follows through
+                /// the feeder.
+                Streamed(Vec<u8>),
+            }
+            let upload = match req.body.take_complete() {
+                Completeness::Complete(bytes) => Upload::Buffered(bytes),
+                Completeness::Live { drained } => Upload::Streamed(drained),
+                Completeness::Failed(error) => return Err(error),
+            };
 
             let (id, head_rx) = registry::allocate(cancel.clone());
             for (name, value) in req.headers.iter_flattened() {
                 bridge::transport_add_header(id, name.as_bytes(), value.as_bytes());
             }
-            if !body.is_empty() {
-                bridge::transport_set_body(id, &body);
+            match &upload {
+                Upload::Buffered(bytes) => {
+                    if !bytes.is_empty() {
+                        bridge::transport_set_body(id, bytes);
+                    }
+                }
+                Upload::Streamed(_) => bridge::transport_set_streaming(id),
             }
             bridge::transport_start(
                 id,
@@ -125,6 +145,11 @@ impl Transport for UrlsessionTransport {
                 follow_redirects,
                 timeout_ms,
             );
+            // The feeder follows the start: the Swift pipe must exist
+            // before the first write can land.
+            if let Upload::Streamed(drained) = upload {
+                upload::spawn_feeder(id, req.body, cancel.clone(), drained);
+            }
 
             enum Step<T> {
                 Head(T),
@@ -151,15 +176,6 @@ impl Transport for UrlsessionTransport {
             }
         })
     }
-}
-
-/// Collects a request body into one buffer for the buffered-upload v1.
-async fn buffer_body(mut body: Body) -> Result<Vec<u8>> {
-    let mut buf = Vec::new();
-    while let Some(chunk) = body.next().await {
-        buf.extend_from_slice(&chunk?);
-    }
-    Ok(buf)
 }
 
 impl WebSocketTransport for UrlsessionTransport {

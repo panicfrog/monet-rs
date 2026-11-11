@@ -812,6 +812,15 @@ pub fn slow_upload_does_not_block_new_requests(t: &dyn Transport, server: &HttpS
             uploaded.body.map(|c| c.unwrap()).collect::<Vec<_>>(),
         );
         assert_eq!(uploaded_body.concat(), b"uploaded".to_vec());
+
+        // The wire shape (v2/W2c/W2d): a live-streamed body goes out
+        // chunked — no transport may buffer it into a Content-Length
+        // send (that would mean collecting the whole stream first).
+        let mode = uploaded
+            .headers
+            .get("x-upload-mode")
+            .expect("the /upload route reports the wire mode");
+        assert_eq!(mode, "chunked", "a streamed upload must not carry a length");
     });
 
     let seen = server.seen_for("/upload");

@@ -39,6 +39,24 @@ void transport_resume(std::uint64_t id) {
   MonetUrlsessionBridge::monetTransportResume(id);
 }
 
+void transport_set_streaming(std::uint64_t id) {
+  MonetUrlsessionBridge::monetTransportSetStreaming(id);
+}
+
+bool transport_upload_write(
+    std::uint64_t id, rust::Slice<const std::uint8_t> data) {
+  return MonetUrlsessionBridge::monetTransportUploadWrite(
+      id, data.data(), data.size());
+}
+
+void transport_upload_finish(std::uint64_t id) {
+  MonetUrlsessionBridge::monetTransportUploadFinish(id);
+}
+
+void transport_upload_fail(std::uint64_t id) {
+  MonetUrlsessionBridge::monetTransportUploadFail(id);
+}
+
 void ws_add_header(
     std::uint64_t id,
     rust::Slice<const std::uint8_t> name,

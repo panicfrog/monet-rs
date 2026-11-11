@@ -14,8 +14,105 @@ final class RequestBox {
   var headers: [(String, String)] = []
   var body = Data()
   var hasBody = false
+  /// v2/W2c: the body streams through an upload pipe instead of
+  /// httpBody.
+  var streamed = false
+  var uploadPipe: UploadPipe?
   /// Set once the task exists; nil while still assembling.
   var task: URLSessionDataTask?
+}
+
+/// One streamed upload's plumbing (v2/W2c): a bound stream pair whose
+/// input half URLSession reads as the request body (the task's
+/// needNewBodyStream callback hands it over) and whose output half the
+/// Rust feeder writes through the control plane. The pair's buffer
+/// bounds the in-flight bytes — a full buffer parks the write until
+/// URLSession drains it, which is the upload's natural backpressure.
+final class UploadPipe: NSObject {
+  let input: InputStream
+  let output: OutputStream
+  private let lock = NSLock()
+  private var ended = false
+  /// Set once the input half was handed to the session — a second ask
+  /// (a body-preserving redirect) cannot be served: a stream cannot
+  /// replay.
+  private var handedOver = false
+
+  override init() {
+    var readStream: Unmanaged<CFReadStream>?
+    var writeStream: Unmanaged<CFWriteStream>?
+    // 64KB of in-flight upload bytes — the same order as the response
+    // channel's bound. The pair creation only allocates; a nil unwrap
+    // here is malloc-failure territory.
+    CFStreamCreateBoundPair(nil, &readStream, &writeStream, 64 * 1024)
+    input = readStream!.takeRetainedValue()
+    output = writeStream!.takeRetainedValue()
+    super.init()
+    // The output half opens now (the write loop feeds it); the input
+    // half stays closed — the session opens and schedules it itself
+    // when needNewBodyStream hands it over (a pre-opened stream breaks
+    // the session's management: it errors and re-asks in a loop, as the
+    // host battery traced).
+    output.open()
+  }
+
+  private func isEnded() -> Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return ended
+  }
+
+  private func markEnded() {
+    lock.lock()
+    ended = true
+    lock.unlock()
+  }
+
+  /// The input half for needNewBodyStream. Nil when this pipe already
+  /// served one ask (a replay — a redirect that preserves the body) or
+  /// has ended: the task then fails, the same refusal the Android
+  /// provider's rewind makes.
+  func takeInput() -> InputStream? {
+    lock.lock()
+    defer { lock.unlock() }
+    guard !handedOver, !ended else { return nil }
+    handedOver = true
+    return input
+  }
+
+  /// Writes one chunk from the Rust feeder's thread. False means the
+  /// pipe ended (the task is gone) — the feeder stops.
+  func write(_ data: Data) -> Bool {
+    guard !data.isEmpty else { return !isEnded() }
+    var offset = 0
+    let count = data.count
+    return data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Bool in
+      guard let base = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return true }
+      while offset < count {
+        if isEnded() { return false }
+        let written = output.write(base + offset, maxLength: count - offset)
+        if written > 0 {
+          offset += written
+        } else if written == 0 {
+          // The pair's buffer is full: URLSession hasn't drained it.
+          // Poll — the session reads at the network's pace, and a
+          // bounded poll keeps an ended pipe from parking this thread.
+          Thread.sleep(forTimeInterval: 0.05)
+        } else {
+          markEnded()
+          return false
+        }
+      }
+      return true
+    }
+  }
+
+  /// Ends the stream cleanly: the input half sees EOF, which completes
+  /// the request body.
+  func finish() {
+    markEnded()
+    output.close()
+  }
 }
 
 /// The shared transport: one URLSession, one registry of live requests.
@@ -54,12 +151,22 @@ final class TransportShim {
     lock.unlock()
   }
 
+  /// Marks the request's body as streamed (v2/W2c): start then builds
+  /// an uploadTask(withStreamedRequest:) whose body the pipe feeds.
+  func setStreaming(id: UInt64) {
+    lock.lock()
+    lockedBox(for: id).streamed = true
+    lock.unlock()
+  }
+
   func start(id: UInt64, url urlString: String, method: String, followRedirects: Bool, timeoutMs: UInt64) {
     lock.lock()
     // Get-or-create: a headerless, bodyless request never touched the box
     // through addHeader/setBody, and it still has to start.
     let box = lockedBox(for: id)
-    let pending = (headers: box.headers, body: box.body, hasBody: box.hasBody)
+    let pending = (
+      headers: box.headers, body: box.body, hasBody: box.hasBody, streamed: box.streamed
+    )
     lock.unlock()
 
     guard let url = URL(string: urlString) else {
@@ -81,7 +188,18 @@ final class TransportShim {
       request.httpBody = pending.body
     }
 
-    let task = session.dataTask(with: request)
+    // v2/W2c: a streamed body has no httpBody — the session asks for
+    // it through needNewBodyStream and the pipe feeds it. The pipe is
+    // created here so control-plane writes (which start once
+    // transport_start returns) always find it.
+    let pipe = pending.streamed ? UploadPipe() : nil
+
+    let task: URLSessionTask
+    if pending.streamed {
+      task = session.uploadTask(withStreamedRequest: request)
+    } else {
+      task = session.dataTask(with: request)
+    }
     task.delegate = TaskDelegate(id: id, followRedirects: followRedirects)
 
     lock.lock()
@@ -91,7 +209,8 @@ final class TransportShim {
       lock.unlock()
       return
     }
-    box.task = task
+    box.task = task as? URLSessionDataTask
+    box.uploadPipe = pipe
     lock.unlock()
     task.resume()
   }
@@ -128,11 +247,58 @@ final class TransportShim {
     task?.resume()
   }
 
+  /// The input half for the task's needNewBodyStream ask (v2/W2c). Nil
+  /// refuses the ask — see UploadPipe.takeInput.
+  func uploadStream(for id: UInt64) -> InputStream? {
+    lock.lock()
+    let pipe = boxes[id]?.uploadPipe
+    lock.unlock()
+    return pipe?.takeInput()
+  }
+
+  /// One chunk into the upload pipe (v2/W2c). False ends the feeder:
+  /// the pipe is gone or the task finished.
+  func uploadWrite(id: UInt64, data: Data) -> Bool {
+    lock.lock()
+    let pipe = boxes[id]?.uploadPipe
+    lock.unlock()
+    guard let pipe else { return false }
+    return pipe.write(data)
+  }
+
+  /// The body ended cleanly: EOF.
+  func uploadFinish(id: UInt64) {
+    lock.lock()
+    let pipe = boxes[id]?.uploadPipe
+    lock.unlock()
+    pipe?.finish()
+  }
+
+  /// The body failed: cancel the task, remapping the cancellation into
+  /// an upload error (the pinning rejection's pattern).
+  func uploadFail(id: UInt64) {
+    lock.lock()
+    let box = boxes[id]
+    lock.unlock()
+    box?.uploadPipe?.finish()
+    if let delegate = box?.task?.delegate as? TaskDelegate {
+      delegate.uploadFailure = "the upload body failed (the producer's stream errored)"
+    }
+    box?.task?.cancel()
+  }
+
   /// Called by a task delegate on completion so the box doesn't leak.
   func completed(id: UInt64) {
     lock.lock()
-    boxes.removeValue(forKey: id)
+    let box = boxes.removeValue(forKey: id)
     lock.unlock()
+    // Release the pipe (a parked feeder write exits) and end the feeder
+    // itself (it may be parked in the body stream with nothing left to
+    // write — the data-plane wake reaches it).
+    box?.uploadPipe?.finish()
+    if box?.streamed == true {
+      on_upload_done(id)
+    }
   }
 }
 
@@ -146,6 +312,9 @@ final class TaskDelegate: NSObject, URLSessionDataDelegate {
   /// the chain; the rejection completes the task as a cancellation, so
   /// didCompleteWithError remaps it to a certificate error.
   var pinRejection: String?
+  /// Set when a streamed upload's producer failed (v2/W2c); the
+  /// task.cancel() it triggers remaps the same way.
+  var uploadFailure: String?
 
   init(id: UInt64, followRedirects: Bool) {
     self.id = id
@@ -244,6 +413,19 @@ final class TaskDelegate: NSObject, URLSessionDataDelegate {
     }
   }
 
+  /// The session needs the request body of a streamed upload (v2/W2c):
+  /// hand over the pipe's input half. This fires for the first send and
+  /// again for body-preserving redirects/retries — the second kind
+  /// cannot be served (a stream cannot replay; nil fails the task), the
+  /// same refusal the Android provider's rewind makes.
+  func urlSession(
+    _ session: URLSession,
+    task: URLSessionTask,
+    needNewBodyStream completionHandler: @escaping (InputStream?) -> Void
+  ) {
+    completionHandler(TransportShim.shared.uploadStream(for: id))
+  }
+
   func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
     TransportShim.shared.completed(id: id)
     if let error = error as NSError? {
@@ -252,6 +434,10 @@ final class TaskDelegate: NSObject, URLSessionDataDelegate {
         // a certificate failure instead of Error::Cancelled.
         notifyError(
           id, code: NSURLErrorServerCertificateUntrusted, message: reason)
+      } else if error.code == NSURLErrorCancelled, let reason = uploadFailure {
+        // A failed upload producer surfaces the same way.
+        notifyError(
+          id, code: NSURLErrorRequestBodyStreamExhausted, message: reason)
       } else {
         notifyError(id, code: error.code, message: error.localizedDescription)
       }
@@ -310,4 +496,29 @@ public func monetTransportCancel(_ id: UInt64) {
 @_expose(Cxx)
 public func monetTransportResume(_ id: UInt64) {
   TransportShim.shared.resume(id: id)
+}
+
+@_expose(Cxx)
+public func monetTransportSetStreaming(_ id: UInt64) {
+  TransportShim.shared.setStreaming(id: id)
+}
+
+@_expose(Cxx)
+public func monetTransportUploadWrite(
+  _ id: UInt64,
+  _ dataPtr: UnsafePointer<UInt8>,
+  _ dataLen: Int
+) -> Bool {
+  let data = Data(bytes: dataPtr, count: dataLen)
+  return TransportShim.shared.uploadWrite(id: id, data: data)
+}
+
+@_expose(Cxx)
+public func monetTransportUploadFinish(_ id: UInt64) {
+  TransportShim.shared.uploadFinish(id: id)
+}
+
+@_expose(Cxx)
+public func monetTransportUploadFail(_ id: UInt64) {
+  TransportShim.shared.uploadFail(id: id)
 }

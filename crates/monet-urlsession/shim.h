@@ -31,6 +31,16 @@ void transport_cancel(std::uint64_t id);
 // overflow. A no-op on finished tasks.
 void transport_resume(std::uint64_t id);
 
+// Streaming uploads (v2/W2c): set_streaming marks the request before
+// start (the upload pipe exists from start on); write feeds one chunk
+// into the pipe (false = the pipe ended, the feeder stops); finish ends
+// the body cleanly (EOF); fail cancels the task with the cancellation
+// remapped to an upload error.
+void transport_set_streaming(std::uint64_t id);
+bool transport_upload_write(std::uint64_t id, rust::Slice<const std::uint8_t> data);
+void transport_upload_finish(std::uint64_t id);
+void transport_upload_fail(std::uint64_t id);
+
 // Control plane, WebSocket: same assemble-then-start ordering as HTTP
 // (add_header first, open sends). ws_close with code 0 sends a close
 // frame without a payload; ws_cancel force-cancels the connection.
