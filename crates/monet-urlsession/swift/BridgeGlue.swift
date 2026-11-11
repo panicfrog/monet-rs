@@ -35,18 +35,16 @@ func notifyResponseHead(_ id: UInt64, status: Int) {
 }
 
 /// Sends one body chunk. URLSession never delivers empty data events, so
-/// the empty case is defensive only. Returns the pause signal (v2/W2b):
-/// `true` means the bounded channel is full and the task must suspend
-/// until the Rust body watcher resumes it.
+/// the empty case is defensive only. The consumer's pace is enforced on
+/// the Rust side (the bounded channel + the overflow its body watcher
+/// drains — v2/W2b redesign, no task suspension).
 @inline(__always)
-func notifyChunk(_ id: UInt64, data: Data) -> Bool {
-  guard !data.isEmpty else { return false }
-  var paused = false
+func notifyChunk(_ id: UInt64, data: Data) {
+  guard !data.isEmpty else { return }
   data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-    paused = monet_on_chunk(
+    monet_on_chunk(
       id, raw.baseAddress?.assumingMemoryBound(to: UInt8.self), raw.count)
   }
-  return paused
 }
 
 /// Sends an informational redirect event.

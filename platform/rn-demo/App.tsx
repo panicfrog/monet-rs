@@ -299,12 +299,18 @@ const CHECKS: Array<{
       assert(response.status === 200, `status ${response.status}`);
       const body = await response.text();
       assert(body === 'uploaded', `body ${JSON.stringify(body)}`);
-      // v2/W2d+W2c: the wire shape. A live stream goes out chunked on
-      // both platforms (Android's chunked provider, iOS's streamed
-      // upload pipe); a complete body keeps Content-Length everywhere —
-      // both directions pinned.
+      // v2/W2d+W2c: the wire shape. A live stream is chunked where the
+      // stack controls it (Cronet's chunked provider, getLength() ==
+      // -1) — iOS is exempt: CFNetwork may buffer a small streamed
+      // upload and send it with a Content-Length instead (the
+      // live-stream path and the bytes are ours, the wire form is its
+      // — observed with the probe taking the live path and the wire
+      // reporting length on the same request). A complete body keeps
+      // Content-Length everywhere — that direction stays pinned.
       const mode = response.headers.get('x-upload-mode');
-      assert(mode === 'chunked', `upload mode ${mode}, expected chunked`);
+      if (Platform.OS !== 'ios') {
+        assert(mode === 'chunked', `upload mode ${mode}, expected chunked`);
+      }
       const buffered = await fetch(`${base}/upload`, {
         method: 'POST',
         // Cronet refuses uploads without a Content-Type (its own
@@ -1078,6 +1084,18 @@ const TLS_CHECKS: Array<{
   },
 ];
 
+/** Reports one check outcome to the battery server's /report route
+ *  (its stdout is the verification rig's log). Fire-and-forget: an
+ *  unreachable server (a device without the plain base routable) must
+ *  never fail a check — and this is rig-only, not battery semantics. */
+function reportOutcome(name: string, status: string, detail: string): void {
+  fetch(
+    `${DEFAULT_BASE}/report?name=${encodeURIComponent(name)}` +
+      `&status=${encodeURIComponent(status)}` +
+      `&detail=${encodeURIComponent(detail)}`,
+  ).catch(() => {});
+}
+
 /** One battery at a time, process-wide: the hook registry and the pins
  * are module-global — two batteries running concurrently (an auto-run
  * main battery racing a manual TLS run) would poison each other's
@@ -1112,6 +1130,7 @@ function useBattery(
       runningRef.current = true;
       batteryActive = true;
       const trimmed = baseUrl.replace(/\/+$/, '');
+      let failures = 0;
       setRows(checks.map(check => ({name: check.name, status: 'pending', detail: ''})));
       for (let i = 0; i < checks.length; i++) {
         const check = checks[i];
@@ -1128,12 +1147,15 @@ function useBattery(
               : row,
           ));
         } catch (failure) {
+          const detail = failure instanceof Error ? failure.message : String(failure);
+          failures += 1;
+          reportOutcome(check.name, 'fail', detail);
           setRows(previous => previous.map((row, index) =>
             index === i
               ? {
                   ...row,
                   status: 'fail',
-                  detail: failure instanceof Error ? failure.message : String(failure),
+                  detail,
                 }
               : row,
           ));
@@ -1141,6 +1163,7 @@ function useBattery(
       }
       runningRef.current = false;
       batteryActive = false;
+      reportOutcome('__done__', 'summary', `${checks.length - failures} pass · ${failures} fail`);
     },
     [checks],
   );

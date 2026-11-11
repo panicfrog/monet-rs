@@ -45,11 +45,11 @@ fn on_response_head(id: u64, status: u16) {
     registry::on_response_head(id, status);
 }
 
-/// Delivers one body chunk. `true` means paused (v2/W2b): the bounded
-/// channel is full and Swift must suspend the task; the body watcher
-/// resumes it (`transport_resume`) once the consumer has drained.
-fn on_chunk(id: u64, data: &[u8]) -> bool {
-    registry::on_chunk(id, data)
+/// Delivers one body chunk. The consumer's pace is enforced on the Rust
+/// side (the bounded channel + the overflow the body watcher drains —
+/// v2/W2b redesign; no task suspension).
+fn on_chunk(id: u64, data: &[u8]) {
+    registry::on_chunk(id, data);
 }
 
 /// Informational: fired for redirects that are being followed. v1 records
@@ -88,14 +88,6 @@ fn pins_for_host(host: &[u8], out: &mut [u8]) -> usize {
 /// alongside the pin query.
 fn roots_count() -> usize {
     roots::count()
-}
-
-/// Whether a stall is still pending its drain (v2/W2b fix): the Swift
-/// suspend re-checks this under its lock — a stall the watcher already
-/// drained must not suspend (the resume would have fired before the
-/// suspend landed, parking the task forever).
-fn still_stalled(id: u64) -> bool {
-    registry::still_stalled(id)
 }
 
 /// Copies root `index`'s DER into `out`, returning the bytes written;
@@ -142,7 +134,7 @@ pub mod bridge {
     extern "Rust" {
         fn on_header(id: u64, name: &[u8], value: &[u8]);
         fn on_response_head(id: u64, status: u16);
-        fn on_chunk(id: u64, data: &[u8]) -> bool;
+        fn on_chunk(id: u64, data: &[u8]);
         fn on_redirect(id: u64, location: &[u8]);
         fn on_done(id: u64);
         fn on_error(id: u64, code: i32, message: &[u8]);
@@ -150,7 +142,6 @@ pub mod bridge {
         fn pins_for_host(host: &[u8], out: &mut [u8]) -> usize;
         fn roots_count() -> usize;
         fn root_at(index: usize, out: &mut [u8]) -> usize;
-        fn still_stalled(id: u64) -> bool;
         fn on_ws_open(id: u64);
         fn on_ws_message(id: u64, is_binary: bool, data: &[u8]);
         fn on_ws_ping(id: u64, data: &[u8]);
@@ -171,7 +162,6 @@ pub mod bridge {
             timeout_ms: u64,
         );
         fn transport_cancel(id: u64);
-        fn transport_resume(id: u64);
         // Streaming uploads (v2/W2c): mark the request streamed before
         // start (the pipe exists from start on), then feed/finish/fail
         // the pipe's output half.

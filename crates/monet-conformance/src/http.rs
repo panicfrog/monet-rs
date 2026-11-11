@@ -121,6 +121,37 @@ impl HttpServer {
                             async move {
                                 let (parts, body) = req.into_parts();
                                 let body = body.collect().await.unwrap().to_bytes();
+                                // The rig's result channel: the battery app
+                                // reports each check's outcome here and the
+                                // server prints it (its stdout is the log the
+                                // harness reads — RN's console.log never
+                                // reaches os_log, and Metro's terminal is not
+                                // the rig's to read).
+                                if parts.uri.path() == "/report" {
+                                    println!(
+                                        "REPORT {} {}",
+                                        parts.uri.query().unwrap_or(""),
+                                        parts.method.as_str()
+                                    );
+                                }
+                                if parts.uri.path() == "/upload" {
+                                    // The upload wire-form probe: what the
+                                    // request actually carried.
+                                    let header = |name: &str| {
+                                        parts
+                                            .headers
+                                            .get(name)
+                                            .and_then(|v| v.to_str().ok())
+                                            .unwrap_or("-")
+                                            .to_string()
+                                    };
+                                    println!(
+                                        "UPLOAD len={} te={} body_bytes={}",
+                                        header("content-length"),
+                                        header("transfer-encoding"),
+                                        body.len()
+                                    );
+                                }
                                 let _ = seen_tx.send(Seen {
                                     method: parts.method.as_str().to_string(),
                                     uri: parts.uri.to_string(),

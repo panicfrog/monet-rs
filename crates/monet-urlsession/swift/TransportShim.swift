@@ -18,13 +18,6 @@ final class RequestBox {
   /// httpBody.
   var streamed = false
   var uploadPipe: UploadPipe?
-  /// v2/W2b: the backpressure valve's own suspend bookkeeping — the
-  /// task was suspended by the valve and not yet resumed. Guards the
-  /// pairing: a resume only runs when a suspend did (the watcher's
-  /// fast-drain path can resume before the delegate's suspend would
-  /// land — an unpaired resume is skipped, and the still-stalled
-  /// re-check skips its suspend in turn).
-  var valveSuspended = false
   /// Set once the task exists; nil while still assembling.
   var task: URLSessionDataTask?
 }
@@ -236,36 +229,6 @@ final class TransportShim {
     task?.cancel()
   }
 
-  /// The body backpressure valve (v2/W2b): Rust probed the bounded
-  /// channel full, so data delivery pauses until the consumer drains.
-  /// The stall is re-checked under this lock against the watcher's flag
-  /// (the watcher clears it BEFORE resuming, and the resume takes this
-  /// same lock): a stall that already drained must not suspend, and a
-  /// resume only runs when a suspend did — the pairing the counted
-  /// task.suspend()/resume() demand.
-  func suspend(id: UInt64) {
-    lock.lock()
-    if let box = boxes[id], let task = box.task, still_stalled(id) {
-      box.valveSuspended = true
-      task.suspend()
-    }
-    lock.unlock()
-  }
-
-  /// The valve's resume edge: the Rust body watcher calls it after
-  /// draining the overflow. A no-op on finished tasks and on drains
-  /// that out-ran their suspend (the still-stalled re-check skipped
-  /// it). The suspend and resume calls are serialized by this lock —
-  /// the ordering both sides' checks depend on.
-  func resume(id: UInt64) {
-    lock.lock()
-    if let box = boxes[id], box.valveSuspended, let task = box.task {
-      box.valveSuspended = false
-      task.resume()
-    }
-    lock.unlock()
-  }
-
   /// The input half for the task's needNewBodyStream ask (v2/W2c). Nil
   /// refuses the ask — see UploadPipe.takeInput.
   func uploadStream(for id: UInt64) -> InputStream? {
@@ -404,14 +367,18 @@ final class TaskDelegate: NSObject, URLSessionDataDelegate {
   }
 
   func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-    let paused = notifyChunk(id, data: data)
-    if paused {
-      // The bounded body channel is full (v2/W2b): stop data delivery
-      // until the consumer drains — the Rust body watcher resumes
-      // through transportResume. Suspend only pauses delivery; the
-      // task's lifecycle (cancel, completion) is untouched.
-      TransportShim.shared.suspend(id: id)
-    }
+    // v2/W2b redesign: no task.suspend() valve. The instrumented
+    // evidence (see the plan's W2b record) showed balanced
+    // suspend/resume pairing with the task never delivering again —
+    // URLSessionTask suspend/resume is not a reliable pause primitive
+    // (a resumed task can simply stop delivering data and completion).
+    // The consumer's pace is enforced entirely on the Rust side: the
+    // bounded body channel plus the overflow the body watcher drains.
+    // The boundary this leaves: the transport buffers the response at
+    // network pace (the overflow), so peak memory is the response size
+    // — the network pause the other two stacks get (Cronet's read
+    // gate, rustls's channel capacity) has no safe equivalent here.
+    _ = notifyChunk(id, data: data)
   }
 
   func urlSession(
@@ -510,11 +477,6 @@ public func monetTransportStart(
 @_expose(Cxx)
 public func monetTransportCancel(_ id: UInt64) {
   TransportShim.shared.cancel(id: id)
-}
-
-@_expose(Cxx)
-public func monetTransportResume(_ id: UInt64) {
-  TransportShim.shared.resume(id: id)
 }
 
 @_expose(Cxx)

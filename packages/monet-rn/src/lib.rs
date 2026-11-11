@@ -45,6 +45,33 @@ mod ws;
 /// that always retries must fail the fetch, not loop forever.
 const MAX_HOOK_RETRIES: u32 = 3;
 
+/// The rig's observation channel (mirrors monet-urlsession's): appends
+/// to $HOME/monet-valve.log in the app container — stderr reaches
+/// nowhere capturable on iOS and NSLog perturbs delegate races.
+fn valve_log(line: &str) {
+    use std::io::Write as _;
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("MONET_VALVE_LOG").is_ok()
+            || std::env::args().any(|arg| arg == "MONET_VALVE_LOG=1")
+    });
+    if !*ENABLED {
+        return;
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(format!("{home}/monet-valve.log"))
+        {
+            let ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let _ = writeln!(file, "{ms} {line}");
+        }
+    }
+}
+
 /// The module state: one shared transport (behind the client for future
 /// hook plumbing, and directly for the fetch pumps — one engine, one
 /// connection pool, one lifecycle), rebuilt when configuration changes,
@@ -413,6 +440,7 @@ impl Monet {
             .map_err(|e| anyhow::anyhow!("invalid URL: {e}"))?;
 
         let (fetch_id, cancel) = self.fetches.allocate();
+        valve_log(&format!("SPAWN fetch id={fetch_id} buffered={}", body_bytes.is_some()));
         let on_head = Arc::new(on_head);
         let on_chunk = Arc::new(on_chunk);
         let on_done = Arc::new(on_done);
@@ -470,6 +498,7 @@ impl Monet {
         // the sending half through the module methods.
         let (body, feed) = monet_core::body::channel();
         self.fetches.attach_stream_feed(fetch_id, feed);
+        crate::valve_log(&format!("SPAWN fetch_stream id={fetch_id}"));
         let on_head = Arc::new(on_head);
         let on_chunk = Arc::new(on_chunk);
         let on_done = Arc::new(on_done);
@@ -501,6 +530,7 @@ impl Monet {
         chunk: jsi::JsiArrayBuffer<'rt>,
     ) -> anyhow::Result<()> {
         let bytes = chunk.data(rt).to_vec();
+        crate::valve_log(&format!("PUSH id={id} bytes={}", bytes.len()));
         if !self.fetches.stream_chunk(id, bytes) {
             anyhow::bail!("no streaming body for fetch {id} (completed, errored, or cleaned up)");
         }
@@ -510,6 +540,7 @@ impl Monet {
     /// Ends a streaming body successfully: the request's upload
     /// completes with everything pushed so far.
     pub fn fetch_stream_complete(&self, id: f64) -> anyhow::Result<()> {
+        crate::valve_log(&format!("COMPLETE id={id}"));
         let _ = self.fetches.stream_complete(id);
         Ok(())
     }
@@ -707,7 +738,8 @@ fn spawn_fetch_pump(
     on_error: Arc<jsi_turbo::TurboCallback>,
 ) {
     async_global_executor::spawn(async move {
-            // Hold one Arc for the pump's lifetime: a pin-config rebuild
+        valve_log(&format!("PUMP-START id={fetch_id}"));
+        // Hold one Arc for the pump's lifetime: a pin-config rebuild
             // swaps the module's transport, and the old engine's
             // shutdown() must wait until this pump is done with it. The
             // original stays usable for the per-attempt executes.

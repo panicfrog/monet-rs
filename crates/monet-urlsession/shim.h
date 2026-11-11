@@ -29,7 +29,7 @@ void transport_cancel(std::uint64_t id);
 // Resumes a task suspended by the body backpressure valve (v2/W2b):
 // the Rust body watcher calls it after the consumer has drained the
 // overflow. A no-op on finished tasks.
-void transport_resume(std::uint64_t id);
+
 
 // Streaming uploads (v2/W2c): set_streaming marks the request before
 // start (the upload pipe exists from start on); write feeds one chunk

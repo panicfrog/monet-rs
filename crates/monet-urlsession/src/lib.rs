@@ -96,6 +96,34 @@ impl Default for UrlsessionTransport {
     }
 }
 
+/// The rig's observation channel: appends to $HOME/monet-valve.log in
+/// the app container (stderr reaches nowhere capturable on iOS, os_log
+/// needs the os_log API, and NSLog perturbs the delegate races — a
+/// plain file is the non-perturbing channel).
+fn valve_log(line: &str) {
+    use std::io::Write as _;
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("MONET_VALVE_LOG").is_ok()
+            || std::env::args().any(|arg| arg == "MONET_VALVE_LOG=1")
+    });
+    if !*ENABLED {
+        return;
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(format!("{home}/monet-valve.log"))
+        {
+            let ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let _ = writeln!(file, "{ms} {line}");
+        }
+    }
+}
+
 impl Transport for UrlsessionTransport {
     fn execute(&self, mut req: Request, cancel: CancelToken) -> BoxFuture<Result<Response>> {
         // Per-request overrides win; the instance values are the
@@ -121,8 +149,14 @@ impl Transport for UrlsessionTransport {
                 Streamed(Vec<u8>),
             }
             let upload = match req.body.take_complete() {
-                Completeness::Complete(bytes) => Upload::Buffered(bytes),
-                Completeness::Live { drained } => Upload::Streamed(drained),
+                Completeness::Complete(bytes) => {
+                    valve_log(&format!("PROBE complete bytes={}", bytes.len()));
+                    Upload::Buffered(bytes)
+                }
+                Completeness::Live { drained } => {
+                    valve_log(&format!("PROBE live drained={}", drained.len()));
+                    Upload::Streamed(drained)
+                }
                 Completeness::Failed(error) => return Err(error),
             };
 
