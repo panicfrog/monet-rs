@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 use futures_channel::oneshot;
 use jsi_turbo::TurboCallback;
 use monet_core::error::{Error, Result};
-use monet_core::hook::{RequestHook, RequestObserver, ResponseHook, ResponseObserver};
+use monet_core::hook::{HookOutcome, RequestHook, RequestObserver, ResponseHook, ResponseObserver};
 use monet_core::request::Request;
 use monet_core::response::Response;
 use monet_core::transport::BoxFuture;
@@ -92,15 +92,31 @@ pub struct HookResponseEvent {
     pub headers: Vec<HeaderKV>,
 }
 
+/// A hook's mocked response (v2/W3): the hook answered the request
+/// itself — no transport runs, nothing goes on the wire. The body is
+/// UTF-8 text (fixtures are JSON/text; binary mocks would need a
+/// protocol field the TurboStruct surface does not carry today).
+#[derive(serde::Serialize, serde::Deserialize, jsi_turbo::TurboStruct, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct HookMockedResponse {
+    pub status: f64,
+    pub headers: Vec<HeaderKV>,
+    #[serde(default)]
+    pub body: Option<String>,
+}
+
 /// What JS sends back to resolve a request hook: the rewritten
-/// url/method/headers. The body and extensions pass through untouched —
-/// v1 keeps bodies out of the protocol.
+/// url/method/headers, or — when `mocked` is set — a mocked response
+/// that short-circuits the transport (v2/W3). The body and extensions
+/// pass through untouched — v1 keeps request bodies out of the protocol.
 #[derive(serde::Serialize, serde::Deserialize, jsi_turbo::TurboStruct, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct HookRequestResolution {
     pub url: String,
     pub method: String,
     pub headers: Vec<HeaderKV>,
+    #[serde(default)]
+    pub mocked: Option<HookMockedResponse>,
 }
 
 /// What JS sends back to resolve a response hook: the rewritten
@@ -192,6 +208,37 @@ pub(crate) fn metadata_bag(metadata: &[HeaderKV]) -> JsMetadata {
     )
 }
 
+/// Builds the [`Response`] a mocking hook answered with: status/headers
+/// from the resolution, the body as one complete chunk, and the
+/// pipeline's extensions (the outcome contract threads them so the
+/// response chain reports the fetch's ids). A status that is not a valid
+/// HTTP code fails the hook — a malformed mock must not reach delivery.
+fn build_mocked_response(
+    mocked: HookMockedResponse,
+    extensions: monet_core::extensions::Extensions,
+) -> Result<Response> {
+    let code = mocked.status.round();
+    if !(0.0..=65535.0).contains(&code) {
+        return Err(Error::transport(
+            "monet-rn: hook mocked an invalid status code",
+        ));
+    }
+    let status = code as u16;
+    let mut headers = monet_core::headers::HeaderMap::new();
+    for pair in mocked.headers {
+        // Same tolerance as every other header path: an invalid name or
+        // value is dropped, not fatal.
+        let _ = headers.append(&pair.name, pair.value);
+    }
+    let body = monet_core::body::Body::from_bytes(mocked.body.unwrap_or_default());
+    Ok(Response {
+        status,
+        headers,
+        body,
+        extensions,
+    })
+}
+
 /// Merges a resolution into a request: replaces url/method/headers, keeps
 /// the body and extensions exactly as they were.
 fn rebuild_request(mut req: Request, resolution: HookRequestResolution) -> Result<Request> {
@@ -228,6 +275,7 @@ fn rebuild_response(mut res: Response, resolution: HookResponseResolution) -> Re
 /// What a parked request hook wakes up to.
 enum RequestResolution {
     Modified(HookRequestResolution),
+    Mocked(HookMockedResponse),
     Error(Error),
 }
 
@@ -311,7 +359,7 @@ impl RequestHook for JsRequestHook {
         "js-request-hook"
     }
 
-    fn on_request(&self, req: Request) -> BoxFuture<Result<Request>> {
+    fn on_request(&self, mut req: Request) -> BoxFuture<Result<HookOutcome>> {
         let attempt = attempt_of(&req.extensions);
         let correlation_id = correlation_of(&req.extensions);
         let metadata = metadata_of(&req.extensions);
@@ -326,9 +374,21 @@ impl RequestHook for JsRequestHook {
             method,
             headers,
         });
+        // The pipeline threads extensions through to the response (the
+        // response-phase events of this fetch report the same ids); a
+        // mock must carry them too, or its response chain would see an
+        // empty bag.
+        let extensions = std::mem::take(&mut req.extensions);
         Box::pin(async move {
             match rx.await {
-                Ok(RequestResolution::Modified(resolution)) => rebuild_request(req, resolution),
+                Ok(RequestResolution::Modified(resolution)) => {
+                    let mut req = req;
+                    req.extensions = extensions;
+                    rebuild_request(req, resolution).map(HookOutcome::Modified)
+                }
+                Ok(RequestResolution::Mocked(mocked)) => {
+                    build_mocked_response(mocked, extensions).map(HookOutcome::Mocked)
+                }
                 Ok(RequestResolution::Error(error)) => Err(error),
                 // The pump dropped the pipeline run (abort raced us, or
                 // clear_hooks): only observable as a stray wake; the
@@ -468,13 +528,18 @@ pub(crate) fn is_hook_retry(error: &Error) -> bool {
 pub(crate) mod protocol {
     use super::*;
 
-    /// Delivers a request-hook resolution coming from JS.
+    /// Delivers a request-hook resolution coming from JS: a rewrite, or
+    /// a mocked response (v2/W3) that short-circuits the transport.
     pub(crate) fn resolve_request(
         pending: &Pending,
         id: f64,
         resolution: HookRequestResolution,
     ) -> bool {
-        pending.resolve_request(id, RequestResolution::Modified(resolution))
+        let resolution = match resolution.mocked {
+            Some(mocked) => RequestResolution::Mocked(mocked),
+            None => RequestResolution::Modified(resolution),
+        };
+        pending.resolve_request(id, resolution)
     }
 
     /// Delivers a request-hook rejection coming from JS.

@@ -22,6 +22,7 @@ export type {
   MonetHookRequest,
   MonetHookResponse,
   MonetHookRetry,
+  MonetMockedResponse,
 } from './hooks';
 export { MonetError, MonetHeaders, MonetResponse } from './response';
 export type { ErrorEvent, HeadEvent } from './response';

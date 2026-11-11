@@ -120,7 +120,7 @@ fn main() {
         }
     }
     println!(
-        "http routes: /plain /ws-open /chunked /auth-guard /echo /redirect /slow-head /stalled /held /fast /leaf-spki"
+        "http routes: /plain /ws-open /chunked /auth-guard /echo /redirect /slow-head /stalled /held /fast /leaf-spki /request-count"
     );
     println!(
         "ws routes: /echo (mirror) /close-1012 (fidelity) /ping (probe) /gc-probe (counted) /hook-echo (hook check)"

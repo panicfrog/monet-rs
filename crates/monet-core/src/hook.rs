@@ -23,16 +23,33 @@ use crate::request::Request;
 use crate::response::Response;
 use crate::transport::BoxFuture;
 
+/// What a request hook hands back: the (possibly rewritten) request
+/// continues to the transport, or the hook answered the request itself —
+/// no transport runs, nothing goes on the wire, and the pipeline
+/// continues at the response chain with this response (v2/W3's mock).
+#[derive(Debug)]
+pub enum HookOutcome {
+    /// The request, possibly rewritten, continues.
+    Modified(Request),
+    /// The hook short-circuits the transport: this response (already
+    /// carrying whatever extensions the pipeline threads) proceeds
+    /// through the response hooks and delivery.
+    Mocked(Response),
+}
+
 /// Runs before a request hits the transport; may rewrite URL, headers, or
-/// body, and must return the request for the next hook.
+/// body, and must return the request for the next hook — or answer the
+/// request outright with [`HookOutcome::Mocked`].
 pub trait RequestHook: Send + Sync {
     /// A stable name for error reporting.
     fn name(&self) -> &str {
         "request-hook"
     }
 
-    /// Called with the request, in registration order.
-    fn on_request(&self, req: Request) -> BoxFuture<Result<Request>>;
+    /// Called with the request, in registration order. The first hook to
+    /// return [`HookOutcome::Mocked`] ends the chain (there is no request
+    /// left to mutate).
+    fn on_request(&self, req: Request) -> BoxFuture<Result<HookOutcome>>;
 }
 
 /// Runs when the response head arrives, before the body streams to the
@@ -140,20 +157,27 @@ impl HookRegistry {
     }
 
     /// Runs every request hook in order. The first failure stops the chain
-    /// and is wrapped in [`Error::Hook`] with the hook's name. On success,
-    /// every request observer sees the final request before it returns.
-    pub async fn run_request_hooks(&self, req: Request) -> Result<Request> {
+    /// and is wrapped in [`Error::Hook`] with the hook's name; so does the
+    /// first [`HookOutcome::Mocked`] (there is no request left to mutate).
+    /// On a [`HookOutcome::Modified`] outcome, every request observer sees
+    /// the final request before it returns — a mocked request never goes
+    /// on the wire, so there is no final wire form for them to observe
+    /// (the response observers see the mock after its response chain).
+    pub async fn run_request_hooks(&self, req: Request) -> Result<HookOutcome> {
         let mut req = req;
         for hook in &self.request_hooks {
-            req = hook.on_request(req).await.map_err(|e| Error::Hook {
+            match hook.on_request(req).await.map_err(|e| Error::Hook {
                 hook: hook.name().to_string(),
                 source: Box::new(e),
-            })?;
+            })? {
+                HookOutcome::Modified(next) => req = next,
+                mocked @ HookOutcome::Mocked(_) => return Ok(mocked),
+            }
         }
         for observer in &self.request_observers {
             observer.on_request(&req);
         }
-        Ok(req)
+        Ok(HookOutcome::Modified(req))
     }
 
     /// Runs every response hook in order, with the same error semantics as
@@ -212,7 +236,7 @@ mod tests {
         fn name(&self) -> &str {
             self.name
         }
-        fn on_request(&self, req: Request) -> BoxFuture<Result<Request>> {
+        fn on_request(&self, req: Request) -> BoxFuture<Result<HookOutcome>> {
             let log = self.log.clone();
             let name = self.name;
             Box::pin(async move {
@@ -220,7 +244,7 @@ mod tests {
                 let mut req = req;
                 let existing = req.headers.get("x-order").unwrap_or_default();
                 req.headers.set("x-order", format!("{existing}{name}"))?;
-                Ok(req)
+                Ok(HookOutcome::Modified(req))
             })
         }
     }
@@ -250,7 +274,10 @@ mod tests {
             .add_request_hook(StampingHook::new("b", &log));
         assert_eq!(registry.request_hook_count(), 2);
 
-        let req = block_on(registry.run_request_hooks(request())).unwrap();
+        let req = match block_on(registry.run_request_hooks(request())).unwrap() {
+            HookOutcome::Modified(req) => req,
+            HookOutcome::Mocked(_) => panic!("nothing mocks here"),
+        };
         assert_eq!(req.headers.get("x-order").unwrap(), "ab");
         assert_eq!(*log.lock().unwrap(), vec!["req:a", "req:b"]);
     }
@@ -262,7 +289,7 @@ mod tests {
             fn name(&self) -> &str {
                 "fail"
             }
-            fn on_request(&self, req: Request) -> BoxFuture<Result<Request>> {
+            fn on_request(&self, req: Request) -> BoxFuture<Result<HookOutcome>> {
                 Box::pin(async {
                     let _ = req;
                     Err(Error::transport("nope"))
@@ -301,7 +328,10 @@ mod tests {
     #[test]
     fn empty_registry_is_a_passthrough() {
         let registry = HookRegistry::new();
-        let req = block_on(registry.run_request_hooks(request())).unwrap();
+        let req = match block_on(registry.run_request_hooks(request())).unwrap() {
+            HookOutcome::Modified(req) => req,
+            HookOutcome::Mocked(_) => panic!("nothing mocks here"),
+        };
         assert_eq!(req.url.as_str(), "https://example.com/");
         let res = block_on(registry.run_response_hooks(response())).unwrap();
         assert_eq!(res.status, 200);
@@ -384,7 +414,7 @@ mod tests {
             fn name(&self) -> &str {
                 "fail"
             }
-            fn on_request(&self, req: Request) -> BoxFuture<Result<Request>> {
+            fn on_request(&self, req: Request) -> BoxFuture<Result<HookOutcome>> {
                 Box::pin(async {
                     let _ = req;
                     Err(Error::transport("nope"))
@@ -409,10 +439,86 @@ mod tests {
         let snapshot = registry.clone();
         registry.add_request_hook(StampingHook::new("b", &log));
 
-        let req = block_on(snapshot.run_request_hooks(request())).unwrap();
+        let req = match block_on(snapshot.run_request_hooks(request())).unwrap() {
+            HookOutcome::Modified(req) => req,
+            HookOutcome::Mocked(_) => panic!("nothing mocks here"),
+        };
         assert_eq!(req.headers.get("x-order").unwrap(), "a");
-        let req = block_on(registry.run_request_hooks(request())).unwrap();
+        let req = match block_on(registry.run_request_hooks(request())).unwrap() {
+            HookOutcome::Modified(req) => req,
+            HookOutcome::Mocked(_) => panic!("nothing mocks here"),
+        };
         assert_eq!(req.headers.get("x-order").unwrap(), "ab");
+    }
+
+    #[test]
+    fn a_mocking_hook_short_circuits_the_chain() {
+        // A mock ends the request chain: later hooks never run, request
+        // observers see nothing (no wire form exists), and the outcome
+        // carries the mocked response through.
+        let hook_log = Arc::new(Mutex::new(Vec::new()));
+        let observer_log = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = HookRegistry::new();
+        registry
+            .add_request_hook(StampingHook::new("a", &hook_log))
+            .add_request_observer(RecordingObserver {
+                log: observer_log.clone(),
+            });
+
+        struct MockHook;
+        impl RequestHook for MockHook {
+            fn name(&self) -> &str {
+                "mock"
+            }
+            fn on_request(&self, req: Request) -> BoxFuture<Result<HookOutcome>> {
+                Box::pin(async {
+                    let _ = req;
+                    Ok(HookOutcome::Mocked(Response::new(
+                        201,
+                        HeaderMap::new(),
+                        Body::from_bytes("mocked"),
+                    )))
+                })
+            }
+        }
+        registry
+            .add_request_hook(MockHook)
+            .add_request_hook(StampingHook::new("never", &hook_log));
+
+        match block_on(registry.run_request_hooks(request())).unwrap() {
+            HookOutcome::Mocked(res) => {
+                assert_eq!(res.status, 201);
+            }
+            HookOutcome::Modified(_) => panic!("the mock must short-circuit"),
+        }
+        // "a" ran before the mock; the hook after it never did; the
+        // observer never fired.
+        assert_eq!(*hook_log.lock().unwrap(), vec!["req:a"]);
+        assert!(observer_log.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_mocked_response_rides_the_response_chain() {
+        // The pump's mock path in miniature: the mocked response goes
+        // through run_response_hooks, so response hooks rewrite it and
+        // response observers see the final form.
+        let observer_log = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = HookRegistry::new();
+        registry
+            .add_response_hook(StampingHook::new("r", &observer_log))
+            .add_response_observer(RecordingObserver {
+                log: observer_log.clone(),
+            });
+
+        let mock = Response::new(201, HeaderMap::new(), Body::from_bytes("mocked"));
+        let res = block_on(registry.run_response_hooks(mock)).unwrap();
+        assert_eq!(res.status, 201);
+        assert_eq!(res.headers.get("x-order").unwrap(), "r");
+        assert_eq!(
+            *observer_log.lock().unwrap(),
+            vec!["res:r", "res:r"],
+            "the hook and the observer both saw the mock"
+        );
     }
 
     #[test]
@@ -429,7 +535,10 @@ mod tests {
         assert_eq!(registry.request_hook_count(), 0);
         assert_eq!(registry.request_observer_count(), 0);
 
-        let req = block_on(registry.run_request_hooks(request())).unwrap();
+        let req = match block_on(registry.run_request_hooks(request())).unwrap() {
+            HookOutcome::Modified(req) => req,
+            HookOutcome::Mocked(_) => panic!("nothing mocks here"),
+        };
         assert_eq!(req.headers.get("x-order"), None);
         assert!(log.lock().unwrap().is_empty());
         assert!(observer_log.lock().unwrap().is_empty());

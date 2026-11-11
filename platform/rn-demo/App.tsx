@@ -721,6 +721,70 @@ const CHECKS: Array<{
     },
   },
   {
+    name: 'http:hook_mock_response',
+    run: async base => {
+      try {
+        // v2/W3: a request hook can answer the fetch itself — a mocked
+        // response with exact status/headers/body, no transport, and
+        // (the observable) zero requests reaching the server. The mock
+        // still rides the response chain: a response hook rewrites it
+        // and the fetch delivers the rewritten form.
+        addRequestHook(req => {
+          if (req.url.endsWith('/plain')) {
+            return {
+              mocked: {
+                status: 201,
+                headers: [{name: 'x-mock', value: 'yes'}],
+                body: 'mocked-body',
+              },
+            };
+          }
+          return req;
+        });
+        addResponseHook(res => ({
+          status: res.status,
+          headers: [...res.headers, {name: 'x-after-mock', value: '1'}],
+        }));
+        const before = Number(
+          await (await fetch(`${base}/request-count`)).text(),
+        );
+        const response = await fetch(`${base}/plain`);
+        const after = Number(
+          await (await fetch(`${base}/request-count`)).text(),
+        );
+        // Exact delivery: the mock's status/headers/body, plus the
+        // response hook's rewrite on top.
+        assert(response.status === 201, `status ${response.status}`);
+        assert(
+          response.headers.get('x-mock') === 'yes',
+          `x-mock ${JSON.stringify(response.headers.get('x-mock'))}`,
+        );
+        assert(
+          response.headers.get('x-after-mock') === '1',
+          `x-after-mock ${JSON.stringify(response.headers.get('x-after-mock'))}`,
+        );
+        const body = await response.text();
+        assert(body === 'mocked-body', `body ${JSON.stringify(body)}`);
+        // Zero server traffic: each counter read counts itself (the
+        // handler increments before reading), so with nothing else
+        // handled in between the delta is exactly the reads' own.
+        assert(
+          after === before + 1,
+          `request count moved ${before} -> ${after} (expected +1: the counter reads only)`,
+        );
+        // A non-mocked URL passes through untouched.
+        const plain = await fetch(`${base}/echo`, {
+          method: 'POST',
+          headers: {'content-type': 'text/plain'},
+          body: 'still-real',
+        });
+        assert(plain.status === 200, `passthrough status ${plain.status}`);
+      } finally {
+        clearHooks();
+      }
+    },
+  },
+  {
     name: 'http:abort_during_hook',
     run: async base => {
       try {

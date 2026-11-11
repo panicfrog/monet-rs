@@ -35,6 +35,22 @@ export interface MonetHookRetry {
 }
 
 /**
+ * A mocked response a request hook can return instead of the request
+ * (v2/W3): the hook answered the fetch itself — no transport runs,
+ * nothing goes on the wire, and the mocked response still passes
+ * through the response hooks (and their rewrites) before delivery.
+ * The body is UTF-8 text (JSON/text fixtures; binary mocks are not in
+ * the protocol yet).
+ */
+export interface MonetMockedResponse {
+  mocked: {
+    status: number;
+    headers: Array<{name: string; value: string}>;
+    body?: string;
+  };
+}
+
+/**
  * The call-site metadata bag (`fetch(url, {metadata})`): the flow tag
  * that strings a series of requests together. Client-side only — never
  * on the wire; send it as a header too when the server needs it.
@@ -130,10 +146,13 @@ export function addResponseObserver(
 
 /**
  * Registers a read-write request hook. The callback may rewrite the
- * request (url/method/headers) and must return it; throwing (or
- * rejecting) fails the fetch with a `Hook` error. The pipeline waits for
- * the resolution — a hook that never resolves hangs its fetch until
- * aborted, so keep the async work bounded.
+ * request (url/method/headers) and must return it, or answer the fetch
+ * itself by returning a {@link MonetMockedResponse} — no transport
+ * runs, nothing goes on the wire, and the mock still passes through
+ * the response hooks. Throwing (or rejecting) fails the fetch with a
+ * `Hook` error. The pipeline waits for the resolution — a hook that
+ * never resolves hangs its fetch until aborted, so keep the async work
+ * bounded.
  *
  * Runs on every fetch and every WebSocket connect (the upgrade request),
  * in registration order together with any other request hooks. The
@@ -144,11 +163,31 @@ export function addRequestHook(
   hook: (
     req: MonetHookRequest,
     ctx: MonetHookContext,
-  ) => MonetHookRequest | Promise<MonetHookRequest>,
+  ) =>
+    | MonetHookRequest
+    | MonetMockedResponse
+    | Promise<MonetHookRequest | MonetMockedResponse>,
 ): void {
   getMonet().addRequestHook(async (event: HookRequestEvent) => {
     try {
-      const modified = await hook(toRequest(event), toContext(event));
+      const out = await hook(toRequest(event), toContext(event));
+      if (out !== null && typeof out === 'object' && 'mocked' in out) {
+        // The hook answered the fetch itself: the mocked response rides
+        // the resolution; url/method/headers pass the event's values
+        // through (the rewrite fields are unused on this arm).
+        getMonet().resolveRequestHook(event.hookCallId, {
+          url: event.url,
+          method: event.method,
+          headers: event.headers,
+          mocked: {
+            status: out.mocked.status,
+            headers: out.mocked.headers,
+            body: out.mocked.body,
+          },
+        });
+        return;
+      }
+      const modified = out;
       getMonet().resolveRequestHook(event.hookCallId, {
         url: modified.url,
         method: modified.method,

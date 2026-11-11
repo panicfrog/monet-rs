@@ -663,7 +663,18 @@ impl Monet {
                 crate::hooks::next_correlation_id(),
             ));
             let request = match race_cancel(hooks.run_request_hooks(request), &cancel).await {
-                RaceOutcome::Done(Ok(request)) => request,
+                RaceOutcome::Done(Ok(monet_core::hook::HookOutcome::Modified(request))) => request,
+                // An upgrade has no response surface to mock: the hook
+                // protocol's short-circuit is HTTP-only.
+                RaceOutcome::Done(Ok(monet_core::hook::HookOutcome::Mocked(_))) => {
+                    on_error.call(ErrorEvent::from(monet_core::Error::Hook {
+                        hook: "js-request-hook".into(),
+                        source: Box::new(monet_core::Error::transport(
+                            "monet-rn: a WebSocket connect cannot be mocked",
+                        )),
+                    }));
+                    return;
+                }
                 RaceOutcome::Done(Err(error)) => {
                     on_error.call(ErrorEvent::from(error));
                     return;
@@ -790,23 +801,43 @@ fn spawn_fetch_pump(
                 // JS hook must not outlive the fetch's abort.
                 valve_log(&format!("PUMP-HOOKS id={fetch_id} attempt={attempt}"));
                 match race_cancel(hooks.run_request_hooks(request), &cancel).await {
-                    RaceOutcome::Done(Ok(mut request)) => {
+                    RaceOutcome::Done(Ok(outcome)) => {
                         valve_log(&format!("PUMP-EXEC id={fetch_id} attempt={attempt}"));
                         let transport = transport.clone();
                         let hooks = hooks.clone();
                         let cancel_for_execute = cancel.clone();
+                        // The transport attempt — or the hook's mock
+                        // (v2/W3), which skips the transport entirely and
+                        // carries the extensions itself. Either way the
+                        // response hooks wrap the result: they see the
+                        // head before on_head delivers it.
+                        let attempted: futures_lite::future::Boxed<
+                            monet_core::Result<monet_core::Response>,
+                        > = match outcome {
+                            monet_core::hook::HookOutcome::Modified(mut request) => {
+                                let transport = transport.clone();
+                                Box::pin(async move {
+                                    let extensions =
+                                        std::mem::take(&mut request.extensions);
+                                    let mut response = transport
+                                        .execute(request, cancel_for_execute)
+                                        .await?;
+                                    response.extensions = extensions;
+                                    Ok(response)
+                                })
+                            }
+                            monet_core::hook::HookOutcome::Mocked(response) => {
+                                valve_log(&format!(
+                                    "PUMP-MOCK id={fetch_id} attempt={attempt}"
+                                ));
+                                Box::pin(async move { Ok(response) })
+                            }
+                        };
                         match race_cancel(
-                            // Response hooks wrap the transport result:
-                            // they see the head before on_head delivers
-                            // it. The request's extensions travel with it
-                            // (no transport reads them — nothing on the
-                            // wire changes).
                             async move {
-                                let extensions = std::mem::take(&mut request.extensions);
-                                let mut response =
-                                    transport.execute(request, cancel_for_execute).await?;
-                                response.extensions = extensions;
-                                hooks.run_response_hooks(response).await
+                                hooks
+                                    .run_response_hooks(attempted.await?)
+                                    .await
                             },
                             &cancel,
                         )

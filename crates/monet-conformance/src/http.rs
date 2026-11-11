@@ -280,6 +280,10 @@ pub(crate) fn set_tls_ca(der_base64: String) {
 static TLS_CONNECTION_CLOSE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Requests handled since server start — the mock check reads it around
+/// a mocked fetch and asserts it only moved by the reads themselves.
+static REQUESTS_HANDLED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Arms `Connection: close` on every response — the TLS battery server.
 pub(crate) fn set_tls_connection_close() {
     TLS_CONNECTION_CLOSE.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -294,6 +298,9 @@ async fn respond(
     request_body: Vec<u8>,
     gate: &std::sync::Arc<tokio::sync::Notify>,
 ) -> HyperResponse<BoxBody<Bytes, std::convert::Infallible>> {
+    // Every handled request counts (v2/W3): a mocked fetch must not move
+    // it — the mock check's zero-connection observable.
+    REQUESTS_HANDLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut response = respond_route(method, path, request_headers, request_body, gate).await;
     if TLS_CONNECTION_CLOSE.load(std::sync::atomic::Ordering::Relaxed) {
         response
@@ -313,6 +320,15 @@ async fn respond_route(
     gate: &std::sync::Arc<tokio::sync::Notify>,
 ) -> HyperResponse<BoxBody<Bytes, std::convert::Infallible>> {
     match path {
+        // The request counter (v2/W3): the mock check's observable.
+        "/request-count" => ok(
+            StatusCode::OK,
+            boxed(Full::new(Bytes::from(
+                REQUESTS_HANDLED
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .to_string(),
+            ))),
+        ),
         "/plain" => ok(
             StatusCode::OK,
             boxed(Full::new(Bytes::from_static(b"plain"))),

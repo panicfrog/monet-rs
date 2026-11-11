@@ -79,11 +79,19 @@ impl Client {
         if cancel.is_cancelled() {
             return Err(Error::Cancelled);
         }
-        let mut req = self.hooks.run_request_hooks(req).await?;
-        let extensions = std::mem::take(&mut req.extensions);
-        let mut res = self.transport.execute(req, cancel).await?;
-        res.extensions = extensions;
-        self.hooks.run_response_hooks(res).await
+        match self.hooks.run_request_hooks(req).await? {
+            crate::hook::HookOutcome::Modified(req) => {
+                let mut req = req;
+                let extensions = std::mem::take(&mut req.extensions);
+                let mut res = self.transport.execute(req, cancel).await?;
+                res.extensions = extensions;
+                self.hooks.run_response_hooks(res).await
+            }
+            // A mocking hook answered the request: no transport, no wire —
+            // the mock (which carries the request's extensions, per the
+            // outcome's contract) proceeds through the response chain.
+            crate::hook::HookOutcome::Mocked(res) => self.hooks.run_response_hooks(res).await,
+        }
     }
 }
 
@@ -117,10 +125,13 @@ mod tests {
         fn name(&self) -> &str {
             "rewrite"
         }
-        fn on_request(&self, mut req: Request) -> crate::transport::BoxFuture<Result<Request>> {
+        fn on_request(
+            &self,
+            mut req: Request,
+        ) -> crate::transport::BoxFuture<Result<crate::hook::HookOutcome>> {
             Box::pin(async move {
                 req.headers.set("x-rewritten", "yes")?;
-                Ok(req)
+                Ok(crate::hook::HookOutcome::Modified(req))
             })
         }
     }
@@ -164,7 +175,10 @@ mod tests {
             fn name(&self) -> &str {
                 "fail"
             }
-            fn on_request(&self, req: Request) -> crate::transport::BoxFuture<Result<Request>> {
+            fn on_request(
+                &self,
+                req: Request,
+            ) -> crate::transport::BoxFuture<Result<crate::hook::HookOutcome>> {
                 Box::pin(async {
                     let _ = req;
                     Err(Error::transport("hook says no"))
@@ -211,10 +225,13 @@ mod tests {
             fn name(&self) -> &str {
                 "stash"
             }
-            fn on_request(&self, mut req: Request) -> crate::transport::BoxFuture<Result<Request>> {
+            fn on_request(
+                &self,
+                mut req: Request,
+            ) -> crate::transport::BoxFuture<Result<crate::hook::HookOutcome>> {
                 Box::pin(async move {
                     req.extensions.insert(TraceId(42));
-                    Ok(req)
+                    Ok(crate::hook::HookOutcome::Modified(req))
                 })
             }
         }
