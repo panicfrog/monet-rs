@@ -9,7 +9,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::LazyLock;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bytes::Bytes;
 use futures_channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
@@ -59,6 +59,14 @@ struct RequestState {
     /// practice, because the task is suspended after the Full probe
     /// until the watcher has drained it.
     overflow: Mutex<VecDeque<Bytes>>,
+    /// Set while a stall *episode* is open — from the first chunk that
+    /// did not fit (the one that suspends the task) until the watcher's
+    /// drain completes and resumes. The Swift suspend re-checks it under
+    /// its lock (see [`still_stalled`]): the watcher clears it before
+    /// resuming, so a stall that already drained must not suspend, and a
+    /// chunk arriving mid-episode must not suspend again (suspends pair
+    /// with resumes one per episode).
+    stalled: AtomicBool,
     /// Wakes the body watcher (a stall or a staged terminal). Dropping
     /// the sender — the state's removal — ends the watcher's stream.
     wake_tx: Option<UnboundedSender<Wake>>,
@@ -88,6 +96,7 @@ pub(crate) fn allocate(cancel: CancelToken) -> (u64, oneshot::Receiver<Result<Re
             headers: HeaderMap::new(),
             body_tx: None,
             overflow: Mutex::new(VecDeque::new()),
+            stalled: AtomicBool::new(false),
             wake_tx: None,
             terminal: Mutex::new(None),
             cancel,
@@ -100,6 +109,27 @@ pub(crate) fn allocate(cancel: CancelToken) -> (u64, oneshot::Receiver<Result<Re
 /// Swift discards a never-started request silently).
 pub(crate) fn remove(id: u64) {
     REGISTRY.states.lock().unwrap().remove(&id);
+}
+
+/// Whether a stall is still pending its drain — the Swift suspend's
+/// re-check (under its lock; the watcher clears the flag before it
+/// resumes, and the resume serializes on the same lock). An unknown id
+/// reads as not stalled: a gone request must not suspend.
+pub(crate) fn still_stalled(id: u64) -> bool {
+    REGISTRY
+        .states
+        .lock()
+        .unwrap()
+        .get(&id)
+        .is_some_and(|state| state.stalled.load(Ordering::SeqCst))
+}
+
+/// Clears the stall flag (the watcher, after the drain completed).
+fn clear_stalled(id: u64) {
+    let states = REGISTRY.states.lock().unwrap();
+    if let Some(state) = states.get(&id) {
+        state.stalled.store(false, Ordering::SeqCst);
+    }
 }
 
 pub(crate) fn on_header(id: u64, name: &[u8], value: &[u8]) {
@@ -180,11 +210,21 @@ pub(crate) fn on_response_head(id: u64, status: u16) {
 /// Delivers one body chunk from the delegate's data event. `true` means
 /// paused (v2/W2b): the bounded channel is full, so Swift suspends the
 /// task; the body watcher resumes it once the consumer has drained the
-/// overflow.
+/// overflow. Suspends pair with resumes one-to-one per stall *episode*:
+/// a chunk arriving while an episode is open joins the overflow without
+/// asking for another suspend (URLSessionTask's suspend/resume are
+/// counted — a second suspend without its own resume parks the task
+/// forever, completion included).
 pub(crate) fn on_chunk(id: u64, data: &[u8]) -> bool {
+    #[derive(PartialEq)]
     enum After {
         Continue,
+        /// The episode opener: this chunk's probe is the one that
+        /// suspends the task.
         Stalled,
+        /// The episode was already open: the chunk joins the overflow;
+        /// the task is already suspended (or its drain is in flight).
+        AlreadyStalled,
         ConsumerGone,
     }
     let after = {
@@ -196,8 +236,13 @@ pub(crate) fn on_chunk(id: u64, data: &[u8]) -> bool {
                 Some(sender) => match sender.try_send(Bytes::copy_from_slice(data)) {
                     Delivery::Sent => After::Continue,
                     Delivery::Full(chunk) => {
+                        let already = state.stalled.swap(true, Ordering::SeqCst);
                         state.overflow.lock().unwrap().push_back(chunk);
-                        After::Stalled
+                        if already {
+                            After::AlreadyStalled
+                        } else {
+                            After::Stalled
+                        }
                     }
                     Delivery::Closed => After::ConsumerGone,
                 },
@@ -209,9 +254,9 @@ pub(crate) fn on_chunk(id: u64, data: &[u8]) -> bool {
     };
     match after {
         After::Continue => false,
-        After::Stalled => {
-            // Outside the states lock: notify wakes the watcher, which
-            // drains at the consumer's pace and resumes the task.
+        // Outside the states lock: notify wakes the watcher, which
+        // drains at the consumer's pace and resumes the task.
+        After::Stalled | After::AlreadyStalled => {
             if let Some(wake_tx) = REGISTRY
                 .states
                 .lock()
@@ -221,13 +266,16 @@ pub(crate) fn on_chunk(id: u64, data: &[u8]) -> bool {
             {
                 let _ = wake_tx.unbounded_send(Wake::Stall);
             }
-            true
+            // Only the episode opener suspends; the watcher's
+            // drain-complete resume closes the episode.
+            after == After::Stalled
         }
-        // The consumer dropped the response body: stop the native task.
+        // The consumer dropped the response body: stop the native task
+        // (no suspend — the cancellation delivers the terminal).
         // The cancellation error arrives later through on_error.
         After::ConsumerGone => {
             bridge::transport_cancel(id);
-            true
+            false
         }
     }
 }
@@ -376,6 +424,14 @@ fn spawn_body_watcher(id: u64, cancel: CancelToken, mut wake_rx: UnboundedReceiv
                                 // way — resuming would race it (a suspended
                                 // task's cancel may deliver late).
                                 Some(_) if matches!(reason, Wake::Stall) && !cancelled => {
+                                    // Clear BEFORE resuming: a suspend
+                                    // re-checking under the Swift lock then
+                                    // either sees the stall (suspends — this
+                                    // resume follows, same lock orders them)
+                                    // or sees it cleared (skips — the resume
+                                    // already fired or is about to). Either
+                                    // order leaves the task running.
+                                    clear_stalled(id);
                                     bridge::transport_resume(id);
                                 }
                                 Some(_) => {
@@ -448,4 +504,48 @@ fn apply_terminal(id: u64) {
         }
     }
     remove(id);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The stall episode's contract (the Swift suspend's re-check and
+    /// pairing): the episode opener suspends (returns true), a chunk
+    /// arriving mid-episode does not (one suspend per episode —
+    /// URLSessionTask's suspend/resume are counted), the drain's
+    /// completion clears it, and an unknown id must never read as
+    /// stalled (a gone request must not suspend).
+    #[test]
+    fn stall_flag_tracks_the_drain() {
+        let (id, rx) = allocate(CancelToken::new());
+        on_response_head(id, 200);
+        let response = futures_lite::future::block_on(rx).unwrap().unwrap();
+
+        // Fill the bounded channel (effective capacity 5), then stall.
+        for i in 0..5u8 {
+            assert!(!on_chunk(id, format!("chunk{i}").as_bytes()));
+        }
+        assert!(on_chunk(id, b"stall"));
+        // The watcher's drain parks on the full channel (no consumer
+        // takes), so the episode stays open — and a second stalling
+        // chunk must NOT ask for another suspend.
+        assert!(still_stalled(id), "a pending stall must read as stalled");
+        assert!(
+            !on_chunk(id, b"stall-2"),
+            "a mid-episode chunk joins the overflow without suspending again"
+        );
+        assert!(still_stalled(id));
+        clear_stalled(id);
+        assert!(!still_stalled(id), "the drain clears the stall");
+
+        // Releasing the body unblocks the parked watcher (its send
+        // errors out) so the test leaves no thread behind.
+        drop(response);
+    }
+
+    #[test]
+    fn unknown_ids_read_as_not_stalled() {
+        assert!(!still_stalled(9999));
+    }
 }

@@ -18,6 +18,13 @@ final class RequestBox {
   /// httpBody.
   var streamed = false
   var uploadPipe: UploadPipe?
+  /// v2/W2b: the backpressure valve's own suspend bookkeeping — the
+  /// task was suspended by the valve and not yet resumed. Guards the
+  /// pairing: a resume only runs when a suspend did (the watcher's
+  /// fast-drain path can resume before the delegate's suspend would
+  /// land — an unpaired resume is skipped, and the still-stalled
+  /// re-check skips its suspend in turn).
+  var valveSuspended = false
   /// Set once the task exists; nil while still assembling.
   var task: URLSessionDataTask?
 }
@@ -231,20 +238,32 @@ final class TransportShim {
 
   /// The body backpressure valve (v2/W2b): Rust probed the bounded
   /// channel full, so data delivery pauses until the consumer drains.
+  /// The stall is re-checked under this lock against the watcher's flag
+  /// (the watcher clears it BEFORE resuming, and the resume takes this
+  /// same lock): a stall that already drained must not suspend, and a
+  /// resume only runs when a suspend did — the pairing the counted
+  /// task.suspend()/resume() demand.
   func suspend(id: UInt64) {
     lock.lock()
-    let task = boxes[id]?.task
+    if let box = boxes[id], let task = box.task, still_stalled(id) {
+      box.valveSuspended = true
+      task.suspend()
+    }
     lock.unlock()
-    task?.suspend()
   }
 
   /// The valve's resume edge: the Rust body watcher calls it after
-  /// draining the overflow. A no-op on finished tasks.
+  /// draining the overflow. A no-op on finished tasks and on drains
+  /// that out-ran their suspend (the still-stalled re-check skipped
+  /// it). The suspend and resume calls are serialized by this lock —
+  /// the ordering both sides' checks depend on.
   func resume(id: UInt64) {
     lock.lock()
-    let task = boxes[id]?.task
+    if let box = boxes[id], box.valveSuspended, let task = box.task {
+      box.valveSuspended = false
+      task.resume()
+    }
     lock.unlock()
-    task?.resume()
   }
 
   /// The input half for the task's needNewBodyStream ask (v2/W2c). Nil

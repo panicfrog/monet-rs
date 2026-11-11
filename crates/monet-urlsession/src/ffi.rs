@@ -90,6 +90,14 @@ fn roots_count() -> usize {
     roots::count()
 }
 
+/// Whether a stall is still pending its drain (v2/W2b fix): the Swift
+/// suspend re-checks this under its lock — a stall the watcher already
+/// drained must not suspend (the resume would have fired before the
+/// suspend landed, parking the task forever).
+fn still_stalled(id: u64) -> bool {
+    registry::still_stalled(id)
+}
+
 /// Copies root `index`'s DER into `out`, returning the bytes written;
 /// an `out` too small writes nothing and returns the needed length
 /// (Swift sizes its buffer with a first empty call).
@@ -142,6 +150,7 @@ pub mod bridge {
         fn pins_for_host(host: &[u8], out: &mut [u8]) -> usize;
         fn roots_count() -> usize;
         fn root_at(index: usize, out: &mut [u8]) -> usize;
+        fn still_stalled(id: u64) -> bool;
         fn on_ws_open(id: u64);
         fn on_ws_message(id: u64, is_binary: bool, data: &[u8]);
         fn on_ws_ping(id: u64, data: &[u8]);

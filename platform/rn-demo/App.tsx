@@ -307,6 +307,9 @@ const CHECKS: Array<{
       assert(mode === 'chunked', `upload mode ${mode}, expected chunked`);
       const buffered = await fetch(`${base}/upload`, {
         method: 'POST',
+        // Cronet refuses uploads without a Content-Type (its own
+        // contract — nitro-fetch leaves this to the app too).
+        headers: {'content-type': 'text/plain'},
         body: 'complete-body',
       });
       assert(
