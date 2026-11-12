@@ -36,6 +36,14 @@ export interface MonetRequestInit {
   /** Recorded for forward compatibility (core-level knob lands later). */
   timeoutMs?: number;
   followRedirects?: boolean;
+  /** The prefetch cache key (v2/W4): a fetch carrying a key that
+   *  matches a fresh prefetch() entry delivers it with zero transport;
+   *  a pending one joins it. Never goes on the wire. */
+  prefetchKey?: string;
+  /** The freshness window for cache reads, milliseconds (0 = the 5s
+   *  default, nitro's prefetchCacheTtlMs). Evaluated when this fetch
+   *  reads the cache. */
+  prefetchTtlMs?: number;
 }
 
 type HeaderKV = {name: string; value: string};
@@ -93,6 +101,8 @@ export function fetch(
     metadata: metadataKV(init),
     timeoutMs: init.timeoutMs ?? 0,
     followRedirects: init.followRedirects ?? true,
+    prefetchKey: init.prefetchKey ?? '',
+    prefetchTtlMs: init.prefetchTtlMs ?? 0,
   };
   let body: ArrayBuffer | null = null;
   if (typeof init.body === 'string') {
@@ -186,5 +196,44 @@ export function fetch(
         init.signal.addEventListener('abort', onAbort);
       }
     }
+  });
+}
+
+/**
+ * Runs a real fetch now and stores its complete response under the
+ * prefetch key — a later `fetch(url, {prefetchKey})` delivers it with
+ * zero transport while fresh (default 5s), or joins this one if still
+ * in flight. Racing prefetches for one key start a single request.
+ * The request-hook chain runs (auth injection rides it); response
+ * hooks do not (the response goes to the cache, not a consumer).
+ */
+export function prefetch(
+  input: string | {url: string},
+  init: MonetRequestInit = {},
+): Promise<void> {
+  const monet = getMonet();
+  const url = typeof input === 'string' ? input : input.url;
+  const options: FetchOptions = {
+    url,
+    method: init.method ?? 'GET',
+    headers: normalizeHeaders(init),
+    metadata: metadataKV(init),
+    timeoutMs: init.timeoutMs ?? 0,
+    followRedirects: init.followRedirects ?? true,
+    prefetchKey: init.prefetchKey ?? '',
+    prefetchTtlMs: init.prefetchTtlMs ?? 0,
+  };
+  return new Promise<void>((resolve, reject) => {
+    monet.prefetch(
+      options,
+      () => resolve(),
+      (event) =>
+        reject(
+          new MonetError(
+            event?.kind ?? 'Transport',
+            event?.message ?? 'prefetch failed',
+          ),
+        ),
+    );
   });
 }

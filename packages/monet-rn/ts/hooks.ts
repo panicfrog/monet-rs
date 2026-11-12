@@ -182,13 +182,14 @@ export function addRequestHook(
           mocked: {
             status: out.mocked.status,
             headers: out.mocked.headers,
-            body: out.mocked.body,
+            body: out.mocked.body ?? null,
           },
         });
         return;
       }
       const modified = out;
       getMonet().resolveRequestHook(event.hookCallId, {
+        mocked: null,
         url: modified.url,
         method: modified.method,
         headers: modified.headers,

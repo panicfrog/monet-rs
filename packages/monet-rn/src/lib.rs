@@ -17,6 +17,7 @@ use std::sync::RwLock;
 use jsi::RuntimeHandle;
 use jsi_turbo::RustTurboModule;
 use monet_core::pin::PinConfig;
+use monet_core::CancelToken;
 use monet_core::Client;
 use monet_core::Method;
 use monet_core::Request;
@@ -36,6 +37,10 @@ mod fetch;
 /// traits, with the pending-map resolve protocol (see docs/plans/2026-11-hooks.md).
 mod hooks;
 mod platform;
+/// The prefetch cache (v2/W4): complete responses keyed by prefetchKey,
+/// stored by prefetch() at its terminal, read by fetches carrying the
+/// key (fresh → zero-transport delivery, pending → join).
+mod prefetch;
 /// The WebSocket connection object: pure Rust (jsi + core types only),
 /// compiled unconditionally — the transport selection in platform.rs is
 /// what the `websocket` feature gates. The connection's lifetime is the
@@ -172,6 +177,17 @@ pub struct FetchOptions {
     /// and wins over configured values.
     pub timeout_ms: f64,
     pub follow_redirects: bool,
+    /// The prefetch cache key (v2/W4): empty = no prefetch participation.
+    /// A fetch carrying a key that matches a fresh prefetch() entry
+    /// delivers it with zero transport; a pending one joins it. The key
+    /// never goes on the wire.
+    #[serde(default)]
+    pub prefetch_key: String,
+    /// The freshness window for cache reads (v2/W4, nitro's
+    /// prefetchCacheTtlMs): 0 = the 5s default. Evaluated at read time
+    /// by the fetching request, not at store time.
+    #[serde(default)]
+    pub prefetch_ttl_ms: f64,
 }
 
 /// One head event as delivered to JS.
@@ -586,6 +602,125 @@ impl Monet {
         Ok(())
     }
 
+    /// ---- prefetch (v2/W4; the design record is in the v2 plan) ----
+
+    /// Runs a real fetch now and stores its complete response under the
+    /// options' `prefetchKey` — a later fetch carrying the same key
+    /// delivers it with zero transport while fresh (the reading
+    /// request's `prefetchTtlMs`, 5s default), or joins this one if
+    /// still in flight. Racing prefetches for one key start a single
+    /// request. The request-hook chain runs (auth injection rides it);
+    /// response hooks do not (the response goes to the cache, not to a
+    /// consumer). Resolves when the response is cached; a failed
+    /// prefetch reports through `on_error` and leaves no entry.
+    pub fn prefetch(
+        &self,
+        options: FetchOptions,
+        on_done: jsi_turbo::TurboCallback,
+        on_error: jsi_turbo::TurboCallback,
+    ) -> anyhow::Result<()> {
+        if options.prefetch_key.is_empty() {
+            anyhow::bail!("prefetch requires a prefetchKey in the options");
+        }
+        let _ = options
+            .url
+            .parse::<monet_core::Url>()
+            .map_err(|e| anyhow::anyhow!("invalid URL: {e}"))?;
+        let key = options.prefetch_key.clone();
+        if !prefetch::begin(&key) {
+            // A fresh entry or a pending prefetch already covers it.
+            on_done.call_with_no_args();
+            return Ok(());
+        }
+        let on_done = Arc::new(on_done);
+        let on_error = Arc::new(on_error);
+        let transport = self.transport.read().unwrap().clone();
+        let hooks = self.hook_snapshot();
+        async_global_executor::spawn(async move {
+            let _keep_engine = transport.clone();
+            let mut request = match build_request(&options, &None) {
+                Ok(request) => request,
+                Err(error) => {
+                    prefetch::fail(&key);
+                    on_error.call(ErrorEvent::from(error));
+                    return;
+                }
+            };
+            request
+                .extensions
+                .insert(hooks::CorrelationId(crate::hooks::next_correlation_id()));
+            request
+                .extensions
+                .insert(crate::hooks::metadata_bag(&options.metadata));
+            // The request-hook chain (auth injection) — a hook veto or
+            // mock ends the prefetch without an entry.
+            match hooks.run_request_hooks(request).await {
+                Ok(monet_core::hook::HookOutcome::Modified(request)) => {
+                    match transport.execute(request, CancelToken::new()).await {
+                        Ok(response) => {
+                            // Buffer the body: a cached response is a
+                            // complete thing.
+                            use futures_lite::StreamExt as _;
+                            let mut body = response.body;
+                            let mut bytes = Vec::new();
+                            let mut failure: Option<monet_core::Error> = None;
+                            while let Some(chunk) = body.next().await {
+                                match chunk {
+                                    Ok(chunk) => bytes.extend_from_slice(&chunk),
+                                    Err(error) => {
+                                        failure = Some(error);
+                                        break;
+                                    }
+                                }
+                            }
+                            match failure {
+                                None => {
+                                    prefetch::complete(
+                                        &key,
+                                        prefetch::CachedResponse {
+                                            status: response.status,
+                                            headers: response.headers,
+                                            body: bytes,
+                                        },
+                                    );
+                                    on_done.call_with_no_args();
+                                }
+                                Some(error) => {
+                                    prefetch::fail(&key);
+                                    on_error.call(ErrorEvent::from(error));
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            prefetch::fail(&key);
+                            on_error.call(ErrorEvent::from(error));
+                        }
+                    }
+                }
+                Ok(_) => {
+                    // A mocked prefetch has no wire form to warm: fail
+                    // closed (no entry).
+                    prefetch::fail(&key);
+                    on_error.call(ErrorEvent::from(monet_core::Error::transport(
+                        "monet-rn: a request hook mocked the prefetch — nothing to cache",
+                    )));
+                }
+                Err(error) => {
+                    prefetch::fail(&key);
+                    on_error.call(ErrorEvent::from(error));
+                }
+            }
+        })
+        .detach();
+        Ok(())
+    }
+
+    /// Drops every cached prefetch entry (fresh and pending alike).
+    pub fn clear_prefetch(&self) -> anyhow::Result<()> {
+        prefetch::clear();
+        Ok(())
+    }
+
 
     /// Takes one queued chunk (zero-copy into a JS ArrayBuffer).
     /// `None` means the queue is empty — check `body_done` to tell "no
@@ -879,16 +1014,63 @@ fn spawn_fetch_pump(
                                 // what the exchange record reports.
                                 exchange.observe_request(&request);
                                 let mut request = request;
-                                let transport = transport.clone();
-                                Box::pin(async move {
-                                    let extensions =
-                                        std::mem::take(&mut request.extensions);
-                                    let mut response = transport
-                                        .execute(request, cancel_for_execute)
-                                        .await?;
-                                    response.extensions = extensions;
-                                    Ok(response)
-                                })
+                                // The prefetch checkpoint (v2/W4): a key
+                                // the caller carried checks the cache
+                                // before the transport — a fresh entry
+                                // delivers with zero connections, a
+                                // pending one joins its prefetch. Falls
+                                // through to the network on miss/stale/
+                                // join-failure (the fetch side never
+                                // writes the cache).
+                                if !options.prefetch_key.is_empty() {
+                                    let ttl = options.prefetch_ttl_ms as u64;
+                                    if let Some(cached) =
+                                        prefetch::take_if_fresh(&options.prefetch_key, ttl)
+                                    {
+                                        valve_log(&format!(
+                                            "PUMP-PREFETCH-HIT id={fetch_id}"
+                                        ));
+                                        let extensions =
+                                            std::mem::take(&mut request.extensions);
+                                        Box::pin(async move {
+                                            Ok(mark_prefetched(cached, extensions))
+                                        })
+                                    } else {
+                                        let key = options.prefetch_key.clone();
+                                        let extensions =
+                                            std::mem::take(&mut request.extensions);
+                                        let transport = transport.clone();
+                                        Box::pin(async move {
+                                            if let Some(cached) = prefetch::join(&key)
+                                                .await
+                                                .ok()
+                                                .flatten()
+                                            {
+                                                return Ok(mark_prefetched(
+                                                    cached, extensions,
+                                                ));
+                                            }
+                                            // Miss/stale/failed join: the
+                                            // network, as a plain fetch.
+                                            let mut response = transport
+                                                .execute(request, cancel_for_execute)
+                                                .await?;
+                                            response.extensions = extensions;
+                                            Ok(response)
+                                        })
+                                    }
+                                } else {
+                                    let transport = transport.clone();
+                                    Box::pin(async move {
+                                        let extensions =
+                                            std::mem::take(&mut request.extensions);
+                                        let mut response = transport
+                                            .execute(request, cancel_for_execute)
+                                            .await?;
+                                        response.extensions = extensions;
+                                        Ok(response)
+                                    })
+                                }
                             }
                             monet_core::hook::HookOutcome::Mocked(response) => {
                                 valve_log(&format!(
@@ -1016,6 +1198,26 @@ fn spawn_fetch_pump(
             }
         })
         .detach();
+}
+
+/// Builds the delivered form of a prefetch hit: the cached status/
+/// headers/body, the request's extensions (correlationId/attempt ride
+/// it like any response), and the hit marker nitro also appends.
+fn mark_prefetched(
+    cached: prefetch::CachedResponse,
+    extensions: monet_core::Extensions,
+) -> monet_core::Response {
+    let mut response = monet_core::Response::new(
+        cached.status,
+        cached.headers,
+        monet_core::body::Body::from_bytes(cached.body),
+    );
+    response
+        .headers
+        .append("x-monet-prefetched", "true")
+        .unwrap_or_else(|e| panic!("the hit marker header: {e:?}"));
+    response.extensions = extensions;
+    response
 }
 
 /// The pump's request body source.

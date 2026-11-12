@@ -7,7 +7,7 @@
 export { getMonet } from '../generated/rust-turbo/Monet';
 export type { Monet } from '../generated/rust-turbo/Monet';
 
-export { fetch } from './fetch';
+export { fetch, prefetch } from './fetch';
 export type { MonetRequestInit } from './fetch';
 export {
   addRequestHook,
@@ -51,6 +51,11 @@ export function configurePins(json: string): void {
 /** Clears the pinning configuration (rebuilds the transport/client). */
 export function clearPins(): void {
   getMonet().clearPins();
+}
+
+/** Drops every cached prefetch entry (fresh and pending alike). */
+export function clearPrefetch(): void {
+  getMonet().clearPrefetch();
 }
 
 /**

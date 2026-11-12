@@ -33,6 +33,7 @@ import {
   addResponseObserver,
   clearHooks,
   clearPins,
+  prefetch,
   clearTrust,
   configurePins,
   configureTrust,
@@ -342,6 +343,93 @@ const CHECKS: Array<{
     },
   },
   {
+    name: 'http:prefetch_hit',
+    run: async base => {
+      // v2/W4: a prefetched response delivers with zero transport. The
+      // server's request counter is the wire observable: the prefetch
+      // itself is +1, the keyed fetch must add nothing.
+      const count = async (): Promise<number> =>
+        Number(await (await fetch(`${base}/request-count`)).text());
+      const before = await count();
+      await prefetch(`${base}/plain`, {prefetchKey: 'battery-prefetch'});
+      const response = await fetch(`${base}/plain`, {
+        prefetchKey: 'battery-prefetch',
+      });
+      assert(response.status === 200, `status ${response.status}`);
+      const body = await response.text();
+      assert(body === 'plain', `body ${JSON.stringify(body)}`);
+      assert(
+        response.headers.get('x-monet-prefetched') === 'true',
+        `hit marker ${JSON.stringify(response.headers.get('x-monet-prefetched'))}`,
+      );
+      // Each /request-count read includes its own increment (the mock
+      // check's "the counter reads only"): before already counted its
+      // read, after counts this one — the delta is the prefetch's own
+      // request (+1) plus this read (+1). The hit added nothing.
+      const after = await count();
+      assert(
+        after === before + 2,
+        `request-count ${before} -> ${after}, expected +2 (the prefetch, this read)`,
+      );
+    },
+  },
+  {
+    name: 'http:prefetch_ttl_expiry',
+    run: async base => {
+      // A stale entry (the reading fetch's TTL governs) falls through
+      // to the network — with the hit marker absent.
+      await prefetch(`${base}/plain`, {prefetchKey: 'battery-ttl'});
+      const response = await fetch(`${base}/plain`, {
+        prefetchKey: 'battery-ttl',
+        prefetchTtlMs: 1,
+      });
+      // 1ms TTL: the entry is stale by the time the fetch reads it.
+      await new Promise<void>(resolve => setTimeout(resolve, 5));
+      const networked = await fetch(`${base}/plain`, {
+        prefetchKey: 'battery-ttl',
+        prefetchTtlMs: 1,
+      });
+      assert(networked.status === 200, `status ${networked.status}`);
+      const body = await networked.text();
+      assert(body === 'plain', `body ${JSON.stringify(body)}`);
+      assert(
+        networked.headers.get('x-monet-prefetched') == null,
+        'a stale entry must not carry the hit marker',
+      );
+    },
+  },
+  {
+    name: 'http:prefetch_pending_join',
+    run: async base => {
+      // A fetch racing an in-flight prefetch joins it: one server
+      // request, both callers satisfied.
+      const count = async (): Promise<number> =>
+        Number(await (await fetch(`${base}/request-count`)).text());
+      const before = await count();
+      const pending = prefetch(`${base}/slow-head`, {
+        prefetchKey: 'battery-join',
+      });
+      // The slow head answers after 500ms; the join must wait it out
+      // and deliver the prefetched form.
+      const response = await fetch(`${base}/slow-head`, {
+        prefetchKey: 'battery-join',
+      });
+      await pending;
+      assert(response.status === 200, `status ${response.status}`);
+      const body = await response.text();
+      assert(body === 'late head', `body ${JSON.stringify(body)}`);
+      assert(
+        response.headers.get('x-monet-prefetched') === 'true',
+        'the joined fetch must see the hit marker',
+      );
+      const after = await count();
+      assert(
+        after === before + 2,
+        `request-count ${before} -> ${after}, expected +2 (the one prefetch, this read) — a join must not re-request`,
+      );
+    },
+  },
+  {
     name: 'http:slow_consumer_bounded',
     timeoutMs: 20_000,
     run: async base => {
@@ -372,6 +460,8 @@ const CHECKS: Array<{
           metadata: [],
           timeoutMs: 0,
           followRedirects: true,
+          prefetchKey: '',
+          prefetchTtlMs: 0,
         },
         null,
         () => headArrived(),
