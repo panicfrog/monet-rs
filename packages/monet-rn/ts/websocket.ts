@@ -135,15 +135,27 @@ type OpenHandler = () => void;
  */
 export class MonetWebSocket {
   /** The native connection object (its lifetime is this object's). */
-  private conn: MonetWsConnection;
+  private conn!: MonetWsConnection;
   /** The correlation id the native-held event closures capture. */
-  private socketId: number;
+  private socketId!: number;
   private _readyState: number = 0; // CONNECTING
 
   // Event handlers (EventTarget-style property assignment).
   private _onopen: OpenHandler | null = null;
   private _onmessage: MessageHandler | null = null;
   private _onclose: CloseHandler | null = null;
+  /** The reconnect policy (v2/W5); null = never reconnect. */
+  private _reconnect: {maxAttempts: number; backoffMs: number} | null;
+  /** Reconnects spent so far (v2/W5). */
+  private _reconnects = 0;
+  /** A reconnect scheduled but not yet fired (v2/W5) — close() during
+   *  the backoff window cancels it. */
+  private _reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private _onreconnect: (() => void) | null = null;
+  /** The original handshake's parameters (v2/W5) — reconnects dial the
+   *  same endpoint with the same protocols and headers. */
+  private _reconnectProtocols: string[] = [];
+  private _reconnectHeaders: {name: string; value: string}[] = [];
   private _onerror: ErrorHandler | null = null;
 
   /** 'blob' is accepted for compatibility but always delivers ArrayBuffer. */
@@ -195,6 +207,15 @@ export class MonetWebSocket {
     }
   }
 
+  /** Fires when a reconnect (v2/W5) re-establishes the connection —
+   *  after an abnormal close, before any further message events. */
+  get onreconnect(): (() => void) | null {
+    return this._onreconnect;
+  }
+  set onreconnect(handler: (() => void) | null) {
+    this._onreconnect = handler;
+  }
+
   get onerror(): ErrorHandler | null {
     return this._onerror;
   }
@@ -211,39 +232,34 @@ export class MonetWebSocket {
     options?: {
       protocols?: string[];
       headers?: Record<string, string>;
+      /** The reconnect policy (v2/W5): on an ABNORMAL close (1006 or
+       *  wasClean false) the socket reconnects with a doubling backoff
+       *  up to maxAttempts extra connections. A clean close (the
+       *  handshake-completed close() or the server's) never
+       *  reconnects. `onreconnect` fires when a reborn connection
+       *  opens; the attempts that give out end in the final onclose.
+       */
+      reconnect?: {maxAttempts: number; backoffMs: number};
     },
   ) {
     this._url = url;
-    const monet = getMonet();
+    this._reconnect = options?.reconnect ?? null;
     const headers: {name: string; value: string}[] = [];
     if (options?.headers) {
       for (const [name, value] of Object.entries(options.headers)) {
         headers.push({name, value});
       }
     }
-    // A JS-side correlation id, allocated before the call so the
-    // native-held closures capture a plain number and nothing else (see
-    // the liveSockets docs — the dispatchers must come from module
-    // scope, not from this constructor's lexical `this`). No callback
-    // can run before wsConnect returns — they all marshal through the
-    // JS thread's queue, and the constructor holds that thread — so
-    // publishing the entry afterwards is race-free.
-    const socketId = nextSocketId++;
-    const dispatchers = makeDispatchers(socketId);
-    this.conn = monet.wsConnect(
-      url,
-      options?.protocols ?? [],
-      headers,
-      dispatchers.onOpen,
-      dispatchers.onMessage,
-      dispatchers.onClose,
-      dispatchers.onError,
-    );
-    this.socketId = socketId;
-    // Strongly held until the first event (see the connecting docs):
-    // the handshake window is exactly when the user's own rooting is
-    // the fragile await-open cycle.
-    connecting.set(socketId, this);
+    // The original handshake's parameters, stashed for reconnects
+    // (v2/W5): the reborn connection dials the same endpoint. The
+    // native wiring lives in spawnConnection (shared with the
+    // reconnect path); it allocates the socket id and publishes the
+    // strong connect-hold the same way — no callback can run before
+    // wsConnect returns (they marshal through the JS thread's queue,
+    // and the constructor holds that thread).
+    this._reconnectProtocols = options?.protocols ?? [];
+    this._reconnectHeaders = headers;
+    this.spawnConnection();
   }
 
   /** 0 CONNECTING, 1 OPEN, 2 CLOSING, 3 CLOSED (WHATWG). */
@@ -277,6 +293,12 @@ export class MonetWebSocket {
 
   /** Starts the close handshake; `onclose` fires when the peer answers. */
   close(code?: number, reason?: string): void {
+    // A user close during a reconnect's backoff window cancels it —
+    // the policy only covers abnormal closes, never this.
+    if (this._reconnectTimer !== null) {
+      clearTimeout(this._reconnectTimer);
+      this._reconnectTimer = null;
+    }
     if (this._readyState === 1) {
       this._readyState = 2; // CLOSING
       // The weak entry stays until the terminal close event: messages
@@ -301,7 +323,37 @@ export class MonetWebSocket {
     // and a dropped socket stays collectable.
     connecting.delete(this.socketId);
     liveSockets.set(this.socketId, new WeakRef(this));
+    if (this._reconnects > 0) {
+      // A reborn connection (v2/W5): the app learns of the reconnect,
+      // not a fresh open.
+      this._onreconnect?.();
+      return;
+    }
     this.onopen?.();
+  }
+
+  /** Establishes (or re-establishes, v2/W5) the native connection: the
+   *  constructor's wiring, extracted so the reconnect path shares it.
+   *  The fresh dispatchers bind a fresh socket id — the old id's
+   *  entries were retired at its close. */
+  private spawnConnection(): void {
+    const monet = getMonet();
+    const socketId = nextSocketId++;
+    const dispatchers = makeDispatchers(socketId);
+    this.conn = monet.wsConnect(
+      this._url,
+      this._reconnectProtocols,
+      this._reconnectHeaders,
+      dispatchers.onOpen,
+      dispatchers.onMessage,
+      dispatchers.onClose,
+      dispatchers.onError,
+    );
+    this.socketId = socketId;
+    // Strongly held until the first event (see the connecting docs):
+    // the handshake window is exactly when the user's own rooting is
+    // the fragile await-open cycle.
+    connecting.set(socketId, this);
   }
 
   /**
@@ -319,10 +371,28 @@ export class MonetWebSocket {
     reason: string;
     wasClean: boolean;
   }): void {
-    this._readyState = 3; // CLOSED
-    this._closed = true;
     connecting.delete(this.socketId);
     liveSockets.delete(this.socketId);
+    // The reconnect window (v2/W5): an abnormal close with budget left
+    // re-establishes the connection instead of ending the socket. The
+    // app sees onreconnect (not onclose) when it lands.
+    const abnormal = !event.wasClean || event.code === 1006;
+    if (
+      abnormal &&
+      this._reconnect !== null &&
+      this._reconnects < this._reconnect.maxAttempts
+    ) {
+      this._readyState = 0; // CONNECTING (the rebirth)
+      this._reconnects += 1;
+      const backoff = this._reconnect.backoffMs << (this._reconnects - 1);
+      this._reconnectTimer = setTimeout(() => {
+        this._reconnectTimer = null;
+        this.spawnConnection();
+      }, backoff);
+      return;
+    }
+    this._readyState = 3; // CLOSED
+    this._closed = true;
     const closeEvent: MonetWsCloseEvent = {
       code: event.code,
       reason: event.reason,

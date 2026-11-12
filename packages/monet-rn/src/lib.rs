@@ -98,6 +98,13 @@ pub struct Monet {
     transport: RwLock<Arc<dyn monet_core::Transport>>,
     client: RwLock<Arc<Client>>,
     trust: RwLock<platform::TrustConfig>,
+    /// The built-in retry policy (v2/W5): retries a 5xx response or a
+    /// network error up to `retries` extra attempts, backing off
+    /// `backoff_ms` doubled per attempt. Off by default; coexists with
+    /// the hook retry exit (the policy fires only after the response
+    /// hooks returned the response unhandled, and never retries a
+    /// Cancelled/Hook error or a streamed body).
+    retry: RwLock<RetryPolicy>,
     fetches: FetchRegistry,
     hooks: RwLock<HookRegistry>,
     pending: Arc<Pending>,
@@ -118,6 +125,7 @@ impl Monet {
             client: RwLock::new(Arc::new(Client::new(transport.clone()))),
             transport: RwLock::new(transport),
             trust: RwLock::new(trust),
+            retry: RwLock::new(RetryPolicy::default()),
             fetches: FetchRegistry::new(),
             hooks: RwLock::new(HookRegistry::new()),
             pending: Pending::shared(),
@@ -250,6 +258,23 @@ impl Monet {
     }
 
     // ---- configuration (client-level) ----
+
+    /// Installs the built-in retry policy (v2/W5):
+    /// `{"retries": <n>, "backoffMs": <ms>}` — n extra attempts on a
+    /// 5xx response or a network error, the backoff doubling per
+    /// attempt. `retries: 0` (the default) is off.
+    pub fn configure_retry(&self, json: String) -> anyhow::Result<()> {
+        let policy: RetryPolicy = serde_json::from_str(&json)
+            .map_err(|e| anyhow::anyhow!("invalid retry policy: {e}"))?;
+        *self.retry.write().unwrap() = policy;
+        Ok(())
+    }
+
+    /// Clears the built-in retry policy (back to off).
+    pub fn clear_retry(&self) -> anyhow::Result<()> {
+        *self.retry.write().unwrap() = RetryPolicy::default();
+        Ok(())
+    }
 
     /// Installs a pinning configuration (nitro-fetch-pinning.json format,
     /// fail-closed: a malformed config is an error, never a silent no-op).
@@ -497,11 +522,13 @@ impl Monet {
         let transport = self.transport.read().unwrap().clone();
         let hooks = self.hook_snapshot();
         let recorders = self.recorders.read().unwrap().clone();
+        let retry_policy = *self.retry.read().unwrap();
         spawn_fetch_pump(
             self.fetches.clone(),
             transport,
             hooks,
             recorders,
+            retry_policy,
             fetch_id,
             cancel,
             options,
@@ -552,11 +579,13 @@ impl Monet {
         let transport = self.transport.read().unwrap().clone();
         let hooks = self.hook_snapshot();
         let recorders = self.recorders.read().unwrap().clone();
+        let retry_policy = *self.retry.read().unwrap();
         spawn_fetch_pump(
             self.fetches.clone(),
             transport,
             hooks,
             recorders,
+            retry_policy,
             fetch_id,
             cancel,
             options,
@@ -922,6 +951,7 @@ fn spawn_fetch_pump(
     transport: Arc<dyn monet_core::Transport>,
     hooks: HookRegistry,
     recorders: Vec<Arc<jsi_turbo::TurboCallback>>,
+    retry_policy: RetryPolicy,
     fetch_id: f64,
     cancel: monet_core::CancelToken,
     options: FetchOptions,
@@ -940,6 +970,10 @@ fn spawn_fetch_pump(
             let _keep_engine = transport.clone();
 
             let mut attempt: u32 = 0;
+            // The policy's own budget (v2/W5), separate from the hook
+            // retry counter: the two exits coexist without eating each
+            // other's caps.
+            let mut policy_attempts: u32 = 0;
             // The fetch's pairing key: stable across retries, carried in
             // the request extensions and threaded to the response, so
             // the request-phase and response-phase events of this fetch
@@ -1089,7 +1123,33 @@ fn spawn_fetch_pump(
                         )
                         .await
                         {
-                            RaceOutcome::Done(Ok(response)) => break response,
+                            RaceOutcome::Done(Ok(response)) => {
+                                // The built-in policy (v2/W5): after the
+                                // response hooks passed on it, a 5xx with
+                                // attempts left backs off and re-runs the
+                                // pipeline. The last response is the
+                                // fetch's result when the cap runs out.
+                                if response.status >= 500
+                                    && policy_attempts < retry_policy.retries
+                                {
+                                    policy_attempts += 1;
+                                    let backoff =
+                                        retry_policy.backoff_ms << (policy_attempts - 1);
+                                    valve_log(&format!(
+                                        "PUMP-RETRY id={fetch_id} status={} attempt={policy_attempts} backoff={backoff}ms",
+                                        response.status
+                                    ));
+                                    if backoff > 0 {
+                                        futures_timer::Delay::new(
+                                            std::time::Duration::from_millis(backoff),
+                                        )
+                                        .await;
+                                    }
+                                    attempt += 1;
+                                    continue;
+                                }
+                                break response
+                            }
                             RaceOutcome::Done(Err(error)) => {
                                 if crate::hooks::is_hook_retry(&error) && attempt < MAX_HOOK_RETRIES
                                 {
@@ -1098,6 +1158,25 @@ fn spawn_fetch_pump(
                                     // run the whole pipeline again. The
                                     // aborted attempt's body is dropped
                                     // with it.
+                                    attempt += 1;
+                                    continue;
+                                }
+                                // The built-in policy (v2/W5): a network
+                                // error (never a Cancelled abort or a Hook
+                                // veto — those are final) with attempts
+                                // left backs off and retries.
+                                if matches!(error, monet_core::Error::Transport { .. })
+                                    && policy_attempts < retry_policy.retries
+                                {
+                                    policy_attempts += 1;
+                                    let backoff =
+                                        retry_policy.backoff_ms << (policy_attempts - 1);
+                                    if backoff > 0 {
+                                        futures_timer::Delay::new(
+                                            std::time::Duration::from_millis(backoff),
+                                        )
+                                        .await;
+                                    }
                                     attempt += 1;
                                     continue;
                                 }
@@ -1198,6 +1277,24 @@ fn spawn_fetch_pump(
             }
         })
         .detach();
+}
+
+/// The built-in retry policy (v2/W5) — see [`Monet::configure_retry`].
+#[derive(serde::Deserialize, Clone, Copy, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct RetryPolicy {
+    /// Extra attempts beyond the first (0 = off).
+    #[serde(default)]
+    pub retries: u32,
+    /// The first backoff in milliseconds; doubles per attempt.
+    #[serde(default)]
+    pub backoff_ms: u64,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        RetryPolicy { retries: 0, backoff_ms: 0 }
+    }
 }
 
 /// Builds the delivered form of a prefetch hit: the cached status/

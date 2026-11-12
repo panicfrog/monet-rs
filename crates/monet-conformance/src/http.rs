@@ -171,6 +171,7 @@ impl HttpServer {
                                     respond(
                                         parts.method.as_str(),
                                         parts.uri.path(),
+                                        parts.uri.query().unwrap_or(""),
                                         &parts.headers,
                                         body.to_vec(),
                                         &gate,
@@ -250,6 +251,12 @@ impl HttpServer {
 /// start mints a new leaf key, so the hash is served, never baked in).
 static TLS_LEAF_SPKI: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
+/// The /flaky route's visit counts (v2/W5) — keyed by path+query so
+/// concurrent checks arm independent counters.
+static FLAKY_VISITS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, usize>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
 /// Registers the TLS battery server's leaf SPKI for `/leaf-spki`.
 pub(crate) fn set_tls_leaf_spki(hash: String) {
     let _ = TLS_LEAF_SPKI.set(hash);
@@ -294,6 +301,7 @@ pub(crate) fn set_tls_connection_close() {
 async fn respond(
     method: &str,
     path: &str,
+    query: &str,
     request_headers: &hyper::HeaderMap,
     request_body: Vec<u8>,
     gate: &std::sync::Arc<tokio::sync::Notify>,
@@ -301,7 +309,8 @@ async fn respond(
     // Every handled request counts (v2/W3): a mocked fetch must not move
     // it — the mock check's zero-connection observable.
     REQUESTS_HANDLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let mut response = respond_route(method, path, request_headers, request_body, gate).await;
+    let mut response =
+        respond_route(method, path, query, request_headers, request_body, gate).await;
     if TLS_CONNECTION_CLOSE.load(std::sync::atomic::Ordering::Relaxed) {
         response
             .headers_mut()
@@ -312,9 +321,11 @@ async fn respond(
 
 /// The route table — [`respond`] adds the TLS battery's connection close.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 async fn respond_route(
     method: &str,
     path: &str,
+    query: &str,
     request_headers: &hyper::HeaderMap,
     request_body: Vec<u8>,
     gate: &std::sync::Arc<tokio::sync::Notify>,
@@ -332,6 +343,42 @@ async fn respond_route(
         "/plain" => ok(
             StatusCode::OK,
             boxed(Full::new(Bytes::from_static(b"plain"))),
+        ),
+        // The retry-policy target (v2/W5): fails with 500 the first n
+        // visits of this exact path, then answers 200 — the battery's
+        // flaky upstream. The visit count keys by the full path+query,
+        // so each check arms its own counter.
+        "/flaky" => {
+            let key = if query.is_empty() {
+                path.to_string()
+            } else {
+                format!("{path}?{query}")
+            };
+            let mut flaky = FLAKY_VISITS.lock().unwrap();
+            let visits = flaky.entry(key).or_insert(0);
+            *visits += 1;
+            let fail_first: usize = query
+                .split('=')
+                .nth(1)
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0);
+            if *visits <= fail_first {
+                ok(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    boxed(Full::new(Bytes::from_static(b"flaky"))),
+                )
+            } else {
+                ok(
+                    StatusCode::OK,
+                    boxed(Full::new(Bytes::from_static(b"recovered"))),
+                )
+            }
+        }
+        // Always 500 — the policy's give-up path: the last response is
+        // the fetch's result, not an error.
+        "/always-500" => ok(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            boxed(Full::new(Bytes::from_static(b"always broken"))),
         ),
         // The TLS battery server's leaf SPKI (base64) — 404 when no TLS
         // variant is running, i.e. from every in-process battery server.
@@ -433,10 +480,9 @@ async fn respond_route(
                     String::from_utf8_lossy(value.as_bytes())
                 ));
             }
-            reflection.push_str(&format!(
-                "],\"body\":\"{}\"}}",
-                String::from_utf8_lossy(&request_body)
-            ));
+            reflection.push_str("],\"body\":\"");
+            reflection.push_str(&json_escape(&String::from_utf8_lossy(&request_body)));
+            reflection.push_str("\"}");
             ok(StatusCode::OK, boxed(Full::new(Bytes::from(reflection))))
         }
         "/redirect" => {
@@ -544,6 +590,25 @@ async fn respond_route(
         }
         _ => ok(StatusCode::NOT_FOUND, boxed(Full::new(Bytes::new()))),
     }
+}
+
+/// JSON-string escapes one string (the /echo reflection's body —
+/// multipart and binary bodies carry CR/LF and quotes that a raw
+/// interpolation would break).
+fn json_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn ok(

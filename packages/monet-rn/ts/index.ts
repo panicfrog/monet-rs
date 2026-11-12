@@ -29,6 +29,7 @@ export {
   type MonetExchange,
   type MonetExchangeBody,
 } from './exchange';
+export { MonetFormData } from './formdata';
 export { MonetError, MonetHeaders, MonetResponse } from './response';
 export type { ErrorEvent, HeadEvent } from './response';
 export { MonetWebSocket } from './websocket';
@@ -56,6 +57,24 @@ export function clearPins(): void {
 /** Drops every cached prefetch entry (fresh and pending alike). */
 export function clearPrefetch(): void {
   getMonet().clearPrefetch();
+}
+
+/**
+ * Installs the built-in retry policy: `{"retries": n, "backoffMs": ms}`
+ * — n extra attempts on a 5xx response or a network error, the backoff
+ * doubling per attempt. Off by default; coexists with the hook retry
+ * exit. The last response is the fetch's result when the cap runs out.
+ */
+export function configureRetry(policy: {
+  retries: number;
+  backoffMs: number;
+}): void {
+  getMonet().configureRetry(JSON.stringify(policy));
+}
+
+/** Clears the built-in retry policy (back to off). */
+export function clearRetry(): void {
+  getMonet().clearRetry();
 }
 
 /**

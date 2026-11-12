@@ -18,6 +18,7 @@ import {
   MonetError,
   MonetResponse,
 } from './response';
+import {MonetFormData} from './formdata';
 import { utf8Encode } from './utf8';
 
 export interface MonetRequestInit {
@@ -26,9 +27,12 @@ export interface MonetRequestInit {
     | Record<string, string>
     | ReadonlyArray<readonly [string, string]>
     | ReadonlyArray<{name: string; value: string}>;
-  /** Buffered (string | ArrayBuffer) or streamed (AsyncIterable of
-   *  either) — the streaming form feeds the wire chunk by chunk. */
-  body?: string | ArrayBuffer | AsyncIterable<string | ArrayBuffer>;
+  /** Buffered (string | ArrayBuffer | MonetFormData) or streamed
+   *  (AsyncIterable of string | ArrayBuffer) — the streaming form feeds
+   *  the wire chunk by chunk. A MonetFormData serializes to its
+   *  multipart body and sets the content-type (an explicit content-type
+   *  header wins, as with browsers). */
+  body?: string | ArrayBuffer | MonetFormData | AsyncIterable<string | ArrayBuffer>;
   /** Client-side metadata riding the hook/observer events (the flow tag
    *  that strings a series of requests together; never on the wire). */
   metadata?: Record<string, string>;
@@ -94,19 +98,21 @@ export function fetch(
 ): Promise<MonetResponse> {
   const monet = getMonet();
   const url = typeof input === 'string' ? input : input.url;
-  const options: FetchOptions = {
-    url,
-    method: init.method ?? 'GET',
-    headers: normalizeHeaders(init),
-    metadata: metadataKV(init),
-    timeoutMs: init.timeoutMs ?? 0,
-    followRedirects: init.followRedirects ?? true,
-    prefetchKey: init.prefetchKey ?? '',
-    prefetchTtlMs: init.prefetchTtlMs ?? 0,
-  };
+  const headers = normalizeHeaders(init);
   let body: ArrayBuffer | null = null;
   if (typeof init.body === 'string') {
     body = utf8Encode(init.body);
+  } else if (init.body instanceof MonetFormData) {
+    // The FormData serializes to its multipart body; its content-type
+    // rides the headers when the caller did not set one explicitly.
+    const assembled = init.body.serialize();
+    body = assembled.body;
+    const hasContentType = headers.some(
+      header => header.name.toLowerCase() === 'content-type',
+    );
+    if (!hasContentType) {
+      headers.push({name: 'content-type', value: assembled.contentType});
+    }
   } else if (
     init.body != null &&
     typeof (init.body as ArrayBuffer).byteLength === 'number'
@@ -117,6 +123,16 @@ export function fetch(
     init.body != null && body == null
       ? (init.body as AsyncIterable<string | ArrayBuffer>)
       : null;
+  const options: FetchOptions = {
+    url,
+    method: init.method ?? 'GET',
+    headers,
+    metadata: metadataKV(init),
+    timeoutMs: init.timeoutMs ?? 0,
+    followRedirects: init.followRedirects ?? true,
+    prefetchKey: init.prefetchKey ?? '',
+    prefetchTtlMs: init.prefetchTtlMs ?? 0,
+  };
 
   const channel = new BodyChannel();
   let headResolved = false;

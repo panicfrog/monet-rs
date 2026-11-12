@@ -33,6 +33,9 @@ import {
   addResponseObserver,
   clearHooks,
   clearPins,
+  clearRetry,
+  configureRetry,
+  MonetFormData,
   prefetch,
   clearTrust,
   configurePins,
@@ -343,6 +346,84 @@ const CHECKS: Array<{
     },
   },
   {
+    name: 'http:formdata_post',
+    run: async base => {
+      // v2/W5: a MonetFormData serializes to its multipart body with
+      // the content-type set — /echo reflects method/headers/body.
+      const form = new MonetFormData();
+      form.append('field-a', 'value-one');
+      form.append('field-b', 'value-two');
+      const response = await fetch(`${base}/echo`, {
+        method: 'POST',
+        body: form,
+      });
+      assert(response.status === 200, `status ${response.status}`);
+      const seen = JSON.parse(await response.text()) as {
+        method: string;
+        headers: string[];
+        body: string;
+      };
+      assert(seen.method === 'POST', `method ${seen.method}`);
+      const contentType = seen.headers.find(header =>
+        header.toLowerCase().startsWith('content-type:'),
+      );
+      assert(
+        contentType != null &&
+          contentType.includes('multipart/form-data; boundary='),
+        `content-type ${JSON.stringify(contentType)}`,
+      );
+      assert(
+        seen.body.includes('name="field-a"') &&
+          seen.body.includes('value-one'),
+        `field-a not in body ${JSON.stringify(seen.body)}`,
+      );
+      assert(
+        seen.body.includes('name="field-b"') &&
+          seen.body.includes('value-two'),
+        `field-b not in body`,
+      );
+      assert(
+        seen.body.trimEnd().endsWith('--'),
+        'the closing boundary marker missing',
+      );
+    },
+  },
+  {
+    name: 'http:retry_policy_succeeds',
+    run: async base => {
+      // v2/W5: the built-in policy retries a 5xx — /flaky fails the
+      // first two visits then recovers; the fetch sees the recovery.
+      try {
+        configureRetry({retries: 3, backoffMs: 10});
+        const response = await fetch(`${base}/flaky?fail=2`);
+        assert(response.status === 200, `status ${response.status}`);
+        const body = await response.text();
+        assert(body === 'recovered', `body ${JSON.stringify(body)}`);
+      } finally {
+        clearRetry();
+      }
+    },
+  },
+  {
+    name: 'http:retry_policy_gives_up',
+    run: async base => {
+      // The cap runs out on a persistently failing upstream: the LAST
+      // response is the fetch's result — not an error.
+      try {
+        configureRetry({retries: 2, backoffMs: 10});
+        const response = await fetch(`${base}/always-500`);
+        assert(
+          response.status === 500,
+          `status ${response.status}, expected the final 500 delivered`,
+        );
+        const body = await response.text();
+        assert(body === 'always broken', `body ${JSON.stringify(body)}`);
+      } finally {
+        clearRetry();
+      }
+    },
+  },
+  {
     name: 'http:prefetch_hit',
     run: async base => {
       // v2/W4: a prefetched response delivers with zero transport. The
@@ -517,6 +598,41 @@ const CHECKS: Array<{
     },
   },
   // ---- WebSocket checks (names mirror monet-conformance/src/ws.rs) ----
+  {
+    name: 'ws:reconnect_after_abrupt_drop',
+    timeoutMs: 15_000,
+    run: async base => {
+      // v2/W5: an abnormal close (the server drops TCP without a close
+      // frame) triggers the policy — the socket re-establishes and the
+      // app learns via onreconnect; the mirrored message before the
+      // drop proves the first life; a round-trip after proves the
+      // second.
+      const ws = new MonetWebSocket(`${wsBaseFrom(base)}/abrupt`, {
+        reconnect: {maxAttempts: 3, backoffMs: 100},
+      });
+      let reconnected = 0;
+      ws.onreconnect = () => {
+        reconnected += 1;
+      };
+      await waitForOpen(ws);
+      ws.send('first-life');
+      const first = await nextMessage(ws);
+      assert(first.data === 'first-life', `first echo ${JSON.stringify(first.data)}`);
+      // The server drops after the mirror; the policy fires.
+      await new Promise<void>(resolve => setTimeout(resolve, 600));
+      assert(reconnected === 1, `reconnects ${reconnected}, expected 1`);
+      assert(ws.readyState === 1, `readyState ${ws.readyState}, expected OPEN`);
+      // The second life round-trips. /abrupt drops after EVERY mirror,
+      // so the second connection dies right after this echo too — the
+      // check has proven what it needs (reconnect fired, round-trip
+      // works) and tears down with abort() rather than waiting out a
+      // clean close that this route never sends.
+      ws.send('second-life');
+      const second = await nextMessage(ws);
+      assert(second.data === 'second-life', `second echo ${JSON.stringify(second.data)}`);
+      ws.abort();
+    },
+  },
   {
     name: 'ws:round_trips',
     run: async base => {

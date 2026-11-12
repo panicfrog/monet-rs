@@ -50,6 +50,10 @@ jsi = { path = "../react-native-rust-turbo/rust/jsi", default-features = false, 
 jsi-turbo = { path = "../react-native-rust-turbo/rust/jsi-turbo" }
 linkme = "0.3"
 anyhow = "1.0"
+# The retry policy's backoff sleeps (v2/W5) — the pump awaits a Delay.
+futures-timer = "3"
+# The retry policy's JSON surface (configureRetry).
+serde_json.workspace = true
 serde = { version = "1.0", features = ["derive"] }
 
 # The monet crates ship vendored (vendor/ — rsynced from the repo's crates/

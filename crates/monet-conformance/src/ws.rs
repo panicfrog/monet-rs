@@ -328,6 +328,22 @@ where
                 }
             }
         }
+        // The reconnect policy's trigger (v2/W5): mirror one message,
+        // then drop the TCP connection without a close frame — the
+        // client sees the abnormal 1006/wasClean-false close.
+        "/abrupt" => {
+            let mut waited_first = false;
+            while let Some(Ok(message)) = ws.next().await {
+                if let Message::Text(text) = message {
+                    ws.send(Message::Text(text)).await?;
+                    waited_first = true;
+                }
+                if waited_first {
+                    // Drop without the close handshake.
+                    return Ok(());
+                }
+            }
+        }
         "/close-1012" => {
             use tokio_tungstenite::tungstenite::protocol::CloseFrame;
             use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
