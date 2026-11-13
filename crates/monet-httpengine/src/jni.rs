@@ -572,6 +572,27 @@ fn setup_and_start(
                 )?;
             }
 
+            // HttpEngine refuses to start any upload without a
+            // Content-Type ("Requests with upload data must have a
+            // Content-Type"); the other stacks send such a body as-is.
+            // The neutral type keeps those requests working here too.
+            let uploads = match upload {
+                UploadBody::Buffered(bytes) => !bytes.is_empty(),
+                UploadBody::Streamed { .. } => true,
+            };
+            if uploads && req.headers.get("content-type").is_none() {
+                let name = env.new_string("Content-Type")?;
+                let value = env.new_string("application/octet-stream")?;
+                env.call_method(
+                    &builder,
+                    jni::jni_str!("addHeader"),
+                    jni::jni_sig!(
+                        "(Ljava/lang/String;Ljava/lang/String;)Landroid/net/http/UrlRequest$Builder;"
+                    ),
+                    &[(&name).into(), (&value).into()],
+                )?;
+            }
+
             match upload {
                 UploadBody::Buffered(bytes) => {
                     if !bytes.is_empty() {

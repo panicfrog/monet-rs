@@ -243,6 +243,10 @@ fn spawn_pump(
             }
             futures_lite::future::block_on(async {
                 let mut done = pin!(done);
+                // One waiter for the pump's whole life: a token waiter
+                // releases its waker slot on drop, so a future rebuilt
+                // per poll would never stay registered.
+                let mut cancelled = pin!(cancel.cancelled());
                 loop {
                     // Hand-rolled three-way select: the oneshot can only
                     // be awaited once, so every iteration re-polls it (and
@@ -251,7 +255,6 @@ fn spawn_pump(
                         if done.as_mut().poll(cx).is_ready() {
                             return Poll::Ready(Step::Done);
                         }
-                        let mut cancelled = pin!(cancel.cancelled());
                         if cancelled.as_mut().poll(cx).is_ready() {
                             return Poll::Ready(Step::Cancelled);
                         }

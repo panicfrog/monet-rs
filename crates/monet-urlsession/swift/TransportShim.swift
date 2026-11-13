@@ -108,9 +108,12 @@ final class UploadPipe: NSObject {
   }
 
   /// Ends the stream cleanly: the input half sees EOF, which completes
-  /// the request body.
+  /// the request body. Deliberately NOT `markEnded()`: a fast producer
+  /// routinely reaches EOF before the session's first needNewBodyStream
+  /// ask (the bytes wait in the pair's buffer), and that ask must still
+  /// be served — refusing it failed the upload as a cancellation.
+  /// `ended` means the task is gone, nothing else.
   func finish() {
-    markEnded()
     output.close()
   }
 }
@@ -297,6 +300,11 @@ final class TaskDelegate: NSObject, URLSessionDataDelegate {
   /// Set when a streamed upload's producer failed (v2/W2c); the
   /// task.cancel() it triggers remaps the same way.
   var uploadFailure: String?
+  /// Set when the session asked for a streamed body a second time (it
+  /// restarts a request in some connection-loss cases) and the ask was
+  /// refused; the task then ends as a cancellation, remapped so the
+  /// failure names its real cause instead of reading as an abort.
+  var bodyReplayRefused = false
 
   init(id: UInt64, followRedirects: Bool) {
     self.id = id
@@ -409,7 +417,11 @@ final class TaskDelegate: NSObject, URLSessionDataDelegate {
     task: URLSessionTask,
     needNewBodyStream completionHandler: @escaping (InputStream?) -> Void
   ) {
-    completionHandler(TransportShim.shared.uploadStream(for: id))
+    let stream = TransportShim.shared.uploadStream(for: id)
+    if stream == nil {
+      bodyReplayRefused = true
+    }
+    completionHandler(stream)
   }
 
   func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
@@ -420,6 +432,10 @@ final class TaskDelegate: NSObject, URLSessionDataDelegate {
         // a certificate failure instead of Error::Cancelled.
         notifyError(
           id, code: NSURLErrorServerCertificateUntrusted, message: reason)
+      } else if error.code == NSURLErrorCancelled, bodyReplayRefused {
+        notifyError(
+          id, code: NSURLErrorRequestBodyStreamExhausted,
+          message: "the session asked to replay a streamed request body (it restarted the request); a stream cannot replay")
       } else if error.code == NSURLErrorCancelled, let reason = uploadFailure {
         // A failed upload producer surfaces the same way.
         notifyError(

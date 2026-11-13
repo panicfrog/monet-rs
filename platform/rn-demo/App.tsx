@@ -207,6 +207,29 @@ const CHECKS: Array<{
     },
   },
   {
+    name: 'http:post_without_content_type',
+    run: async base => {
+      // An upload with no Content-Type must still go out: HttpEngine
+      // refuses to start one ("Requests with upload data must have a
+      // Content-Type"). A string body takes the WHATWG default; a byte
+      // body gets the transport's neutral fallback.
+      const echo = async (body: string | ArrayBuffer) =>
+        JSON.parse(
+          await (await fetch(`${base}/echo`, {method: 'POST', body})).text(),
+        ) as {body: string; headers: string[]};
+      const text = await echo('plain-string');
+      assert(text.body === 'plain-string', `string body ${JSON.stringify(text.body)}`);
+      assert(
+        text.headers.some(
+          h => h.toLowerCase() === 'content-type:text/plain;charset=utf-8',
+        ),
+        `the string body's default type is missing (${text.headers.join(', ')})`,
+      );
+      const bytes = await echo(utf8Encode('raw-bytes'));
+      assert(bytes.body === 'raw-bytes', `byte body ${JSON.stringify(bytes.body)}`);
+    },
+  },
+  {
     name: 'http:redirect_followed',
     run: async base => {
       const response = await fetch(`${base}/redirect`);
@@ -241,6 +264,45 @@ const CHECKS: Array<{
         cancelled === undefined
           ? 'the body completed — the abort did not take effect'
           : `expected kind Cancelled, got ${cancelled.kind}: ${cancelled.message}`,
+      );
+    },
+  },
+  {
+    name: 'http:abort_streaming_before_head',
+    run: async base => {
+      // An abort before the head must settle the fetch promptly while a
+      // streamed upload is in flight. The token is awaited by the pump
+      // AND the transport's upload feeder; a single shared waker slot
+      // let the feeder's registration erase the pump's, and the abort
+      // only landed when /slow-head's head arrived (~500ms) — or the
+      // fetch even resolved despite it.
+      const controller = new AbortController();
+      const started = Date.now();
+      setTimeout(() => controller.abort(), 100);
+      let error: unknown;
+      try {
+        await fetch(`${base}/slow-head`, {
+          method: 'POST',
+          headers: {'content-type': 'text/plain'},
+          body: (async function* () {
+            yield 'streamed-';
+            yield 'body';
+          })(),
+          signal: controller.signal,
+        });
+      } catch (caught) {
+        error = caught;
+      }
+      const elapsed = Date.now() - started;
+      assert(
+        error instanceof MonetError && error.kind === 'Cancelled',
+        error === undefined
+          ? `the fetch resolved despite the abort (${elapsed}ms)`
+          : `expected kind Cancelled, got ${String(error)}`,
+      );
+      assert(
+        elapsed < 300,
+        `the abort settled after ${elapsed}ms — it waited for the head`,
       );
     },
   },

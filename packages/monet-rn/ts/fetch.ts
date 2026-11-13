@@ -115,6 +115,12 @@ export function fetch(
   let blobType: string | null = null;
   if (typeof init.body === 'string') {
     body = utf8Encode(init.body);
+    // The WHATWG default for a string body (an explicit header wins).
+    // Not cosmetic on Android: HttpEngine refuses any upload that
+    // carries no Content-Type at all.
+    if (!headers.some(h => h.name.toLowerCase() === 'content-type')) {
+      headers.push({name: 'content-type', value: 'text/plain;charset=UTF-8'});
+    }
   } else if (init.body instanceof MonetFormData) {
     // The FormData's content-type rides the headers when the caller did
     // not set one explicitly. A form with file/blob parts streams (the
