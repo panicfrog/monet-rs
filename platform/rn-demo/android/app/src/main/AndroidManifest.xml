@@ -27,5 +27,19 @@
             <category android:name="android.intent.category.LAUNCHER" />
         </intent-filter>
       </activity>
+
+      <!-- The battery's content:// fixture source: FileProvider serves
+           the app's cache dir (writeCacheFile's landing zone) as
+           content:// URIs, so the content arm of Monet.readFileChunk is
+           exercised without an external file picker. -->
+      <provider
+        android:name="androidx.core.content.FileProvider"
+        android:authorities="${applicationId}.fileprovider"
+        android:exported="false"
+        android:grantUriPermissions="true">
+        <meta-data
+          android:name="android.support.FILE_PROVIDER_PATHS"
+          android:resource="@xml/file_paths" />
+      </provider>
     </application>
 </manifest>

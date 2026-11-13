@@ -28,9 +28,20 @@ import { utf8Decode, utf8Encode } from './utf8';
  * call is invisible to the collector), so a GC during the handshake
  * would collect the socket mid-connect and the open would never arrive.
  *
- * Once the connection is established the entry turns WEAK
- * (`liveSockets`) — the user's scope holds a socket they are using — so
- * dropping it without close()/abort() stays collectable. The connection
+ * The same cycle outlives the handshake: `await nextMessage(ws)` (a
+ * promise settled from `onmessage`) roots the awaiting frame only
+ * through the socket again. So an established socket with a pending
+ * consumer — an `onmessage`, `onclose` or `onreconnect` handler set —
+ * stays STRONGLY held too (`listenedSockets`; the WHATWG rule that an
+ * open socket with event listeners must not be collected). A GC in that
+ * window used to clear the weak entry, and the message signal found no
+ * socket to deliver to — silently, with the wire healthy.
+ *
+ * Without such a consumer the entry is WEAK (`liveSockets`) — the
+ * user's scope holds a socket they are using — so dropping it without
+ * close()/abort() stays collectable. (`onopen`/`onerror` alone do not
+ * pin: the open has already fired, and a socket abandoned with an error
+ * handler must still be releasable.) The connection
  * object rides the JS wrapper's NativeState: when the collector reclaims
  * the wrapper (the app's own allocation drives it — no explicit
  * collection needed), the connection's Rust `Drop` fires the cancel
@@ -41,12 +52,13 @@ import { utf8Decode, utf8Encode } from './utf8';
  * entry here.
  */
 const connecting = new Map<number, MonetWebSocket>();
+const listenedSockets = new Map<number, MonetWebSocket>();
 const liveSockets = new Map<number, WeakRef<MonetWebSocket>>();
 let nextSocketId = 1;
 
 /** Resolves the socket a native signal belongs to. */
 function resolveLive(socketId: number): MonetWebSocket | null {
-  const strong = connecting.get(socketId);
+  const strong = connecting.get(socketId) ?? listenedSockets.get(socketId);
   if (strong !== undefined) {
     return strong;
   }
@@ -186,6 +198,7 @@ export class MonetWebSocket {
   }
   set onmessage(handler: MessageHandler | null) {
     this._onmessage = handler;
+    this.updateRetention();
     if (handler !== null && this.messageBuffer.length > 0) {
       const buffered = this.messageBuffer;
       this.messageBuffer = [];
@@ -200,6 +213,7 @@ export class MonetWebSocket {
   }
   set onclose(handler: CloseHandler | null) {
     this._onclose = handler;
+    this.updateRetention();
     if (handler !== null && this.closeBuffer !== null) {
       const buffered = this.closeBuffer;
       this.closeBuffer = null;
@@ -214,6 +228,7 @@ export class MonetWebSocket {
   }
   set onreconnect(handler: (() => void) | null) {
     this._onreconnect = handler;
+    this.updateRetention();
   }
 
   get onerror(): ErrorHandler | null {
@@ -323,6 +338,7 @@ export class MonetWebSocket {
     // and a dropped socket stays collectable.
     connecting.delete(this.socketId);
     liveSockets.set(this.socketId, new WeakRef(this));
+    this.updateRetention();
     if (this._reconnects > 0) {
       // A reborn connection (v2/W5): the app learns of the reconnect,
       // not a fresh open.
@@ -372,6 +388,7 @@ export class MonetWebSocket {
     wasClean: boolean;
   }): void {
     connecting.delete(this.socketId);
+    listenedSockets.delete(this.socketId);
     liveSockets.delete(this.socketId);
     // The reconnect window (v2/W5): an abnormal close with budget left
     // re-establishes the connection instead of ending the socket. The
@@ -410,8 +427,28 @@ export class MonetWebSocket {
     this._readyState = 3; // CLOSED
     this._closed = true;
     connecting.delete(this.socketId);
+    listenedSockets.delete(this.socketId);
     liveSockets.delete(this.socketId);
     this._onerror?.({kind: event.kind, message: event.message});
+  }
+
+  /** Pins an established socket strongly while a consumer waits on it
+   *  (see the listenedSockets docs); otherwise only the weak entry
+   *  remains. CONNECTING is the connecting map's job, CLOSED holds
+   *  nothing — and an id whose live entry is gone (a reconnect's
+   *  retired id, before the reborn one opens) stays unpinned. */
+  private updateRetention(): void {
+    const established =
+      this._readyState === 1 || this._readyState === 2; // OPEN, CLOSING
+    const listening =
+      this._onmessage !== null ||
+      this._onclose !== null ||
+      this._onreconnect !== null;
+    if (established && listening && liveSockets.has(this.socketId)) {
+      listenedSockets.set(this.socketId, this);
+    } else {
+      listenedSockets.delete(this.socketId);
+    }
   }
 
   /** Pulls all queued messages, delivering or buffering each. */

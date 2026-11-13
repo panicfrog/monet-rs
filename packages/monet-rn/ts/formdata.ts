@@ -4,11 +4,14 @@ import {utf8Encode} from './utf8';
 // fetch layer. string and ArrayBuffer parts serialize inline; a file
 // part ({uri, name, type}) streams: the framing yields as strings and
 // the file's bytes as ArrayBuffer chunks read natively
-// (Monet.readFileChunk — std::fs under a file:// URI or bare path), so
-// a large upload never crosses into JS memory whole. Non-file schemes
-// (content://, ph://) fail in the native reader — the recorded growth
-// paths.
+// (Monet.readFileChunk — std::fs under a file:// URI, bare path, or on
+// Android a content:// URI through the ContentResolver fd route), so a
+// large upload never crosses into JS memory whole. A Blob part rides
+// the same streaming form — its bytes read through FileReader at
+// stream time (RN's Blob has no synchronous read path). ph:// remains
+// the recorded growth path (the Photos framework).
 
+import {isBlob, readBlob, BlobLike} from './blob';
 import { getMonet } from '../generated/rust-turbo/Monet';
 
 const BOUNDARY_CHARS =
@@ -33,6 +36,13 @@ type Part =
       contentType?: string;
     }
   | {
+      kind: 'blob';
+      name: string;
+      value: BlobLike;
+      filename?: string;
+      contentType?: string;
+    }
+  | {
       kind: 'file';
       name: string;
       uri: string;
@@ -46,12 +56,19 @@ export class MonetFormData {
 
   /** Appends one field: a string (text), an ArrayBuffer (a binary part;
    *  `meta` carries its filename/content-type the way browsers'
-   *  append(name, blob, filename) does), or a file part — `{uri, name,
-   *  type}` where uri is a file:// URL or bare path the native reader
-   *  streams (see the file header). */
+   *  append(name, blob, filename) does), a Blob (read through
+   *  FileReader at stream time — the filename defaults to "blob",
+   *  the browser convention, and the content-type to blob.type), or a
+   *  file part — `{uri, name, type}` where uri is a file:// URL, bare
+   *  path, or (Android) content:// URI the native reader streams (see
+   *  the file header). */
   append(
     name: string,
-    value: string | ArrayBuffer | {uri: string; name?: string; type?: string},
+    value:
+      | string
+      | ArrayBuffer
+      | BlobLike
+      | {uri: string; name?: string; type?: string},
     meta?: {filename?: string; contentType?: string},
   ): void {
     if (typeof value === 'string') {
@@ -59,6 +76,14 @@ export class MonetFormData {
     } else if (value instanceof ArrayBuffer) {
       this.parts.push({
         kind: 'bytes',
+        name,
+        value,
+        filename: meta?.filename,
+        contentType: meta?.contentType,
+      });
+    } else if (isBlob(value)) {
+      this.parts.push({
+        kind: 'blob',
         name,
         value,
         filename: meta?.filename,
@@ -80,10 +105,13 @@ export class MonetFormData {
     return `multipart/form-data; boundary=${this.boundary}`;
   }
 
-  /** Whether any part streams from the filesystem (the fetch layer
-   *  routes such forms through the streaming upload). */
+  /** Whether any part needs the streaming route — a file part (native
+   *  chunks) or a Blob part (FileReader at stream time). The fetch
+   *  layer routes such forms through the streaming upload. */
   hasFileParts(): boolean {
-    return this.parts.some(part => part.kind === 'file');
+    return this.parts.some(
+      part => part.kind === 'file' || part.kind === 'blob',
+    );
   }
 
   /** The streaming form (v2/W5 patch): the same bytes `serialize()`
@@ -99,6 +127,16 @@ export class MonetFormData {
       } else if (part.kind === 'bytes') {
         yield this.bytesPartHeaders(part.name, part.filename, part.contentType);
         yield part.value;
+        yield '\r\n';
+      } else if (part.kind === 'blob') {
+        // The browser conventions: filename "blob" when unnamed, the
+        // Blob's own type when set.
+        yield this.bytesPartHeaders(
+          part.name,
+          part.filename ?? 'blob',
+          part.contentType ?? (part.value.type || 'application/octet-stream'),
+        );
+        yield await readBlob(part.value);
         yield '\r\n';
       } else {
         yield this.bytesPartHeaders(part.name, part.filename, part.contentType);
@@ -149,10 +187,15 @@ export class MonetFormData {
         );
         chunks.push(new Uint8Array(part.value));
         pushText('\r\n');
-      } else {
-        // Unreachable from the fetch layer (file parts route through
+      } else if (part.kind === 'blob') {
+        // Unreachable from the fetch layer (blob parts route through
         // stream()); a direct serialize() call fails loudly instead of
         // silently dropping the part.
+        throw new Error(
+          'MonetFormData: a blob part cannot serialize inline — send it through fetch (it streams)',
+        );
+      } else {
+        // Same for file parts.
         throw new Error(
           'MonetFormData: a file part cannot serialize inline — send it through fetch (it streams)',
         );

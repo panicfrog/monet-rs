@@ -6,9 +6,11 @@
 
 export { getMonet } from '../generated/rust-turbo/Monet';
 export type { Monet } from '../generated/rust-turbo/Monet';
+export type { BlobLike } from './blob';
 
 export { fetch, prefetch } from './fetch';
 export type { MonetRequestInit } from './fetch';
+export { utf8Encode } from './utf8';
 export {
   addRequestHook,
   addRequestObserver,

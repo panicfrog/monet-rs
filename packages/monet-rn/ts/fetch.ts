@@ -3,12 +3,13 @@
 //
 //   fetch(url, init) → Promise<MonetResponse>
 //
-// init: { method, headers, body (string | ArrayBuffer |
-//         AsyncIterable<string | ArrayBuffer>), signal (AbortSignal),
-//         timeoutMs, followRedirects }. A streaming body rides a channel
-//         the producer feeds chunk by chunk (fetchStream + friends); a
-//         streamed body cannot be retried by a response hook — the fetch
-//         fails instead of silently re-sending an empty body.
+// init: { method, headers, body (string | ArrayBuffer | Blob |
+//         MonetFormData | AsyncIterable<string | ArrayBuffer>), signal
+//         (AbortSignal), timeoutMs, followRedirects }. A streaming body
+//         rides a channel the producer feeds chunk by chunk (fetchStream
+//         + friends); a streamed body cannot be retried by a response
+//         hook — the fetch fails instead of silently re-sending an empty
+//         body.
 
 import { getMonet } from '../generated/rust-turbo/Monet';
 import type { FetchOptions } from '../generated/rust-turbo/structs/FetchOptions';
@@ -18,6 +19,7 @@ import {
   MonetError,
   MonetResponse,
 } from './response';
+import {blobBodyStream, isBlob, BlobLike} from './blob';
 import {MonetFormData} from './formdata';
 import { utf8Encode } from './utf8';
 
@@ -31,8 +33,15 @@ export interface MonetRequestInit {
    *  (AsyncIterable of string | ArrayBuffer) — the streaming form feeds
    *  the wire chunk by chunk. A MonetFormData serializes to its
    *  multipart body and sets the content-type (an explicit content-type
-   *  header wins, as with browsers). */
-  body?: string | ArrayBuffer | MonetFormData | AsyncIterable<string | ArrayBuffer>;
+   *  header wins, as with browsers). A Blob rides the streaming route
+   *  (FileReader at pump time; the Blob's type sets the content-type
+   *  when none is explicit). */
+  body?:
+    | string
+    | ArrayBuffer
+    | BlobLike
+    | MonetFormData
+    | AsyncIterable<string | ArrayBuffer>;
   /** Client-side metadata riding the hook/observer events (the flow tag
    *  that strings a series of requests together; never on the wire). */
   metadata?: Record<string, string>;
@@ -102,13 +111,16 @@ export function fetch(
   let body: ArrayBuffer | null = null;
   let streamingForm: AsyncGenerator<string | ArrayBuffer> | null = null;
   let formdataContentType: string | null = null;
+  let blobStream: AsyncGenerator<ArrayBuffer> | null = null;
+  let blobType: string | null = null;
   if (typeof init.body === 'string') {
     body = utf8Encode(init.body);
   } else if (init.body instanceof MonetFormData) {
     // The FormData's content-type rides the headers when the caller did
-    // not set one explicitly. A form with file parts streams (the
-    // native reader yields the bytes; a large file never crosses into
-    // JS memory whole); a pure form serializes inline.
+    // not set one explicitly. A form with file/blob parts streams (the
+    // native reader or the FileReader yields the bytes; a large file
+    // never crosses into JS memory whole); a pure form serializes
+    // inline.
     formdataContentType = init.body.contentType();
     if (init.body.hasFileParts()) {
       streamingForm = init.body.stream();
@@ -121,6 +133,16 @@ export function fetch(
     if (!hasContentType && formdataContentType !== null) {
       headers.push({name: 'content-type', value: formdataContentType});
     }
+  } else if (isBlob(init.body)) {
+    // A Blob body rides the streaming route too: the FileReader read
+    // is async and fetch itself stays synchronous. The Blob's type
+    // rides the headers when the caller did not set one (the browser
+    // behavior).
+    blobStream = blobBodyStream(init.body);
+    blobType = init.body.type || null;
+    if (blobType && !headers.some(h => h.name.toLowerCase() === 'content-type')) {
+      headers.push({name: 'content-type', value: blobType});
+    }
   } else if (
     init.body != null &&
     typeof (init.body as ArrayBuffer).byteLength === 'number'
@@ -129,6 +151,7 @@ export function fetch(
   }
   const streamingBody: AsyncIterable<string | ArrayBuffer> | null =
     streamingForm ??
+    blobStream ??
     (init.body != null && body == null
       ? (init.body as AsyncIterable<string | ArrayBuffer>)
       : null);

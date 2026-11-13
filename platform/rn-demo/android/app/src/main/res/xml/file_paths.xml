@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- FileProvider's path map: the cache root under the name "fixtures"
+     — a file written to <cache>/monet-formdata-fixture.bin serves as
+     content://<applicationId>.fileprovider/fixtures/monet-formdata-fixture.bin. -->
+<paths>
+    <cache-path name="fixtures" path="." />
+</paths>

@@ -30,6 +30,8 @@ use crate::ws::WsQueue;
 use monet_core::HookRegistry;
 
 #[cfg(target_os = "android")]
+mod android_content;
+#[cfg(target_os = "android")]
 mod bootstrap;
 pub mod exchange;
 mod fetch;
@@ -772,15 +774,18 @@ impl Monet {
         Ok(path.to_string_lossy().into_owned())
     }
 
-    /// Reads up to `maxBytes` from `uri` at `offset` — a `file://` URL
-    /// or a bare filesystem path (the app sandbox and any
-    /// process-readable path; `Url::to_file_path` handles the scheme
-    /// and percent-decoding). Returns the bytes as a zero-copy
-    /// ArrayBuffer; `null` is EOF. FormData's file parts ride this
-    /// (v2/W5 patch): the TS layer streams a multipart body without
-    /// the file ever crossing into JS memory whole. Non-file schemes
-    /// fail with the recorded growth paths — `content://` needs the
-    /// Android ContentResolver (JNI), `ph://` the Photos framework.
+    /// Reads up to `maxBytes` from `uri` at `offset` — a `file://` URL,
+    /// a bare filesystem path (the app sandbox and any process-readable
+    /// path; `Url::to_file_path` handles the scheme and
+    /// percent-decoding), or on Android a `content://` URI (the
+    /// ContentResolver fd route — see [`android_content`]; SAF
+    /// documents, MediaStore, FileProvider all land here). Returns the
+    /// bytes as a zero-copy ArrayBuffer; `null` is EOF. FormData's file
+    /// parts ride this (v2/W5 patch): the TS layer streams a multipart
+    /// body without the file ever crossing into JS memory whole. The
+    /// schemes that still fail name their growth paths — `ph://` the
+    /// Photos framework, `blob:` RN's Blob store (the TS layer reads
+    /// Blobs through FileReader instead).
     pub fn read_file_chunk<'rt>(
         &self,
         rt: &mut RuntimeHandle<'rt>,
@@ -788,21 +793,23 @@ impl Monet {
         offset: f64,
         max_bytes: f64,
     ) -> anyhow::Result<Option<jsi::JsiArrayBuffer<'rt>>> {
-        use std::io::{Read, Seek, SeekFrom};
+        // The content arm first: a content:// URI has no filesystem
+        // path to resolve — it opens as an fd and reads with the same
+        // seek+read code below.
+        #[cfg(target_os = "android")]
+        let content_file = if uri.starts_with("content://") {
+            Some(std::fs::File::from(android_content::open_fd(&uri)?))
+        } else {
+            None
+        };
+        #[cfg(target_os = "android")]
+        if let Some(mut file) = content_file {
+            return read_chunk(&mut file, &uri, offset, max_bytes, rt);
+        }
         let path = file_path(&uri)?;
         let mut file = std::fs::File::open(&path)
             .map_err(|e| anyhow::anyhow!("monet-rn: open {}: {e}", path.display()))?;
-        file.seek(SeekFrom::Start(offset as u64))
-            .map_err(|e| anyhow::anyhow!("monet-rn: seek {}: {e}", path.display()))?;
-        let mut buffer = vec![0u8; max_bytes.max(0.0) as usize];
-        let read = file
-            .read(&mut buffer)
-            .map_err(|e| anyhow::anyhow!("monet-rn: read {}: {e}", path.display()))?;
-        if read == 0 {
-            return Ok(None); // EOF (or past it)
-        }
-        buffer.truncate(read);
-        Ok(Some(jsi::JsiArrayBuffer::from_vec(buffer, rt)))
+        read_chunk(&mut file, &path.display().to_string(), offset, max_bytes, rt)
     }
 
 
@@ -1334,6 +1341,30 @@ fn spawn_fetch_pump(
         .detach();
 }
 
+/// The shared seek+read tail of [`Monet::read_file_chunk`] — one chunk
+/// from an open file (a real path or a ContentResolver fd), zero-copy
+/// into a JS ArrayBuffer.
+fn read_chunk<'rt>(
+    file: &mut std::fs::File,
+    source: &str,
+    offset: f64,
+    max_bytes: f64,
+    rt: &mut RuntimeHandle<'rt>,
+) -> anyhow::Result<Option<jsi::JsiArrayBuffer<'rt>>> {
+    use std::io::{Read, Seek, SeekFrom};
+    file.seek(SeekFrom::Start(offset as u64))
+        .map_err(|e| anyhow::anyhow!("monet-rn: seek {source}: {e} (a streaming content provider serves a pipe — no seek)"))?;
+    let mut buffer = vec![0u8; max_bytes.max(0.0) as usize];
+    let read = file
+        .read(&mut buffer)
+        .map_err(|e| anyhow::anyhow!("monet-rn: read {source}: {e}"))?;
+    if read == 0 {
+        return Ok(None); // EOF (or past it)
+    }
+    buffer.truncate(read);
+    Ok(Some(jsi::JsiArrayBuffer::from_vec(buffer, rt)))
+}
+
 /// Resolves a `file://` URL or bare path to a filesystem path. Other
 /// schemes fail with the growth paths named (see [`Monet::read_file_chunk`]).
 fn file_path(uri: &str) -> anyhow::Result<std::path::PathBuf> {
@@ -1344,8 +1375,9 @@ fn file_path(uri: &str) -> anyhow::Result<std::path::PathBuf> {
                 .map_err(|_| anyhow::anyhow!("monet-rn: {uri} is not a file path"));
         }
         anyhow::bail!(
-            "monet-rn: {uri} is not a file:// URI — content:// needs the \
-             Android ContentResolver (growth path), ph:// the Photos framework"
+            "monet-rn: {uri} is not a file:// URI — ph:// needs the \
+             Photos framework (growth path), blob: RN's Blob store \
+             (the TS layer reads Blobs through FileReader instead)"
         );
     }
     // A bare path (no scheme) — the app sandbox shape.

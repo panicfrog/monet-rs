@@ -48,6 +48,7 @@ import {
   addExchangeRecorder,
   MonetHookRequest,
   MonetHookResponse,
+  utf8Encode,
 } from 'monet-rn';
 
 type CheckStatus = 'pending' | 'pass' | 'fail';
@@ -468,6 +469,87 @@ const CHECKS: Array<{
       );
     },
   },
+  // Android only — the content:// arm of the native reader has no iOS
+  // counterpart (the platform hands apps file:// paths).
+  ...(Platform.OS === 'android'
+    ? [
+        {
+          name: 'http:formdata_content_uri',
+          timeoutMs: 15_000,
+          run: async (base: string) => {
+            // v2 patch: a content:// URI rides the ContentResolver fd
+            // route (openFileDescriptor → detachFd → seek+read on the
+            // raw fd) — the shape every Android picker hands the app.
+            // The fixture source is the app's own FileProvider serving
+            // its cache dir, so the check needs no external picker.
+            const monet = getMonet();
+            const pattern = new Uint8Array(4096);
+            for (let i = 0; i < pattern.length; i++) {
+              pattern[i] = i % 251;
+            }
+            const fixture = monet.writeCacheFile(
+              'monet-formdata-content-fixture.bin',
+              pattern.buffer,
+            );
+            // The deterministic FileProvider mapping (manifest +
+            // res/xml/file_paths.xml): <cache>/name →
+            // content://<app>.fileprovider/fixtures/name.
+            const contentUri = `content://com.monet.rndemo.fileprovider/fixtures/monet-formdata-content-fixture.bin`;
+            // The reader returns the same bytes through the provider.
+            let offset = 0;
+            let matched = true;
+            for (;;) {
+              const chunk = monet.readFileChunk(contentUri, offset, 262144);
+              if (chunk == null) {
+                break;
+              }
+              const view = new Uint8Array(chunk);
+              for (let i = 0; i < view.length; i++) {
+                if (view[i] !== pattern[offset + i]) {
+                  matched = false;
+                }
+              }
+              offset += view.length;
+            }
+            assert(
+              offset === pattern.length && matched,
+              `the content read returned ${offset} bytes${matched ? '' : ' (content mismatch)'}, expected ${pattern.length} matching`,
+            );
+            // The streamed upload through the content URI matches the
+            // buffered equivalent's byte count exactly.
+            const sizeOf = async (form: MonetFormData): Promise<number> =>
+              Number(await (await fetch(`${base}/body-size`, {
+                method: 'POST',
+                body: form,
+              })).text());
+            const streamed = new MonetFormData();
+            streamed.append('field', 'present');
+            streamed.append('file', {uri: contentUri, name: 'fixture.bin', type: 'application/octet-stream'});
+            const streamedSize = await sizeOf(streamed);
+            const buffered = new MonetFormData();
+            buffered.append('field', 'present');
+            buffered.append(
+              'file',
+              pattern.buffer,
+              {filename: 'fixture.bin', contentType: 'application/octet-stream'},
+            );
+            const bufferedSize = await sizeOf(buffered);
+            assert(
+              streamedSize === bufferedSize,
+              `content-streamed ${streamedSize} bytes, buffered equivalent ${bufferedSize}`,
+            );
+            // The framing arrived through the provider.
+            const reflection = JSON.parse(
+              await (await fetch(`${base}/echo`, {method: 'POST', body: streamed})).text(),
+            ) as {headers: string[]; body: string};
+            assert(
+              reflection.body.includes('filename="fixture.bin"'),
+              'the content part headers missing from the reflected body',
+            );
+          },
+        },
+      ]
+    : []),
   {
     name: 'http:retry_policy_succeeds',
     run: async base => {
@@ -482,6 +564,82 @@ const CHECKS: Array<{
       } finally {
         clearRetry();
       }
+    },
+  },
+  {
+    name: 'http:formdata_blob_part',
+    timeoutMs: 15_000,
+    run: async base => {
+      // v2 patch: a Blob part rides the streaming form — the bytes read
+      // through FileReader at stream time (RN's Blob has no synchronous
+      // read path), the filename defaulting to "blob" and the
+      // content-type to the Blob's own type, the browser conventions.
+      // RN 0.88's Blob constructor only accepts Blob|string parts, so
+      // the fixture content is a string.
+      const CONTENT = 'blob-part-content';
+      const blob = new Blob([CONTENT], {type: 'text/plain'});
+      // A direct Blob body: one streaming chunk, the Blob's type riding
+      // the headers (ASCII-only content — length is the utf-8 size).
+      const directSize = Number(await (await fetch(`${base}/body-size`, {
+        method: 'POST',
+        body: blob,
+      })).text());
+      assert(
+        directSize === CONTENT.length,
+        `a direct blob body sent ${directSize} bytes, expected ${CONTENT.length}`,
+      );
+      const directReflection = JSON.parse(
+        await (await fetch(`${base}/echo`, {method: 'POST', body: blob})).text(),
+      ) as {headers: string[]; body: string};
+      assert(
+        directReflection.headers.some(h => h === 'content-type:text/plain'),
+        `the blob's type did not ride the headers (${directReflection.headers.join(', ')})`,
+      );
+      assert(
+        directReflection.body === CONTENT,
+        `the direct blob body reflected as ${JSON.stringify(directReflection.body)}`,
+      );
+      // A Blob part in a form: same bytes as the bytes-part equivalent.
+      const sizeOf = async (form: MonetFormData): Promise<number> =>
+        Number(await (await fetch(`${base}/body-size`, {
+          method: 'POST',
+          body: form,
+        })).text());
+      const withBlob = new MonetFormData();
+      withBlob.append('field', 'present');
+      withBlob.append(
+        'blob',
+        blob,
+        {filename: 'note.txt', contentType: 'text/plain'},
+      );
+      const blobSize = await sizeOf(withBlob);
+      const withBytes = new MonetFormData();
+      withBytes.append('field', 'present');
+      withBytes.append(
+        'blob',
+        utf8Encode(CONTENT),
+        {filename: 'note.txt', contentType: 'text/plain'},
+      );
+      const bytesSize = await sizeOf(withBytes);
+      assert(
+        blobSize === bytesSize,
+        `a blob part sent ${blobSize} bytes, the bytes equivalent ${bytesSize}`,
+      );
+      // The unnamed-blob default: filename "blob" when no meta carries
+      // one, the part content-type from the Blob's own type.
+      const unnamed = new MonetFormData();
+      unnamed.append('blob', blob);
+      const reflection = JSON.parse(
+        await (await fetch(`${base}/echo`, {method: 'POST', body: unnamed})).text(),
+      ) as {headers: string[]; body: string};
+      assert(
+        reflection.body.includes('filename="blob"'),
+        'the default blob filename missing from the reflected body',
+      );
+      assert(
+        reflection.body.includes('text/plain'),
+        'the blob\'s own type missing from the part headers',
+      );
     },
   },
   {
