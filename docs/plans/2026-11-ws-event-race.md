@@ -29,10 +29,30 @@ handler 丢弃 socket 的，释放契约保持不变。
 - 工作树 App.tsx 里 `http:retry_policy_succeeds` 被 blob 检查**覆盖掉了**
   （编辑事故）——这就是接手时 iOS 只有 33 项且复现不出来的原因。已恢复到
   原位置（blob 检查之前），恢复后 34 项确定性复现 2/2，修复后 4/4 绿。
-- **另一个未解问题（与本病无关）**：Android 7 轮里有 3 轮各有一个
-  **流式上传**检查超时——`formdata_blob_part`、`formdata_content_uri`、
-  `streaming_upload`（W2 起的老检查）各一次，全部走 `fetchStream` 路径，
-  无 ws 参与，iOS 未见。是否为预先存在（HEAD 上也有）尚未确认。
+- **另一个问题（与本病无关，同日已解）**：Android 上**流式上传**检查偶发
+  超时（约 1/7~1/10 轮；`formdata_blob_part`、`formdata_content_uri`、
+  `streaming_upload` 都中过），iOS 未见。
+  - **根因**：`MonetStreamedProvider.onDataAvailable`（v2/W2d）先清空
+    挂起的 read 再 drain，drain 取空时**不放回**——读被丢。陈旧 notify 是
+    常态：feeder 每 push 一次就 notify 一次，期间 Cronet 的直接 read() 可能
+    已取走那块数据。陈旧 notify 撞上刚停泊的 read → 取空 → read 丢失 →
+    之后的 notify 全部找不到停泊者 → Cronet 永远等 → 服务器
+    `body.collect()` 收不到结尾 → 无 head。
+  - **证据**（httpengine 临时打点）：`take Wrote(4096)` → `take Empty`
+    （停泊）→ `take Empty`（陈旧 notify）→ feeder 的 `chunk(2)`、
+    `chunk(31)`、`end` 三次 notify 之后再无 take。
+  - **修复**：取空则把 read 放回停泊位（清空仍在 drain 之前——成功的 drain
+    会调 sink，sink 可能同线程重入 read() 并停泊新读）。
+    `platform/android-demo` 的 Kotlin 同款 provider 同样修复，另补了缺失的
+    `@Synchronized`（原来完全无锁，还有一条更直接的丢唤醒）。
+  - **确定性验证**：临时让 feeder 每次 push 后 5ms 再补一个陈旧 notify →
+    旧 Java 4 项流式检查 **3/3 全超时**；新 Java 3/3 全绿（每轮 26–42 次
+    重新停泊）。去掉打点后的干净构建 Android 35·0 ×6。
+  - 打点手段（Android 上开 valve log）：`adb root` 后
+    `adb shell setprop wrap.com.monet.rndemo '"HOME=/data/user/0/com.monet.rndemo MONET_VALVE_LOG=1"'`
+    （root 会重启 adbd、清空 `adb reverse`，要重设 8081/8964-8967）；
+    日志在 `/data/user/0/com.monet.rndemo/monet-valve.log`；用完把 wrap
+    清空。
 
 以下为原调查记录（§6 的假设 1/3 均不成立，留作历史）。
 

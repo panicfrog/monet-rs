@@ -38,14 +38,24 @@ public final class MonetStreamedProvider extends UploadDataProvider {
   }
 
   // Wakes a parked read — called over JNI from the Rust feeder thread
-  // after a chunk (or a terminal) lands in the queue.
+  // after a chunk (or a terminal) lands in the queue. A notify can be
+  // stale: the feeder fires one per push, and reads issued in between
+  // may already have taken that chunk. An empty take re-parks the read —
+  // dropping it would leave Cronet's read outstanding with nobody left
+  // to complete it (every later notify finds nothing parked), hanging
+  // the upload. The slot is cleared BEFORE the drain: a completing drain
+  // calls into the sink, which may issue the next read() re-entrantly
+  // (same thread, reentrant monitor) and park it here.
   public synchronized void onDataAvailable() {
     UploadDataSink sink = pendingSink;
     ByteBuffer buffer = pendingBuffer;
     if (sink != null && buffer != null) {
       pendingSink = null;
       pendingBuffer = null;
-      drain(sink, buffer);
+      if (!drain(sink, buffer)) {
+        pendingSink = sink;
+        pendingBuffer = buffer;
+      }
     }
   }
 

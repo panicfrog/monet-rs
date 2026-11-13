@@ -110,6 +110,7 @@ class MonetStreamedProvider(private val id: Long) : UploadDataProvider() {
 
     override fun getLength(): Long = -1L
 
+    @Synchronized
     override fun read(sink: UploadDataSink, buffer: ByteBuffer) {
         if (!drain(sink, buffer)) {
             // Nothing yet: hold the read; the feeder's notify
@@ -120,13 +121,26 @@ class MonetStreamedProvider(private val id: Long) : UploadDataProvider() {
         }
     }
 
-    /** Wakes a parked read — called over JNI from the Rust feeder thread. */
+    /**
+     * Wakes a parked read — called over JNI from the Rust feeder thread.
+     * A notify can be stale: the feeder fires one per push, and reads
+     * issued in between may already have taken that chunk. An empty take
+     * re-parks the read — dropping it would leave Cronet's read
+     * outstanding with nobody left to complete it, hanging the upload.
+     * The slot is cleared BEFORE the drain: a completing drain calls into
+     * the sink, which may issue the next read() re-entrantly (same
+     * thread, reentrant monitor) and park it here.
+     */
+    @Synchronized
     fun onDataAvailable() {
         val sink = pendingSink ?: return
         val buffer = pendingBuffer ?: return
         pendingSink = null
         pendingBuffer = null
-        drain(sink, buffer)
+        if (!drain(sink, buffer)) {
+            pendingSink = sink
+            pendingBuffer = buffer
+        }
     }
 
     // One take attempt; returns true when the read completed. Callers
@@ -154,11 +168,13 @@ class MonetStreamedProvider(private val id: Long) : UploadDataProvider() {
         }
     }
 
+    @Synchronized
     override fun rewind(sink: UploadDataSink) {
         // A stream cannot replay; onRewindError is the documented answer.
         sink.onRewindError(java.io.IOException("a streamed upload cannot be rewound"))
     }
 
+    @Synchronized
     override fun close() {
         if (!closed) {
             closed = true
