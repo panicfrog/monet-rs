@@ -53,6 +53,19 @@ pub extern "system" fn Java_com_monet_rn_httpengine_MonetBootstrap_nativeInit(
             {
                 let vm = env.get_java_vm()?;
                 let context = env.new_global_ref(httpengine_context)?;
+                // The app's cache directory, read here where env +
+                // Context live (HttpEngine's init consumes the global;
+                // this rides the same scope) and stashed for
+                // write_cache_file — the check-fixture writer.
+                let cache = env
+                    .call_method(&context, jni::jni_str!("getCacheDir"), jni::jni_sig!("()Ljava/io/File;"), &[])?
+                    .l()?;
+                let absolute = env
+                    .call_method(&cache, jni::jni_str!("getAbsolutePath"), jni::jni_sig!("()Ljava/lang/String;"), &[])?
+                    .l()?;
+                let dir = (*env.as_cast::<jni::objects::JString>(&absolute)?).to_string();
+                log::info!("monet-rn: cache dir = {dir}");
+                crate::platform::set_cache_dir(dir);
                 captured = Some((vm, context));
             }
             Ok(())

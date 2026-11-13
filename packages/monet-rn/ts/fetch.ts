@@ -100,18 +100,26 @@ export function fetch(
   const url = typeof input === 'string' ? input : input.url;
   const headers = normalizeHeaders(init);
   let body: ArrayBuffer | null = null;
+  let streamingForm: AsyncGenerator<string | ArrayBuffer> | null = null;
+  let formdataContentType: string | null = null;
   if (typeof init.body === 'string') {
     body = utf8Encode(init.body);
   } else if (init.body instanceof MonetFormData) {
-    // The FormData serializes to its multipart body; its content-type
-    // rides the headers when the caller did not set one explicitly.
-    const assembled = init.body.serialize();
-    body = assembled.body;
+    // The FormData's content-type rides the headers when the caller did
+    // not set one explicitly. A form with file parts streams (the
+    // native reader yields the bytes; a large file never crosses into
+    // JS memory whole); a pure form serializes inline.
+    formdataContentType = init.body.contentType();
+    if (init.body.hasFileParts()) {
+      streamingForm = init.body.stream();
+    } else {
+      body = init.body.serialize().body;
+    }
     const hasContentType = headers.some(
       header => header.name.toLowerCase() === 'content-type',
     );
-    if (!hasContentType) {
-      headers.push({name: 'content-type', value: assembled.contentType});
+    if (!hasContentType && formdataContentType !== null) {
+      headers.push({name: 'content-type', value: formdataContentType});
     }
   } else if (
     init.body != null &&
@@ -120,9 +128,10 @@ export function fetch(
     body = init.body as ArrayBuffer;
   }
   const streamingBody: AsyncIterable<string | ArrayBuffer> | null =
-    init.body != null && body == null
+    streamingForm ??
+    (init.body != null && body == null
       ? (init.body as AsyncIterable<string | ArrayBuffer>)
-      : null;
+      : null);
   const options: FetchOptions = {
     url,
     method: init.method ?? 'GET',

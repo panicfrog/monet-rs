@@ -380,6 +380,16 @@ async fn respond_route(
             StatusCode::INTERNAL_SERVER_ERROR,
             boxed(Full::new(Bytes::from_static(b"always broken"))),
         ),
+        // The binary-safe size observable (v2/W5): the request body's
+        // exact byte count — the FormData file-part check compares the
+        // streamed upload against the buffered equivalent without the
+        // /echo reflection's lossy UTF-8.
+        "/body-size" => ok(
+            StatusCode::OK,
+            boxed(Full::new(Bytes::from(
+                request_body.len().to_string(),
+            ))),
+        ),
         // The TLS battery server's leaf SPKI (base64) — 404 when no TLS
         // variant is running, i.e. from every in-process battery server.
         "/leaf-spki" => match TLS_LEAF_SPKI.get() {

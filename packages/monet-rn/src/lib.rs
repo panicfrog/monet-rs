@@ -750,6 +750,61 @@ impl Monet {
         Ok(())
     }
 
+    /// Writes `bytes` to `<cache dir>/<name>` and returns the path —
+    /// the check-fixture writer (v2/W5): the battery creates a
+    /// known-content file in the app's own sandbox, then uploads it as
+    /// a FormData file part, proving the {uri} streaming path with no
+    /// dependence on platform system files being app-readable.
+    pub fn write_cache_file<'rt>(
+        &self,
+        rt: &mut RuntimeHandle<'rt>,
+        name: String,
+        bytes: jsi::JsiArrayBuffer<'rt>,
+    ) -> anyhow::Result<String> {
+        let dir = platform::cache_dir();
+        anyhow::ensure!(
+            !dir.as_os_str().is_empty(),
+            "monet-rn: the cache directory is unknown on this platform"
+        );
+        let path = dir.join(&name);
+        std::fs::write(&path, bytes.data(rt))
+            .map_err(|e| anyhow::anyhow!("monet-rn: write {}: {e}", path.display()))?;
+        Ok(path.to_string_lossy().into_owned())
+    }
+
+    /// Reads up to `maxBytes` from `uri` at `offset` — a `file://` URL
+    /// or a bare filesystem path (the app sandbox and any
+    /// process-readable path; `Url::to_file_path` handles the scheme
+    /// and percent-decoding). Returns the bytes as a zero-copy
+    /// ArrayBuffer; `null` is EOF. FormData's file parts ride this
+    /// (v2/W5 patch): the TS layer streams a multipart body without
+    /// the file ever crossing into JS memory whole. Non-file schemes
+    /// fail with the recorded growth paths — `content://` needs the
+    /// Android ContentResolver (JNI), `ph://` the Photos framework.
+    pub fn read_file_chunk<'rt>(
+        &self,
+        rt: &mut RuntimeHandle<'rt>,
+        uri: String,
+        offset: f64,
+        max_bytes: f64,
+    ) -> anyhow::Result<Option<jsi::JsiArrayBuffer<'rt>>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let path = file_path(&uri)?;
+        let mut file = std::fs::File::open(&path)
+            .map_err(|e| anyhow::anyhow!("monet-rn: open {}: {e}", path.display()))?;
+        file.seek(SeekFrom::Start(offset as u64))
+            .map_err(|e| anyhow::anyhow!("monet-rn: seek {}: {e}", path.display()))?;
+        let mut buffer = vec![0u8; max_bytes.max(0.0) as usize];
+        let read = file
+            .read(&mut buffer)
+            .map_err(|e| anyhow::anyhow!("monet-rn: read {}: {e}", path.display()))?;
+        if read == 0 {
+            return Ok(None); // EOF (or past it)
+        }
+        buffer.truncate(read);
+        Ok(Some(jsi::JsiArrayBuffer::from_vec(buffer, rt)))
+    }
+
 
     /// Takes one queued chunk (zero-copy into a JS ArrayBuffer).
     /// `None` means the queue is empty — check `body_done` to tell "no
@@ -992,7 +1047,7 @@ fn spawn_fetch_pump(
                 &options.headers,
             );
             let response = loop {
-                let mut request = match &mut body {
+                let request = match &mut body {
                     PumpBody::Buffered(bytes) => build_request(&options, bytes),
                     // The stream was consumed by the first attempt; a
                     // hook-driven retry cannot replay it.
@@ -1277,6 +1332,24 @@ fn spawn_fetch_pump(
             }
         })
         .detach();
+}
+
+/// Resolves a `file://` URL or bare path to a filesystem path. Other
+/// schemes fail with the growth paths named (see [`Monet::read_file_chunk`]).
+fn file_path(uri: &str) -> anyhow::Result<std::path::PathBuf> {
+    if let Ok(parsed) = uri.parse::<monet_core::Url>() {
+        if parsed.scheme() == "file" {
+            return parsed
+                .to_file_path()
+                .map_err(|_| anyhow::anyhow!("monet-rn: {uri} is not a file path"));
+        }
+        anyhow::bail!(
+            "monet-rn: {uri} is not a file:// URI — content:// needs the \
+             Android ContentResolver (growth path), ph:// the Photos framework"
+        );
+    }
+    // A bare path (no scheme) — the app sandbox shape.
+    Ok(std::path::PathBuf::from(uri))
 }
 
 /// The built-in retry policy (v2/W5) — see [`Monet::configure_retry`].

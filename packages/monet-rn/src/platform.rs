@@ -98,7 +98,14 @@ fn select_http(trust: &TrustConfig) -> Result<Arc<dyn Transport>, String> {
             .map(Arc::new)
             .map_err(|e| e.to_string());
     }
-    #[cfg(target_os = "android")]
+    // Only reachable when neither stack feature compiled in — with
+    // either one the block above is the tail, and an ungated block here
+    // would be dead code behind its `return` (the compiler says so).
+    #[cfg(all(
+        target_os = "android",
+        not(feature = "httpengine"),
+        not(feature = "fallback-rustls")
+    ))]
     {
         Err("monet-rn: no Android HTTP stack compiled in (enable `httpengine` or `fallback-rustls`)".into())
     }
@@ -187,6 +194,30 @@ impl Transport for BrokenTransport {
         })
     }
 }
+
+/// The app's cache directory (write_cache_file's landing zone).
+/// Android: stashed by the bootstrap from Context.getCacheDir(). Apple:
+/// $HOME/Library/Caches (the simulator and device both guarantee it).
+pub(crate) fn set_cache_dir(dir: String) {
+    // Once-only by construction (the bootstrap runs once); a second set
+    // is a no-op, not an error worth surfacing.
+    let _ = CACHE_DIR.set(dir);
+}
+
+/// The app's cache directory; empty when unknown (Apple pre-HOME, or an
+/// embedder that never stashed it).
+pub(crate) fn cache_dir() -> std::path::PathBuf {
+    if let Some(dir) = CACHE_DIR.get() {
+        return std::path::PathBuf::from(dir);
+    }
+    #[cfg(any(target_os = "ios", target_os = "macos"))]
+    if let Ok(home) = std::env::var("HOME") {
+        return std::path::Path::new(&home).join("Library/Caches");
+    }
+    std::path::PathBuf::new()
+}
+
+static CACHE_DIR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// The stack description the demo prints (a misconfigured build is
 /// visible at a glance instead of buried in link errors).

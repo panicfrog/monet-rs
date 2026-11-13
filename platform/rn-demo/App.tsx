@@ -389,6 +389,86 @@ const CHECKS: Array<{
     },
   },
   {
+    name: 'http:formdata_file_part',
+    timeoutMs: 15_000,
+    run: async base => {
+      // v2/W5 patch: a {uri} file part streams from the filesystem —
+      // the native reader (std::fs) yields the bytes, the multipart
+      // framing rides strings, and a large file never crosses into JS
+      // memory whole. The fixture lives in the app's own sandbox
+      // (written by the native cache-dir writer), so the check depends
+      // on no platform system file being app-readable; the size math
+      // compares the streamed upload against the buffered equivalent
+      // byte-for-byte.
+      const monet = getMonet();
+      // The fixture: known content written into the app's own sandbox
+      // (the native cache-dir writer), so the check depends on no
+      // platform system file being app-readable. 4KB — one streamed
+      // chunk's worth of content with a recognizable pattern.
+      const pattern = new Uint8Array(4096);
+      for (let i = 0; i < pattern.length; i++) {
+        pattern[i] = i % 251;
+      }
+      const fixture = monet.writeCacheFile('monet-formdata-fixture.bin', pattern.buffer);
+      const bytes = pattern.byteLength;
+      // The native reader returns exactly the bytes written.
+      let readBack = 0;
+      for (let offset = 0; ; offset += 262144) {
+        const chunk = monet.readFileChunk(fixture, offset, 262144);
+        if (chunk == null) {
+          break;
+        }
+        readBack += chunk.byteLength;
+      }
+      assert(
+        readBack === bytes,
+        `the native reader returned ${readBack} bytes, expected ${bytes}`,
+      );
+      // The streamed file upload matches the buffered equivalent's
+      // byte count exactly (identical framing, same length content).
+      const sizeOf = async (form: MonetFormData): Promise<number> =>
+        Number(await (await fetch(`${base}/body-size`, {
+          method: 'POST',
+          body: form,
+        })).text());
+      const streamed = new MonetFormData();
+      streamed.append('field', 'present');
+      streamed.append('file', {uri: fixture, name: 'fixture.bin', type: 'application/octet-stream'});
+      const streamedSize = await sizeOf(streamed);
+      const buffered = new MonetFormData();
+      buffered.append('field', 'present');
+      buffered.append(
+        'file',
+        new ArrayBuffer(bytes),
+        {filename: 'fixture.bin', contentType: 'application/octet-stream'},
+      );
+      const bufferedSize = await sizeOf(buffered);
+      assert(
+        streamedSize === bufferedSize,
+        `streamed ${streamedSize} bytes, buffered equivalent ${bufferedSize}`,
+      );
+      assert(
+        streamedSize > bytes,
+        `body ${streamedSize} has no framing around the ${bytes} content bytes`,
+      );
+      // The framing arrived: the /echo reflection carries the ASCII
+      // part headers through the (lossy) text round-trip.
+      const echoed = new MonetFormData();
+      echoed.append('file', {uri: fixture, name: 'fixture.bin', type: 'application/octet-stream'});
+      const reflection = JSON.parse(
+        await (await fetch(`${base}/echo`, {method: 'POST', body: echoed})).text(),
+      ) as {headers: string[]; body: string};
+      assert(
+        reflection.body.includes('filename="fixture.bin"'),
+        'the file part headers missing from the reflected body',
+      );
+      assert(
+        reflection.body.includes('application/octet-stream'),
+        'the file part content-type missing',
+      );
+    },
+  },
+  {
     name: 'http:retry_policy_succeeds',
     run: async base => {
       // v2/W5: the built-in policy retries a 5xx — /flaky fails the
