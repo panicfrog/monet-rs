@@ -891,22 +891,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "monet-cronet"
-version = "0.1.0"
-dependencies = [
- "base64",
- "bytes",
- "futures-channel",
- "futures-lite",
- "monet-core",
- "monet-cronet-sys",
-]
-
-[[package]]
-name = "monet-cronet-sys"
-version = "0.1.0"
-
-[[package]]
 name = "monet-demo"
 version = "0.1.0"
 dependencies = [

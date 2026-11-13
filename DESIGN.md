@@ -84,7 +84,7 @@ trait ResponseHook { async fn on_response(&self, res: &mut Response) -> Result<(
 |---|---|---|
 | Android（v1 主力） | **monet-rustls**：hyper + h2 + rustls | 静态编入 App 已有的 Rust staticlib（~+2-3MB，**小于** libcronet.so 的 4-7MB/ABI）；TLS/pin 复用 monet-ws 的 verifier（platform-verifier / webpki-roots / pin walk-up）；DNS 走系统 resolver；H3（quinn + h3）挂实验性 feature——h3 还在 0.0.x（2025-05 后未发版），H2 路线成熟先行 |
 | Android（可选增强） | monet-cronet-jni | GMS 轨道（见双轨决策），将来按需 |
-| Android（遗留选项） | monet-cronet | 已建成已测试；想钉 143 embedded `.so` 的 App 仍可用，非默认 |
+| ~~Android（遗留选项）~~ | ~~monet-cronet~~ | **已删除（2026-11-13）**：被 monet-httpengine（平台 HttpEngine，API 34+）+ monet-rustls（<34）完全取代；代码在 git 历史里 |
 | iOS | URLSession（Swift shim + cxx） | 原生栈健在，维持 |
 
 诚实的缺口记录（Cronet 白送、Rust 要自建的）：Happy Eyeballs / DNS 竞速启发式（v1 不做）；h3 语义层不成熟。已核实无碍的：quinn 客户端连接迁移**功能上支持**（主动迁移与 NAT 重绑定可用，quinn-rs issue #1803/#2778 已关闭；仍开着的 #2184/#716 是隐私加固与服务端迁移，不影响客户端）。
@@ -111,7 +111,7 @@ core 约束不变：面向 trait 编程，`Transport` 接口不为 hyper 便利�
 | 轨道 | 状态 | 适用 |
 |---|---|---|
 | **monet-rustls（默认）**：hyper + h2 + rustls | ✅ 已实现（redirect 跟随 + head 超时已对齐 iOS 语义；`cargo ndk --target arm64-v8a build` 交叉编译已验证，NDK 27） | 全设备；版本随 cargo 更新，无天花板，体积最优 |
-| monet-cronet：C API 直连 + embedded `.so` | ✅ 已实现 | 想钉 143 embedded 的 App；遗留选项 |
+| ~~monet-cronet：C API 直连 + embedded `.so`~~ | **已删除（2026-11-13）** | 曾已实现；由 monet-httpengine 取代，代码在 git 历史里 |
 | monet-cronet-jni：Java API + provider 模型 | 未开工 | GMS 设备增强（play-services-cronet） |
 
 决策依据的核实事实（2026-11）：
