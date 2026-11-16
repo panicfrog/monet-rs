@@ -14,6 +14,8 @@
 #![cfg_attr(target_os = "android", allow(unsafe_code))] // JNI boundary.
 
 #[cfg(any(target_os = "android", test))]
+mod read_slots;
+#[cfg(any(target_os = "android", test))]
 mod registry;
 #[cfg(any(target_os = "android", test))]
 mod upload;

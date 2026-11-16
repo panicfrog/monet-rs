@@ -8,9 +8,7 @@
 //! attach-scope closure returns `Result<_, jni::errors::Error>` and is
 //! mapped to a transport error at the boundary.
 
-use std::collections::HashMap;
-use std::pin::Pin;
-use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use futures_channel::oneshot;
 use jni::JavaVM;
@@ -22,6 +20,7 @@ use monet_core::request::Request;
 use monet_core::response::Response;
 use monet_core::transport::BoxFuture;
 
+use crate::read_slots::ReadSlots;
 use crate::registry;
 
 /// The host app's bridge classes (the Kotlin side stays mechanical; see
@@ -72,17 +71,9 @@ fn jni_err(context: &str) -> impl Fn(jni::errors::Error) -> Error + '_ {
     move |error| Error::transport(format!("httpengine: {context}: {error}"))
 }
 
-/// The per-request direct ByteBuffer: the backing memory must outlive the
-/// read and never move, so it is pinned and lives in the slot map until
-/// the matching onReadCompleted (or a terminal event) replaces/drops it.
-struct ReadBuffer {
-    // The pinned backing of the direct ByteBuffer handed to Cronet;
-    // alive exactly until the matching onReadCompleted replaces it.
-    _backing: Pin<Box<[u8]>>,
-}
-
-static READ_BUFFERS: LazyLock<Mutex<HashMap<u64, ReadBuffer>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// The backings of the direct ByteBuffers handed to `UrlRequest.read`
+/// (see [`ReadSlots`]).
+static READ_SLOTS: LazyLock<ReadSlots> = LazyLock::new(ReadSlots::new);
 
 /// Bootstrap: stores the JVM, the app Context, and the app class loader
 /// (bridge classes live in the app; platform classes are in the boot
@@ -729,41 +720,36 @@ fn provider_notify(
     })
 }
 
-/// Issues the next body read: a fresh direct ByteBuffer whose backing
-/// lives in the slot map until the matching onReadCompleted replaces it.
+/// Issues the next body read into a fresh direct ByteBuffer whose backing
+/// sits in the request's slot until the next read replaces it or the
+/// terminal event releases it.
 pub(crate) fn issue_read(id: u64, request: &Global<JObject<'static>>) {
     let Some(globals) = GLOBALS.get() else {
         return;
     };
-    let result = globals.vm.scope(|env| -> JniResult<()> {
-        let backing: Pin<Box<[u8]>> = Pin::from(vec![0u8; READ_CHUNK].into_boxed_slice());
-        // SAFETY: the backing is pinned for the buffer's lifetime and is
-        // placed in the slot map below before `read` can complete.
-        // SAFETY: the backing is pinned for the buffer's lifetime and is
-        // placed in the slot map below before `read` can complete.
-        let buffer =
-            unsafe { env.new_direct_byte_buffer(backing.as_ptr().cast_mut(), backing.len())? };
-        env.call_method(
-            &**request,
-            jni::jni_str!("read"),
-            jni::jni_sig!("(Ljava/nio/ByteBuffer;)V"),
-            &[(&*buffer).into()],
-        )?;
-        READ_BUFFERS
-            .lock()
-            .unwrap()
-            .insert(id, ReadBuffer { _backing: backing });
-        Ok(())
+    let result = READ_SLOTS.issue(id, READ_CHUNK, |ptr, len| {
+        globals.vm.scope(|env| -> JniResult<()> {
+            // SAFETY: the backing is pinned and already in the slot, where
+            // it stays until the next read or the terminal event.
+            let buffer = unsafe { env.new_direct_byte_buffer(ptr, len)? };
+            env.call_method(
+                &**request,
+                jni::jni_str!("read"),
+                jni::jni_sig!("(Ljava/nio/ByteBuffer;)V"),
+                &[(&*buffer).into()],
+            )?;
+            Ok(())
+        })
     });
     if result.is_err() {
         registry::on_error(id, "issuing read failed");
     }
 }
 
-/// Drops a request's read buffer slot (terminal events, or between
-/// reads — the buffer global must die after Cronet is done with it).
-pub(crate) fn drop_read_buffer(id: u64) {
-    READ_BUFFERS.lock().unwrap().remove(&id);
+/// Releases a request's read buffer at its terminal event. Never between
+/// reads: a read resumed by the body watcher may already own the slot.
+pub(crate) fn release_read_buffer(id: u64) {
+    READ_SLOTS.release(id);
 }
 
 /// Copies the raw `JavaVM` pointer into a fresh `JavaVM` handle (the

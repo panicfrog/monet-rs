@@ -15,7 +15,7 @@ use jni::EnvUnowned;
 use jni::objects::{Global, JClass, JObject, JString};
 use jni::sys::jlong;
 
-use crate::jni::{drop_read_buffer, issue_read};
+use crate::jni::{issue_read, release_read_buffer};
 use crate::registry;
 
 type RequestMap = Mutex<HashMap<u64, Global<JObject<'static>>>>;
@@ -153,9 +153,9 @@ pub extern "system" fn native_on_read_completed(
             // body watcher to drain the consumer's backlog.
             let gate = registry::on_chunk(id as u64, data);
 
-            // The slot's buffer is consumed; the next read wraps a fresh
-            // one (issue_read replaces the slot).
-            drop_read_buffer(id as u64);
+            // The buffer stays in its slot: the next read replaces it —
+            // possibly the watcher's resume, which can start as soon as
+            // on_chunk has signalled a stall — or the terminal releases it.
             match gate {
                 registry::ReadGate::Continue => {
                     let guard = requests().lock().unwrap();
@@ -302,10 +302,10 @@ pub extern "system" fn native_close_upload(_env: EnvUnowned<'_>, _class: JClass<
     crate::upload::close(id as u64);
 }
 
-/// Terminal cleanup: drop the read buffer slot and this map's request
+/// Terminal cleanup: release the read buffer and this map's request
 /// handle (the cancel closure owns a separate one).
 fn terminal(id: jlong) {
-    drop_read_buffer(id as u64);
+    release_read_buffer(id as u64);
     requests().lock().unwrap().remove(&(id as u64));
 }
 
