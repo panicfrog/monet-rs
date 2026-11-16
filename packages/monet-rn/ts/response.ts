@@ -191,8 +191,9 @@ async function* bodyIterator(
   } finally {
     // Drained, thrown, or abandoned early — either way the transfer is
     // over for this consumer. abort() stops a still-running pump (a
-    // no-op once terminated); cleanupFetch releases the native state.
-    // Both are safe in any state, exactly once is enough.
+    // no-op once terminated); cleanupFetch releases the native state
+    // early when the transfer is still running (fetch() releases it at
+    // termination otherwise). Both are idempotent.
     monet.abort(fetchId);
     monet.cleanupFetch(fetchId);
   }

@@ -188,6 +188,16 @@ export function fetch(
       streamingBody != null
         ? monet.fetchStream(options, head, chunk, done, error)
         : monet.fetch(options, body, head, chunk, done, error);
+    // Pulls everything the pump queued into the JS-side channel.
+    const drain = (): void => {
+      for (;;) {
+        const chunk = monet.takeChunk(fetchId);
+        if (chunk == null) {
+          break;
+        }
+        channel.push(new Uint8Array(chunk));
+      }
+    };
     const fetchId = wireCallbacks(
       (head: HeadEvent) => {
         headResolved = true;
@@ -195,19 +205,15 @@ export function fetch(
         // whole fetch, body included, not just the head phase.
         resolve(new MonetResponse(fetchId, monet, head, channel));
       },
-      () => {
-        // A chunk-signalled pull: drain everything the pump queued.
-        for (;;) {
-          const chunk = monet.takeChunk(fetchId);
-          if (chunk == null) {
-            break;
-          }
-          channel.push(new Uint8Array(chunk));
-        }
-      },
+      // A chunk-signalled pull: drain everything the pump queued.
+      drain,
       () => {
         detachAbort();
+        // The whole body is in the channel now, so the native state
+        // goes at termination — not when (if ever) the body is read.
+        drain();
         channel.finish();
+        monet.cleanupFetch(fetchId);
       },
       (event) => {
         detachAbort();
@@ -219,6 +225,7 @@ export function fetch(
           reject(error);
         }
         channel.fail(error);
+        monet.cleanupFetch(fetchId);
       },
     );
 
