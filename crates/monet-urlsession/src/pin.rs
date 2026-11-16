@@ -24,8 +24,13 @@ static PINS: LazyLock<Mutex<Option<PinConfig>>> = LazyLock::new(|| Mutex::new(No
 /// shim is process-global (one shared URLSession), so this is too; the
 /// last registration wins. Called by
 /// [`UrlsessionTransport::with_pins`](crate::UrlsessionTransport::with_pins).
+///
+/// Server trust is evaluated only when a TLS connection opens, so the
+/// shared session's pooled connections are flushed: requests after this
+/// handshake anew under the new pins.
 pub(crate) fn register(config: PinConfig) {
     *PINS.lock().unwrap() = Some(config);
+    crate::bridge::transport_flush_connections();
 }
 
 /// Copies the pinned SPKI hashes for `host` into `out` (32 bytes each)

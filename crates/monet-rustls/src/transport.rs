@@ -257,14 +257,25 @@ async fn run_execute(
             && method != monet_core::Method::Get
             && method != monet_core::Method::Head
         {
-            // 301/302/303: fetch semantics switch bodied methods to GET.
+            // 301/302/303: fetch semantics switch bodied methods to GET,
+            // and the GET carries none of the request-body headers (a
+            // stale Content-Length announces bytes that never come).
             method = monet_core::Method::Get;
+            for name in [
+                "content-type",
+                "content-length",
+                "content-encoding",
+                "content-language",
+                "content-location",
+            ] {
+                headers.remove(name);
+            }
         }
         url = next;
     }
-    Err(Error::transport(
-        "monet-rustls: too many redirects (> {MAX_REDIRECTS})",
-    ))
+    Err(Error::transport(format!(
+        "monet-rustls: too many redirects (> {MAX_REDIRECTS})"
+    )))
 }
 
 /// One request/response exchange: cancel race plus the optional head

@@ -1494,6 +1494,32 @@ const CHECKS: Array<{
     },
   },
   {
+    name: 'http:hook_cancel_rejection_is_cancelled',
+    run: async base => {
+      try {
+        // A hook that gives up with a Cancelled MonetError cancels the
+        // fetch cleanly: kind Cancelled, not a hook failure.
+        addRequestHook(() => {
+          throw new MonetError('Cancelled', 'the hook gave up');
+        });
+        try {
+          await fetch(`${base}/plain`);
+        } catch (error) {
+          assert(
+            error instanceof MonetError && error.kind === 'Cancelled',
+            error instanceof MonetError
+              ? `expected kind Cancelled, got ${error.kind}: ${error.message}`
+              : `expected MonetError, got ${String(error)}`,
+          );
+          return;
+        }
+        throw new Error('the fetch succeeded past a rejecting hook');
+      } finally {
+        clearHooks();
+      }
+    },
+  },
+  {
     name: 'http:abort_during_hook',
     run: async base => {
       try {

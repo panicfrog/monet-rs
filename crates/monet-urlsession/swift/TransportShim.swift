@@ -32,6 +32,10 @@ final class UploadPipe: NSObject {
   let input: InputStream
   let output: OutputStream
   private let lock = NSLock()
+  /// Serializes the output half's operations: the feeder thread writes,
+  /// while `release()` closes from the delegate queue — a CFWriteStream
+  /// is not safe to close mid-write on another thread.
+  private let streamLock = NSLock()
   private var ended = false
   /// Set once the input half was handed to the session — a second ask
   /// (a body-preserving redirect) cannot be served: a stream cannot
@@ -82,6 +86,13 @@ final class UploadPipe: NSObject {
 
   /// Writes one chunk from the Rust feeder's thread. False means the
   /// pipe ended (the task is gone) — the feeder stops.
+  ///
+  /// A bound pair's write BLOCKS on a full buffer (it does not return
+  /// 0), and nothing on another thread wakes it — when the session never
+  /// opened the input half (the task failed before asking for the body),
+  /// a blocked feeder would hang forever. So the write only runs when
+  /// the pair has room (one writer; the reader only frees space, so it
+  /// cannot block then), and a full pair is polled against `ended`.
   func write(_ data: Data) -> Bool {
     guard !data.isEmpty else { return !isEnded() }
     var offset = 0
@@ -89,14 +100,19 @@ final class UploadPipe: NSObject {
     return data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Bool in
       guard let base = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return true }
       while offset < count {
-        if isEnded() { return false }
-        let written = output.write(base + offset, maxLength: count - offset)
+        streamLock.lock()
+        if isEnded() {
+          streamLock.unlock()
+          return false
+        }
+        let written = output.hasSpaceAvailable
+          ? output.write(base + offset, maxLength: count - offset) : 0
+        streamLock.unlock()
         if written > 0 {
           offset += written
         } else if written == 0 {
-          // The pair's buffer is full: URLSession hasn't drained it.
-          // Poll — the session reads at the network's pace, and a
-          // bounded poll keeps an ended pipe from parking this thread.
+          // Full: URLSession hasn't drained the pair yet. Poll at the
+          // network's pace; release() ends the wait.
           Thread.sleep(forTimeInterval: 0.05)
         } else {
           markEnded()
@@ -114,7 +130,18 @@ final class UploadPipe: NSObject {
   /// be served — refusing it failed the upload as a cancellation.
   /// `ended` means the task is gone, nothing else.
   func finish() {
+    streamLock.lock()
     output.close()
+    streamLock.unlock()
+  }
+
+  /// The task is gone: end the pipe for good — a feeder polling a full
+  /// pair stops, and later writes fail. Safe from any thread.
+  func release() {
+    streamLock.lock()
+    markEnded()
+    output.close()
+    streamLock.unlock()
   }
 }
 
@@ -126,7 +153,9 @@ final class TransportShim {
   /// configuration (system URLCache policy included). delegateQueue is
   /// nil, so all delegate events for a request arrive on one serial
   /// queue — the ordering contract in src/ffi.rs relies on that.
-  private let session = URLSession(configuration: .default)
+  /// Replaced when the trust policy changes (see `renewSession`); read
+  /// and swapped under `lock`.
+  private var session = URLSession(configuration: .default)
 
   private let lock = NSLock()
   private var boxes: [UInt64: RequestBox] = [:]
@@ -197,6 +226,9 @@ final class TransportShim {
     // transport_start returns) always find it.
     let pipe = pending.streamed ? UploadPipe() : nil
 
+    lock.lock()
+    let session = self.session
+    lock.unlock()
     let task: URLSessionTask
     if pending.streamed {
       task = session.uploadTask(withStreamedRequest: request)
@@ -265,11 +297,27 @@ final class TransportShim {
     lock.lock()
     let box = boxes[id]
     lock.unlock()
-    box?.uploadPipe?.finish()
+    box?.uploadPipe?.release()
     if let delegate = box?.task?.delegate as? TaskDelegate {
       delegate.uploadFailure = "the upload body failed (the producer's stream errored)"
     }
     box?.task?.cancel()
+  }
+
+  /// The trust policy changed (pins or roots): server trust is only
+  /// evaluated when a TLS connection opens, so the pooled connections —
+  /// trusted under the old policy — must not serve new requests. A
+  /// fresh session has its own pool; the old one finishes its running
+  /// tasks, then invalidates. (flush/reset do not do it: an idle pooled
+  /// connection still served the next request, unchallenged.) The
+  /// cookie store and URLCache are the configuration's shared ones, so
+  /// they carry over.
+  func renewSession() {
+    lock.lock()
+    let old = session
+    session = URLSession(configuration: .default)
+    lock.unlock()
+    old.finishTasksAndInvalidate()
   }
 
   /// Called by a task delegate on completion so the box doesn't leak.
@@ -277,10 +325,10 @@ final class TransportShim {
     lock.lock()
     let box = boxes.removeValue(forKey: id)
     lock.unlock()
-    // Release the pipe (a parked feeder write exits) and end the feeder
-    // itself (it may be parked in the body stream with nothing left to
-    // write — the data-plane wake reaches it).
-    box?.uploadPipe?.finish()
+    // Release the pipe (a feeder polling a full pipe exits) and end the
+    // feeder itself (it may be parked in the body stream with nothing
+    // left to write — the data-plane wake reaches it).
+    box?.uploadPipe?.release()
     if box?.streamed == true {
       on_upload_done(id)
     }
@@ -493,6 +541,11 @@ public func monetTransportStart(
 @_expose(Cxx)
 public func monetTransportCancel(_ id: UInt64) {
   TransportShim.shared.cancel(id: id)
+}
+
+@_expose(Cxx)
+public func monetTransportFlushConnections() {
+  TransportShim.shared.renewSession()
 }
 
 @_expose(Cxx)

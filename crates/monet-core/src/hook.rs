@@ -157,7 +157,8 @@ impl HookRegistry {
     }
 
     /// Runs every request hook in order. The first failure stops the chain
-    /// and is wrapped in [`Error::Hook`] with the hook's name; so does the
+    /// and is wrapped in [`Error::Hook`] with the hook's name (a
+    /// cancellation passes through as-is — see [`hook_error`]); so does the
     /// first [`HookOutcome::Mocked`] (there is no request left to mutate).
     /// On a [`HookOutcome::Modified`] outcome, every request observer sees
     /// the final request before it returns — a mocked request never goes
@@ -166,10 +167,11 @@ impl HookRegistry {
     pub async fn run_request_hooks(&self, req: Request) -> Result<HookOutcome> {
         let mut req = req;
         for hook in &self.request_hooks {
-            match hook.on_request(req).await.map_err(|e| Error::Hook {
-                hook: hook.name().to_string(),
-                source: Box::new(e),
-            })? {
+            match hook
+                .on_request(req)
+                .await
+                .map_err(|e| hook_error(hook.name(), e))?
+            {
                 HookOutcome::Modified(next) => req = next,
                 mocked @ HookOutcome::Mocked(_) => return Ok(mocked),
             }
@@ -186,15 +188,28 @@ impl HookRegistry {
     pub async fn run_response_hooks(&self, res: Response) -> Result<Response> {
         let mut res = res;
         for hook in &self.response_hooks {
-            res = hook.on_response(res).await.map_err(|e| Error::Hook {
-                hook: hook.name().to_string(),
-                source: Box::new(e),
-            })?;
+            res = hook
+                .on_response(res)
+                .await
+                .map_err(|e| hook_error(hook.name(), e))?;
         }
         for observer in &self.response_observers {
             observer.on_response(&res);
         }
         Ok(res)
+    }
+}
+
+/// Wraps a hook's failure with the hook's name. A cancellation is not
+/// the hook's failure — the request was aborted while the hook ran — so
+/// it passes through unwrapped and keeps its kind.
+fn hook_error(hook: &str, error: Error) -> Error {
+    match error {
+        Error::Cancelled => Error::Cancelled,
+        other => Error::Hook {
+            hook: hook.to_string(),
+            source: Box::new(other),
+        },
     }
 }
 
@@ -542,5 +557,33 @@ mod tests {
         assert_eq!(req.headers.get("x-order"), None);
         assert!(log.lock().unwrap().is_empty());
         assert!(observer_log.lock().unwrap().is_empty());
+    }
+
+    /// An abort that lands inside a hook is still an abort: the chain
+    /// must not wrap Cancelled in Error::Hook (the JS side would see the
+    /// kind "Hook" instead of "Cancelled").
+    #[test]
+    fn a_cancelled_hook_surfaces_as_cancelled() {
+        struct AbortedRequestHook;
+        impl RequestHook for AbortedRequestHook {
+            fn on_request(&self, _req: Request) -> BoxFuture<Result<HookOutcome>> {
+                Box::pin(async { Err(Error::Cancelled) })
+            }
+        }
+        struct AbortedResponseHook;
+        impl ResponseHook for AbortedResponseHook {
+            fn on_response(&self, _res: Response) -> BoxFuture<Result<Response>> {
+                Box::pin(async { Err(Error::Cancelled) })
+            }
+        }
+        let mut registry = HookRegistry::new();
+        registry
+            .add_request_hook(AbortedRequestHook)
+            .add_response_hook(AbortedResponseHook);
+
+        let err = block_on(registry.run_request_hooks(request())).unwrap_err();
+        assert!(matches!(err, Error::Cancelled), "request chain: {err:?}");
+        let err = block_on(registry.run_response_hooks(response())).unwrap_err();
+        assert!(matches!(err, Error::Cancelled), "response chain: {err:?}");
     }
 }

@@ -435,3 +435,38 @@ fn plain_body_arrives_intact() {
     );
     assert_eq!(chunks.concat(), b"plain".to_vec());
 }
+
+/// A streamed upload whose task fails before URLSession ever asks for
+/// the body (here: connection refused) leaves the pipe's input half
+/// unopened. The feeder must still let go once the task is gone — it
+/// used to block forever in the full pipe's write, holding the body (the
+/// producer never learned the upload had ended).
+#[test]
+fn a_streamed_upload_to_a_refused_port_releases_its_body() {
+    let url = Url::parse("http://127.0.0.1:1/upload").unwrap();
+    let (body, feed) = monet_core::body::channel();
+    let mut request = Request::new(Method::Post, url)
+        .with_header("content-type", "application/octet-stream")
+        .unwrap();
+    request.body = body;
+    // More than the pipe's 64KB buffer, and the body stays open (live).
+    for _ in 0..64 {
+        feed.send_chunk(vec![b'u'; 16 * 1024]).unwrap();
+    }
+    let transport = UrlsessionTransport::new();
+    let err = wait_for(
+        "refused upload",
+        transport.execute(request, CancelToken::new()),
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::Transport { .. }), "got: {err:?}");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while feed.send_chunk("probe").is_ok() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the feeder still holds the body 5s after the task failed"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}

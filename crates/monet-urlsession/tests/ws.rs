@@ -43,6 +43,9 @@ enum Script {
     ServerClose(u16, &'static str),
     /// Send a ping, wait for the client's pong, then report it.
     PingThenReport,
+    /// Send this many one-byte binary messages back to back (one flush),
+    /// then wait for the client to go.
+    Burst(usize),
 }
 
 /// What the test server observed.
@@ -111,6 +114,15 @@ fn spawn_server(script: Script, connections: usize) -> (Url, mpsc::Receiver<Seen
                                 };
                                 ws.send(Message::Close(Some(close))).await.unwrap();
                             }
+                            Script::Burst(count) => {
+                                for i in 0..count {
+                                    ws.feed(Message::Binary(vec![(i % 251) as u8].into()))
+                                        .await
+                                        .unwrap();
+                                }
+                                ws.flush().await.unwrap();
+                                while let Some(Ok(_)) = ws.next().await {}
+                            }
                             Script::PingThenReport => {
                                 ws.send(Message::Ping(bytes::Bytes::from_static(b"probe")))
                                     .await
@@ -140,6 +152,7 @@ impl Clone for Script {
             Script::Echo => Script::Echo,
             Script::ServerClose(code, reason) => Script::ServerClose(*code, reason),
             Script::PingThenReport => Script::PingThenReport,
+            Script::Burst(count) => Script::Burst(*count),
         }
     }
 }
@@ -272,4 +285,41 @@ fn connection_refused_maps_to_transport_error() {
     let request = Request::new(Method::Get, url);
     let err = wait_for("refused", transport().connect(request, CancelToken::new())).unwrap_err();
     assert!(matches!(err, Error::Transport { .. }), "got: {err:?}");
+}
+
+/// A burst of small frames: the parser used to drop each frame with
+/// `removeFirst`, shifting the whole rest of the buffer per frame —
+/// quadratic in frames per read (a read is up to 4MB).
+#[test]
+fn a_burst_of_small_frames_parses_in_linear_time() {
+    const COUNT: usize = 1_000_000;
+    let (url, _seen) = spawn_server(Script::Burst(COUNT), 1);
+    let mut stream = connect(&url);
+    let started = std::time::Instant::now();
+    let received = futures_lite::future::block_on(futures_lite::future::or(
+        async {
+            let mut received = 0usize;
+            while received < COUNT {
+                match stream.next_message().await {
+                    Ok(Some(WsMessage::Binary(bytes))) => {
+                        assert_eq!(bytes[..], [(received % 251) as u8], "message {received}");
+                        received += 1;
+                    }
+                    other => panic!("message {received}: {other:?}"),
+                }
+            }
+            received
+        },
+        async {
+            futures_timer::Delay::new(Duration::from_secs(20)).await;
+            0
+        },
+    ));
+    let elapsed = started.elapsed();
+    assert_eq!(received, COUNT, "the burst did not arrive within 20s");
+    // The quadratic parser took ~10s here; the linear one ~1.2s.
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the burst took {elapsed:?}"
+    );
 }

@@ -375,24 +375,33 @@ final class WebSocketConnection {
     parseFrames()
   }
 
+  /// Parses every complete frame in `buffer`. A cursor walks the frames;
+  /// the consumed bytes are dropped once per pass — dropping each frame
+  /// with removeFirst shifted the rest of the buffer per frame, quadratic
+  /// in frames per read (a read is up to 4MB).
   private func parseFrames() {
+    var cursor = 0
+    defer {
+      if cursor > 0 { buffer.removeFirst(min(cursor, buffer.count)) }
+    }
     while !stopped {
-      guard buffer.count >= 2 else { return }
-      let first = buffer[0]
-      let second = buffer[1]
+      let available = buffer.count - cursor
+      guard available >= 2 else { return }
+      let first = buffer[cursor]
+      let second = buffer[cursor + 1]
       let opcode = first & 0x0F
       let isFin = first & Const.fin != 0
       let isCompressed = first & Const.rsv1 != 0
       var headerLength = 2
       var length = UInt64(second & 0x7F)
       if length == 126 {
-        guard buffer.count >= 4 else { return }
-        length = (UInt64(buffer[2]) << 8) | UInt64(buffer[3])
+        guard available >= 4 else { return }
+        length = (UInt64(buffer[cursor + 2]) << 8) | UInt64(buffer[cursor + 3])
         headerLength = 4
       } else if length == 127 {
-        guard buffer.count >= 10 else { return }
+        guard available >= 10 else { return }
         length = 0
-        for i in 0..<8 { length = (length << 8) | UInt64(buffer[2 + i]) }
+        for i in 0..<8 { length = (length << 8) | UInt64(buffer[cursor + 2 + i]) }
         headerLength = 10
       }
       // Server frames must be unmasked; RSV2/3 are always bad here.
@@ -407,9 +416,10 @@ final class WebSocketConnection {
           fail(code: 1002, posixError: "protocol error")
           return
         }
-        guard buffer.count >= headerLength + Int(length) else { return }
-        let payload = Array(buffer[headerLength..<(headerLength + Int(length))])
-        buffer.removeFirst(headerLength + Int(length))
+        guard available >= headerLength + Int(length) else { return }
+        let start = cursor + headerLength
+        let payload = Array(buffer[start..<(start + Int(length))])
+        cursor = start + Int(length)
         controlFrame(opcode: opcode, payload: payload)
         continue
       }
@@ -427,9 +437,10 @@ final class WebSocketConnection {
         fail(code: 1009, posixError: "message too big")
         return
       }
-      guard buffer.count >= headerLength + Int(length) else { return }
-      let payload = Array(buffer[headerLength..<(headerLength + Int(length))])
-      buffer.removeFirst(headerLength + Int(length))
+      guard available >= headerLength + Int(length) else { return }
+      let start = cursor + headerLength
+      let payload = Array(buffer[start..<(start + Int(length))])
+      cursor = start + Int(length)
       dataFrame(opcode: opcode, isFin: isFin, payload: payload)
     }
   }

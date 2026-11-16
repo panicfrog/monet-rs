@@ -20,8 +20,12 @@ static ROOTS: LazyLock<Mutex<Vec<Vec<u8>>>> = LazyLock::new(|| Mutex::new(Vec::n
 /// Registers the DER roots the shim anchors challenges with. The last
 /// registration wins. Called by
 /// [`UrlsessionTransport::with_roots`](crate::UrlsessionTransport::with_roots).
+///
+/// Flushes the pooled connections for the same reason as
+/// [`crate::pin::register`].
 pub(crate) fn register(roots: Vec<Vec<u8>>) {
     *ROOTS.lock().unwrap() = roots;
+    crate::bridge::transport_flush_connections();
 }
 
 /// How many roots are registered (Swift's loop bound).
@@ -51,8 +55,13 @@ pub(crate) fn root_at(index: usize, out: &mut [u8]) -> usize {
 mod tests {
     use super::*;
 
+    /// The registry is process-global and these tests register different
+    /// sets: one at a time.
+    static SERIAL: Mutex<()> = Mutex::new(());
+
     #[test]
     fn roots_round_trip_by_index() {
+        let _serial = SERIAL.lock().unwrap();
         register(vec![vec![1, 2, 3], vec![4, 5]]);
         assert_eq!(count(), 2);
 
@@ -69,6 +78,7 @@ mod tests {
 
     #[test]
     fn an_empty_registration_clears() {
+        let _serial = SERIAL.lock().unwrap();
         register(vec![vec![9]]);
         register(vec![]);
         assert_eq!(count(), 0);

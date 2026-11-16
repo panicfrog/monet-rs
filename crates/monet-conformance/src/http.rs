@@ -555,6 +555,33 @@ async fn respond_route(
                 boxed(Full::new(Bytes::from(if released { "1" } else { "0" }))),
             )
         }
+        // A 302 for a bodied request (unique to its check): the follow-up
+        // must be a bodyless GET without the request-body headers.
+        "/redirect-post" => {
+            let mut response = ok(
+                StatusCode::FOUND,
+                boxed(Full::new(Bytes::from_static(b"moved"))),
+            );
+            response
+                .headers_mut()
+                .insert("location", "/redirect-post-final".parse().unwrap());
+            response
+        }
+        "/redirect-post-final" => ok(
+            StatusCode::OK,
+            boxed(Full::new(Bytes::from_static(b"plain"))),
+        ),
+        // Redirects to itself forever — the hop limit's check.
+        "/redirect-loop" => {
+            let mut response = ok(
+                StatusCode::FOUND,
+                boxed(Full::new(Bytes::from_static(b"again"))),
+            );
+            response
+                .headers_mut()
+                .insert("location", "/redirect-loop".parse().unwrap());
+            response
+        }
         "/redirect-final" => ok(
             StatusCode::OK,
             boxed(Full::new(Bytes::from_static(b"plain"))),
@@ -774,6 +801,51 @@ pub fn redirect_followed_by_default(t: &dyn Transport, server: &HttpServer) {
     assert_eq!(body.concat(), b"plain".to_vec());
     assert_eq!(server.seen_for("/redirect").method, "GET");
     assert_eq!(server.seen_for("/redirect-final").method, "GET");
+}
+
+/// A POST answered with 302 is followed as a GET (fetch semantics), and
+/// the GET must not carry the request-body headers — a leftover
+/// Content-Length on a bodyless GET can leave the server waiting for
+/// bytes that never come.
+pub fn post_redirected_to_get_drops_body_headers(t: &dyn Transport, server: &HttpServer) {
+    let request = Request::new(Method::Post, server.url("/redirect-post"))
+        .with_header("content-type", "application/json")
+        .unwrap()
+        .with_body_bytes(br#"{"redirected":true}"#);
+    let response = wait_for(
+        "post redirect outcome",
+        t.execute(request, CancelToken::new()),
+    )
+    .unwrap();
+    assert_eq!(response.status, 200, "the redirect was not followed");
+    assert_eq!(server.seen_for("/redirect-post").method, "POST");
+    let followed = server.seen_for("/redirect-post-final");
+    assert_eq!(followed.method, "GET");
+    let body_headers: Vec<_> = followed
+        .headers
+        .iter()
+        .filter(|(name, _)| {
+            name.eq_ignore_ascii_case("content-type") || name.eq_ignore_ascii_case("content-length")
+        })
+        .collect();
+    assert!(
+        body_headers.is_empty(),
+        "the GET kept request-body headers: {body_headers:?}"
+    );
+    assert!(followed.body.is_empty(), "the GET carried a body");
+}
+
+/// A redirect loop ends in an error rather than hopping forever; the
+/// error is returned so a transport's own test can check its wording.
+pub fn redirect_loop_fails(t: &dyn Transport, server: &HttpServer) -> Error {
+    let request = get(server.url("/redirect-loop"));
+    match wait_for(
+        "redirect loop outcome",
+        t.execute(request, CancelToken::new()),
+    ) {
+        Ok(_) => panic!("a redirect loop must fail"),
+        Err(error) => error,
+    }
 }
 
 /// A per-request deadline shorter than the (unconfigured) default must
@@ -1009,6 +1081,7 @@ pub fn run_suite(t: &dyn Transport, server: &HttpServer) {
     get_chunked_content(t, server);
     post_reaches_server(t, server);
     redirect_followed_by_default(t, server);
+    post_redirected_to_get_drops_body_headers(t, server);
     pre_cancelled_fails_fast(t, server);
     cancel_after_head_aborts_body(t, server);
     held_body_does_not_block_new_requests(t, server);

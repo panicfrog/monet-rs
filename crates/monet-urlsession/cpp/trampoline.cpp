@@ -35,6 +35,10 @@ void transport_cancel(std::uint64_t id) {
   MonetUrlsessionBridge::monetTransportCancel(id);
 }
 
+void transport_flush_connections() {
+  MonetUrlsessionBridge::monetTransportFlushConnections();
+}
+
 
 void transport_set_streaming(std::uint64_t id) {
   MonetUrlsessionBridge::monetTransportSetStreaming(id);

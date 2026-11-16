@@ -26,6 +26,11 @@ void transport_start(
 
 void transport_cancel(std::uint64_t id);
 
+// The trust policy changed (pins or roots): later requests must not
+// ride the pooled connections — they handshake (and are challenged)
+// anew. Running requests finish on their connections.
+void transport_flush_connections();
+
 // Resumes a task suspended by the body backpressure valve (v2/W2b):
 // the Rust body watcher calls it after the consumer has drained the
 // overflow. A no-op on finished tasks.

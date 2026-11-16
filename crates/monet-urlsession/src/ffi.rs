@@ -162,6 +162,9 @@ pub mod bridge {
             timeout_ms: u64,
         );
         fn transport_cancel(id: u64);
+        // Trust changed (pins or roots): pooled connections were trusted
+        // under the old policy — future requests must handshake anew.
+        fn transport_flush_connections();
         // Streaming uploads (v2/W2c): mark the request streamed before
         // start (the pipe exists from start on), then feed/finish/fail
         // the pipe's output half.

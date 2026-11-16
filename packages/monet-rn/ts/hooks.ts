@@ -14,6 +14,17 @@
 // plain (possibly async) functions and never sees hookCallId.
 
 import { getMonet } from '../generated/rust-turbo/Monet';
+import { MonetError } from './response';
+
+/** The kind a hook rejection reports: a MonetError's own kind (so a hook
+ *  that throws MonetError('Cancelled', …) cancels the fetch cleanly),
+ *  otherwise the error's name. */
+function rejectionKind(error: unknown): string {
+  if (error instanceof MonetError) {
+    return error.kind;
+  }
+  return error instanceof Error ? error.name : 'Hook';
+}
 
 /** A request as hooks see and rewrite it (the body passes through
  *  untouched — v1 keeps bodies out of the protocol). */
@@ -196,7 +207,7 @@ export function addRequestHook(
       });
     } catch (error) {
       getMonet().rejectRequestHook(event.hookCallId, {
-        kind: error instanceof Error ? error.name : 'Hook',
+        kind: rejectionKind(error),
         message: error instanceof Error ? error.message : String(error),
       });
     }
@@ -239,7 +250,7 @@ export function addResponseHook(
       });
     } catch (error) {
       getMonet().rejectResponseHook(event.hookCallId, {
-        kind: error instanceof Error ? error.name : 'Hook',
+        kind: rejectionKind(error),
         message: error instanceof Error ? error.message : String(error),
       });
     }

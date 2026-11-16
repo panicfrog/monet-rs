@@ -149,6 +149,23 @@ pub fn spawn_https_on(ca: &LocalCa, bind: &str) -> HttpServer {
     })
 }
 
+/// An HTTPS server that keeps connections alive (no `Connection:
+/// close`, unlike [`spawn_https_server`]) — for checks about what a
+/// pooled TLS connection does. The close flag is process-global, so use
+/// this only in a test binary that spawns no closing server.
+pub fn spawn_https_keep_alive(ca: &LocalCa) -> HttpServer {
+    let acceptor = tls_acceptor(ca);
+    HttpServer::spawn_with("127.0.0.1:0", move |stream| {
+        let acceptor = acceptor.clone();
+        async move {
+            acceptor
+                .accept(stream)
+                .await
+                .map_err(|_| std::io::Error::other("tls"))
+        }
+    })
+}
+
 /// PEM ("-----BEGIN PRIVATE KEY-----…") or raw PKCS#8 DER → DER.
 fn pkcs8_der(input: &[u8]) -> Vec<u8> {
     if input.starts_with(b"-----") {
