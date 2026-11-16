@@ -133,6 +133,72 @@ pub(crate) fn allocate(cancel: CancelToken) -> (u64, oneshot::Receiver<Result<Re
     (id, head_rx)
 }
 
+/// Waits for `id`'s response head, racing it against the cancel token
+/// and the per-request head deadline (Cronet has no timeout API — the
+/// deadline races the head here). Any way out without a head — cancel,
+/// deadline, or the caller dropping this future — cancels the native
+/// request, which would otherwise run until the server answers.
+pub(crate) async fn await_head(
+    id: u64,
+    head_rx: oneshot::Receiver<Result<Response>>,
+    cancel: CancelToken,
+    timeout: Option<std::time::Duration>,
+) -> Result<Response> {
+    /// Fires the native cancel on drop unless the head arrived.
+    struct NoHeadGuard {
+        id: u64,
+        head_arrived: bool,
+    }
+    impl Drop for NoHeadGuard {
+        fn drop(&mut self) {
+            if !self.head_arrived {
+                cancel_native(self.id);
+            }
+        }
+    }
+    let mut guard = NoHeadGuard {
+        id,
+        head_arrived: false,
+    };
+
+    let deadline = timeout.map(futures_timer::Delay::new);
+    enum Step<T> {
+        Head(T),
+        Cancelled,
+        TimedOut,
+    }
+    let head = async { Step::Head(head_rx.await) };
+    let early = async {
+        futures_lite::future::race(
+            async {
+                cancel.cancelled().await;
+                Step::Cancelled
+            },
+            async {
+                match deadline {
+                    Some(delay) => {
+                        delay.await;
+                        Step::TimedOut
+                    }
+                    None => std::future::pending().await,
+                }
+            },
+        )
+        .await
+    };
+    match futures_lite::future::race(head, early).await {
+        Step::Head(Ok(response)) => {
+            guard.head_arrived = true;
+            response
+        }
+        Step::Head(Err(_)) => Err(Error::transport(
+            "httpengine: request state dropped before the response head",
+        )),
+        Step::Cancelled => Err(Error::Cancelled),
+        Step::TimedOut => Err(Error::transport("httpengine: response head timed out")),
+    }
+}
+
 /// Registers how to cancel the native request.
 pub(crate) fn arm_native_cancel(id: u64, cancel: CancelNative) {
     let mut states = REGISTRY.states.lock().unwrap();
@@ -626,5 +692,75 @@ mod tests {
             Bytes::from("chunk1chunk2chunk3chunk4chunk5"),
             "the overflowed chunk must arrive before the end-of-stream"
         );
+    }
+
+    /// A request with a native-cancel probe: the id, its head channel,
+    /// and whether `UrlRequest.cancel()` has fired.
+    fn probed(
+        cancel: &CancelToken,
+    ) -> (
+        u64,
+        oneshot::Receiver<Result<Response>>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let (id, rx) = allocate(cancel.clone());
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe = fired.clone();
+        arm_native_cancel(id, Arc::new(move || probe.store(true, Ordering::SeqCst)));
+        (id, rx, fired)
+    }
+
+    /// Cancelling before the head must cancel the native request too:
+    /// otherwise it stays open (and a streamed upload never ends) until
+    /// the server happens to answer.
+    #[test]
+    fn cancel_before_head_cancels_the_native_request() {
+        let cancel = CancelToken::new();
+        let (id, rx, fired) = probed(&cancel);
+        cancel.cancel();
+        let result = futures_lite::future::block_on(await_head(id, rx, cancel, None));
+        assert!(matches!(result, Err(Error::Cancelled)), "got: {result:?}");
+        assert!(fired.load(Ordering::SeqCst), "the native request was left running");
+    }
+
+    /// The caller dropping the wait (a pump racing it against its own
+    /// cancel) is a cancel as well.
+    #[test]
+    fn dropping_the_head_wait_cancels_the_native_request() {
+        let cancel = CancelToken::new();
+        let (id, rx, fired) = probed(&cancel);
+        let mut wait = Box::pin(await_head(id, rx, cancel, None));
+        assert!(
+            futures_lite::future::block_on(futures_lite::future::poll_once(&mut wait)).is_none()
+        );
+        drop(wait);
+        assert!(fired.load(Ordering::SeqCst), "the native request was left running");
+    }
+
+    #[test]
+    fn head_timeout_cancels_the_native_request() {
+        let cancel = CancelToken::new();
+        let (id, rx, fired) = probed(&cancel);
+        let result = futures_lite::future::block_on(await_head(
+            id,
+            rx,
+            cancel,
+            Some(std::time::Duration::from_millis(10)),
+        ));
+        assert!(matches!(result, Err(Error::Transport { .. })), "got: {result:?}");
+        assert!(fired.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_delivered_head_leaves_the_request_running() {
+        let cancel = CancelToken::new();
+        let (id, rx, fired) = probed(&cancel);
+        head_delivered(id, 200);
+        let response = futures_lite::future::block_on(await_head(id, rx, cancel, None)).unwrap();
+        assert_eq!(response.status, 200);
+        drop(response);
+        // The body consumer leaving is a separate path (on_chunk); the
+        // head wait itself must not cancel anything.
+        assert!(!fired.load(Ordering::SeqCst));
     }
 }

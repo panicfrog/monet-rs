@@ -418,46 +418,8 @@ pub fn execute(
         };
 
         let (id, head_rx) = start_request(&engine, &req, &cancel, upload)?;
-        let req_timeout_ms = req.timeout_ms.map(std::time::Duration::from_millis);
-
-        // The per-request head deadline (Cronet has no timeout API —
-        // the deadline races the head here and fires the native cancel).
-        let deadline = req_timeout_ms.map(futures_timer::Delay::new);
-        enum Step<T> {
-            Head(T),
-            Cancelled,
-            TimedOut,
-        }
-        let head = async { Step::Head(head_rx.await) };
-        let early = async {
-            futures_lite::future::race(
-                async {
-                    cancel.cancelled().await;
-                    Step::Cancelled
-                },
-                async {
-                    match deadline {
-                        Some(delay) => {
-                            delay.await;
-                            Step::TimedOut
-                        }
-                        None => std::future::pending().await,
-                    }
-                },
-            )
-            .await
-        };
-        match futures_lite::future::race(head, early).await {
-            Step::Head(Ok(response)) => response,
-            Step::Head(Err(_)) => Err(Error::transport(
-                "httpengine: request state dropped before the response head",
-            )),
-            Step::Cancelled => Err(Error::Cancelled),
-            Step::TimedOut => {
-                registry::cancel_native(id);
-                Err(Error::transport("httpengine: response head timed out"))
-            }
-        }
+        let timeout = req.timeout_ms.map(std::time::Duration::from_millis);
+        registry::await_head(id, head_rx, cancel, timeout).await
     })
 }
 
