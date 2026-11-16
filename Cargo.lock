@@ -944,6 +944,7 @@ dependencies = [
 name = "monet-tls"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "monet-core",
  "rcgen",
  "rustls",

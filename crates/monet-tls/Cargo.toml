@@ -24,6 +24,7 @@ sha2 = "0.10"
 webpki-roots = { version = "1", optional = true }
 
 [dev-dependencies]
+base64.workspace = true
 rcgen = "0.13"
 
 [lints]
