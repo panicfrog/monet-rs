@@ -17,6 +17,7 @@ use std::sync::RwLock;
 use jsi::RuntimeHandle;
 use jsi_turbo::RustTurboModule;
 use monet_core::pin::PinConfig;
+use monet_core::retry::{AttemptOutcome, RetryPolicy};
 use monet_core::CancelToken;
 use monet_core::Client;
 use monet_core::Method;
@@ -266,9 +267,12 @@ impl Monet {
     /// 5xx response or a network error, the backoff doubling per
     /// attempt. `retries: 0` (the default) is off.
     pub fn configure_retry(&self, json: String) -> anyhow::Result<()> {
-        let policy: RetryPolicy = serde_json::from_str(&json)
+        let config: RetryConfig = serde_json::from_str(&json)
             .map_err(|e| anyhow::anyhow!("invalid retry policy: {e}"))?;
-        *self.retry.write().unwrap() = policy;
+        *self.retry.write().unwrap() = RetryPolicy {
+            retries: config.retries,
+            backoff_ms: config.backoff_ms,
+        };
         Ok(())
     }
 
@@ -1190,22 +1194,22 @@ fn spawn_fetch_pump(
                                 // response hooks passed on it, a 5xx with
                                 // attempts left backs off and re-runs the
                                 // pipeline. The last response is the
-                                // fetch's result when the cap runs out.
-                                if response.status >= 500
-                                    && policy_attempts < retry_policy.retries
-                                {
+                                // fetch's result when the cap runs out —
+                                // or at once when the body was a consumed
+                                // stream.
+                                if let Some(backoff) = retry_policy.retry_after(
+                                    AttemptOutcome::Response(response.status),
+                                    policy_attempts,
+                                    body.replayable(),
+                                ) {
                                     policy_attempts += 1;
-                                    let backoff =
-                                        retry_policy.backoff_ms << (policy_attempts - 1);
                                     valve_log(&format!(
-                                        "PUMP-RETRY id={fetch_id} status={} attempt={policy_attempts} backoff={backoff}ms",
-                                        response.status
+                                        "PUMP-RETRY id={fetch_id} status={} attempt={policy_attempts} backoff={}ms",
+                                        response.status,
+                                        backoff.as_millis()
                                     ));
-                                    if backoff > 0 {
-                                        futures_timer::Delay::new(
-                                            std::time::Duration::from_millis(backoff),
-                                        )
-                                        .await;
+                                    if !backoff.is_zero() {
+                                        futures_timer::Delay::new(backoff).await;
                                     }
                                     attempt += 1;
                                     continue;
@@ -1227,17 +1231,14 @@ fn spawn_fetch_pump(
                                 // error (never a Cancelled abort or a Hook
                                 // veto — those are final) with attempts
                                 // left backs off and retries.
-                                if matches!(error, monet_core::Error::Transport { .. })
-                                    && policy_attempts < retry_policy.retries
-                                {
+                                if let Some(backoff) = retry_policy.retry_after(
+                                    AttemptOutcome::Error(&error),
+                                    policy_attempts,
+                                    body.replayable(),
+                                ) {
                                     policy_attempts += 1;
-                                    let backoff =
-                                        retry_policy.backoff_ms << (policy_attempts - 1);
-                                    if backoff > 0 {
-                                        futures_timer::Delay::new(
-                                            std::time::Duration::from_millis(backoff),
-                                        )
-                                        .await;
+                                    if !backoff.is_zero() {
+                                        futures_timer::Delay::new(backoff).await;
                                     }
                                     attempt += 1;
                                     continue;
@@ -1384,22 +1385,15 @@ fn file_path(uri: &str) -> anyhow::Result<std::path::PathBuf> {
     Ok(std::path::PathBuf::from(uri))
 }
 
-/// The built-in retry policy (v2/W5) — see [`Monet::configure_retry`].
-#[derive(serde::Deserialize, Clone, Copy, Debug)]
+/// The JSON form of the built-in retry policy — see
+/// [`Monet::configure_retry`].
+#[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct RetryPolicy {
-    /// Extra attempts beyond the first (0 = off).
+struct RetryConfig {
     #[serde(default)]
-    pub retries: u32,
-    /// The first backoff in milliseconds; doubles per attempt.
+    retries: u32,
     #[serde(default)]
-    pub backoff_ms: u64,
-}
-
-impl Default for RetryPolicy {
-    fn default() -> Self {
-        RetryPolicy { retries: 0, backoff_ms: 0 }
-    }
+    backoff_ms: u64,
 }
 
 /// Builds the delivered form of a prefetch hit: the cached status/
@@ -1428,9 +1422,20 @@ enum PumpBody {
     /// rebuilds the request from them.
     Buffered(Option<Vec<u8>>),
     /// A streamed upload ([`Monet::fetch_stream`]): the channel's
-    /// receiving half, consumed by the first attempt — a retry cannot
-    /// replay it and fails the fetch with an explicit error.
+    /// receiving half, consumed by the first attempt — the retry policy
+    /// passes on it, and a hook-driven retry fails the fetch with an
+    /// explicit error.
     Stream(Option<monet_core::body::Body>),
+}
+
+impl PumpBody {
+    /// Whether another attempt can send this body.
+    fn replayable(&self) -> bool {
+        match self {
+            PumpBody::Buffered(_) => true,
+            PumpBody::Stream(slot) => slot.is_some(),
+        }
+    }
 }
 
 /// [`build_request`] with a streaming body: the channel rides the

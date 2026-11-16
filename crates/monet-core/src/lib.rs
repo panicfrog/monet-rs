@@ -45,6 +45,7 @@ pub mod mock;
 pub mod pin;
 pub mod request;
 pub mod response;
+pub mod retry;
 pub mod transport;
 pub mod ws;
 
