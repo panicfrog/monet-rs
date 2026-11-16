@@ -193,11 +193,15 @@ impl Drop for GcProbeGuard {
     }
 }
 
+/// How many messages the `/burst` route sends.
+const BURST_LEN: u8 = 20;
+
 /// A long-lived, externally reachable WebSocket echo server for the JS
 /// battery (the `server` bin): every accepted connection behaves by its
 /// URL path — `/echo` mirrors messages, `/close-1012` closes with the
-/// fidelity-check code, `/ping` sends a probe, `/gc-probe` mirrors and
-/// counts (see [`GC_PROBE_OPEN`]). Multi-connection (each battery check
+/// fidelity-check code, `/ping` sends a probe, `/burst` sends a mixed
+/// text/binary burst, `/gc-probe` mirrors and counts (see
+/// [`GC_PROBE_OPEN`]). Multi-connection (each battery check
 /// opens its own socket); no observation queue (the JS battery asserts
 /// from the client side).
 pub struct PathEchoServer {
@@ -343,6 +347,23 @@ where
                     return Ok(());
                 }
             }
+        }
+        // The receive-order check: on the first client message, send
+        // BURST_LEN messages back to back, text at even indexes and
+        // binary at odd ones. The client holds its JS thread meanwhile
+        // so they all queue natively before the first is pulled.
+        "/burst" => {
+            if let Some(Ok(_)) = ws.next().await {
+                for i in 0..BURST_LEN {
+                    if i % 2 == 0 {
+                        ws.feed(Message::Text(format!("m{i}").into())).await?;
+                    } else {
+                        ws.feed(Message::Binary(vec![i].into())).await?;
+                    }
+                }
+                ws.flush().await?;
+            }
+            while let Some(Ok(_)) = ws.next().await {}
         }
         "/close-1012" => {
             use tokio_tungstenite::tungstenite::protocol::CloseFrame;

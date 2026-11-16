@@ -182,10 +182,6 @@ export class MonetWebSocket {
   private closeBuffer: MonetWsCloseEvent | null = null;
   private _closed = false;
 
-  // The isBinary flags from on_message signals, paired FIFO with
-  // takeMessage pulls.
-  private pendingFlags: boolean[] = [];
-
   get onopen(): OpenHandler | null {
     return this._onopen;
   }
@@ -373,12 +369,26 @@ export class MonetWebSocket {
   }
 
   /**
-   * Internal: the native on_message signal — queue the type flag, pull
-   * the queued data, deliver or buffer.
+   * Internal: the native on_message signal — pull its message, deliver
+   * or buffer. The pump queues each message before signalling it, and
+   * both run FIFO, so this signal's message is the oldest one queued.
+   * Exactly one pull per signal: draining further would take messages
+   * whose signals (and isBinary flags) haven't arrived yet.
    */
   handleMessageSignal(event: {isBinary: boolean}): void {
-    this.pendingFlags.push(event.isBinary);
-    this.drainMessages();
+    const buffer = this.conn.takeMessage();
+    if (buffer == null) {
+      return;
+    }
+    const data: string | ArrayBuffer = event.isBinary
+      ? buffer
+      : utf8Decode(new Uint8Array(buffer));
+    const message = {data, isBinary: event.isBinary};
+    if (this._onmessage !== null) {
+      this._onmessage(message);
+    } else {
+      this.messageBuffer.push(message);
+    }
   }
 
   /** Internal: terminal close dispatch. */
@@ -448,26 +458,6 @@ export class MonetWebSocket {
       listenedSockets.set(this.socketId, this);
     } else {
       listenedSockets.delete(this.socketId);
-    }
-  }
-
-  /** Pulls all queued messages, delivering or buffering each. */
-  private drainMessages(): void {
-    for (;;) {
-      const buffer = this.conn.takeMessage();
-      if (buffer == null) {
-        break;
-      }
-      const isBinary = this.pendingFlags.shift() ?? false;
-      const data: string | ArrayBuffer = isBinary
-        ? buffer
-        : utf8Decode(new Uint8Array(buffer));
-      const event = {data, isBinary};
-      if (this._onmessage !== null) {
-        this._onmessage(event);
-      } else {
-        this.messageBuffer.push(event);
-      }
     }
   }
 }

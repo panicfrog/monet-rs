@@ -15,6 +15,7 @@
 //! that the pump drains and applies to the [`WebSocketStream`] it owns
 //! (the stream's send half is `&mut self`, so only the pump may touch it).
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use jsi::{JsiArrayBuffer, RuntimeHandle};
@@ -30,9 +31,10 @@ pub(crate) enum WsCommand {
 
 /// The receive queue: received messages waiting for JS to pull them
 /// (zero-copy). The isBinary flag is NOT queued — it rides the
-/// `on_message` signal that precedes each pull, and the TS layer pairs
-/// them FIFO (same shape as the fetch channel's on_chunk/take_chunk).
-pub(crate) type WsQueue = Arc<Mutex<Vec<Vec<u8>>>>;
+/// `on_message` signal that precedes each pull, and the TS layer pulls
+/// exactly one message per signal. Strictly FIFO: messages pile up
+/// whenever JS falls behind, and must still come out in arrival order.
+pub(crate) type WsQueue = Arc<Mutex<VecDeque<Vec<u8>>>>;
 
 /// A live WebSocket connection as handed to JS. Every operation goes
 /// through the object; dropping it disconnects.
@@ -57,7 +59,7 @@ impl MonetWsConnection {
     ) {
         let cancel = CancelToken::new();
         let (command_tx, command_rx) = futures_channel::mpsc::unbounded();
-        let queue: WsQueue = Arc::new(Mutex::new(Vec::new()));
+        let queue: WsQueue = Arc::new(Mutex::new(VecDeque::new()));
         (
             MonetWsConnection {
                 cancel: cancel.clone(),
@@ -97,7 +99,7 @@ impl Default for MonetWsConnection {
         MonetWsConnection {
             cancel: CancelToken::new(),
             commands: futures_channel::mpsc::unbounded().0,
-            queue: Arc::new(Mutex::new(Vec::new())),
+            queue: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 }
@@ -149,16 +151,15 @@ impl MonetWsConnection {
         Ok(true)
     }
 
-    /// Takes one queued message as a zero-copy ArrayBuffer. The isBinary
-    /// flag arrived on the `on_message` signal that preceded this pull —
-    /// the signal/data pairs are strictly FIFO, so the TS layer pairs
-    /// them by order (same shape as the fetch channel's
-    /// on_chunk/take_chunk).
+    /// Takes the oldest queued message as a zero-copy ArrayBuffer. The
+    /// isBinary flag arrived on the `on_message` signal that preceded
+    /// this pull — the pump queues before it signals, and both are
+    /// FIFO, so each signal's own message is the oldest one still queued.
     pub fn take_message<'rt>(
         &self,
         rt: &mut RuntimeHandle<'rt>,
     ) -> anyhow::Result<Option<JsiArrayBuffer<'rt>>> {
-        let data = self.queue.lock().unwrap().pop();
+        let data = self.queue.lock().unwrap().pop_front();
         Ok(data.map(|data| JsiArrayBuffer::from_vec(data, rt)))
     }
 }

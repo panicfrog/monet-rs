@@ -123,7 +123,7 @@ fn main() {
         "http routes: /plain /ws-open /chunked /auth-guard /echo /redirect /slow-head /stalled /held /fast /leaf-spki /request-count"
     );
     println!(
-        "ws routes: /echo (mirror) /close-1012 (fidelity) /ping (probe) /gc-probe (counted) /hook-echo (hook check)"
+        "ws routes: /echo (mirror) /close-1012 (fidelity) /ping (probe) /burst (order) /gc-probe (counted) /hook-echo (hook check)"
     );
 
     // The server threads keep themselves alive; main must not return or

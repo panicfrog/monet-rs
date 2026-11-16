@@ -967,6 +967,55 @@ const CHECKS: Array<{
     },
   },
   {
+    name: 'ws:burst_order',
+    run: async base => {
+      // /burst answers our trigger with 20 back-to-back messages, text
+      // "m<i>" at even i and binary [i] at odd i. Holding the JS thread
+      // right after the trigger lets them all queue natively, so the
+      // pulls see a backlog: order and the text/binary pairing must hold.
+      const count = 20;
+      const ws = new MonetWebSocket(`${wsBaseFrom(base)}/burst`);
+      try {
+        await waitForOpen(ws);
+        const received: {data: string | ArrayBuffer; isBinary: boolean}[] = [];
+        const all = new Promise<void>((resolve, reject) => {
+          ws.onmessage = event => {
+            received.push(event);
+            if (received.length === count) {
+              resolve();
+            }
+          };
+          ws.onerror = (event: {kind: string; message: string}) =>
+            reject(new MonetError(event.kind, event.message));
+        });
+        ws.send('go');
+        const holdUntil = Date.now() + 300;
+        while (Date.now() < holdUntil) {
+          // Busy-wait: the JS thread must not run the signals yet.
+        }
+        await all;
+        received.forEach((event, i) => {
+          if (i % 2 === 0) {
+            assert(
+              !event.isBinary && event.data === `m${i}`,
+              `message ${i}: ${JSON.stringify(event.data)} isBinary=${event.isBinary}, expected text "m${i}"`,
+            );
+          } else {
+            const bytes =
+              event.data instanceof ArrayBuffer ? new Uint8Array(event.data) : null;
+            assert(
+              event.isBinary && bytes !== null && bytes.length === 1 && bytes[0] === i,
+              `message ${i}: ${bytes ? Array.from(bytes) : JSON.stringify(event.data)} isBinary=${event.isBinary}, expected binary [${i}]`,
+            );
+          }
+        });
+      } finally {
+        ws.close(1000, 'done');
+        await waitForClose(ws);
+      }
+    },
+  },
+  {
     name: 'ws:close_code_fidelity',
     run: async base => {
       const ws = new MonetWebSocket(`${wsBaseFrom(base)}/close-1012`);

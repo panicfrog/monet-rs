@@ -1525,22 +1525,22 @@ async fn ws_pump(
         .await;
         match step {
             Step::Message(Ok(Some(WsMessage::Text(text)))) => {
-                queue.lock().unwrap().push(text.into_bytes());
+                queue.lock().unwrap().push_back(text.into_bytes());
                 on_message.call(WsMessageEvent { is_binary: false });
             }
             Step::Message(Ok(Some(WsMessage::Binary(bytes)))) => {
-                queue.lock().unwrap().push(bytes.to_vec());
+                queue.lock().unwrap().push_back(bytes.to_vec());
                 on_message.call(WsMessageEvent { is_binary: true });
             }
             Step::Message(Ok(Some(WsMessage::Ping(bytes)))) => {
                 // Surfaced with its payload for tests/custom protocols;
                 // the transport already answered it.
-                queue.lock().unwrap().push(bytes.to_vec());
+                queue.lock().unwrap().push_back(bytes.to_vec());
                 on_message.call(WsMessageEvent { is_binary: true });
             }
             Step::Message(Ok(Some(WsMessage::Pong(bytes)))) => {
                 // Fire-and-forget: surfaced like a message for symmetry.
-                queue.lock().unwrap().push(bytes.to_vec());
+                queue.lock().unwrap().push_back(bytes.to_vec());
                 on_message.call(WsMessageEvent { is_binary: true });
             }
             Step::Message(Ok(Some(WsMessage::Close(frame)))) => {
