@@ -199,7 +199,8 @@ const BURST_LEN: u8 = 20;
 /// A long-lived, externally reachable WebSocket echo server for the JS
 /// battery (the `server` bin): every accepted connection behaves by its
 /// URL path — `/echo` mirrors messages, `/close-1012` closes with the
-/// fidelity-check code, `/ping` sends a probe, `/burst` sends a mixed
+/// fidelity-check code, `/ping` sends a probe, `/ping-echo` names the
+/// frame type it receives, `/burst` sends a mixed
 /// text/binary burst, `/gc-probe` mirrors and counts (see
 /// [`GC_PROBE_OPEN`]). Multi-connection (each battery check
 /// opens its own socket); no observation queue (the JS battery asserts
@@ -364,6 +365,20 @@ where
                 ws.flush().await?;
             }
             while let Some(Ok(_)) = ws.next().await {}
+        }
+        // What frame did the client send? A ping answers "ping", a binary
+        // message "binary:<len>" — the client's ping() check.
+        "/ping-echo" => {
+            while let Some(Ok(message)) = ws.next().await {
+                let reply = match message {
+                    Message::Ping(_) => "ping".to_string(),
+                    Message::Binary(bytes) => format!("binary:{}", bytes.len()),
+                    Message::Text(_) => "text".to_string(),
+                    Message::Close(_) => return Ok(()),
+                    _ => continue,
+                };
+                ws.send(Message::Text(reply.into())).await?;
+            }
         }
         "/close-1012" => {
             use tokio_tungstenite::tungstenite::protocol::CloseFrame;

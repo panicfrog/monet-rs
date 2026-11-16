@@ -17,6 +17,7 @@ use std::sync::RwLock;
 use jsi::RuntimeHandle;
 use jsi_turbo::RustTurboModule;
 use monet_core::pin::PinConfig;
+use monet_core::prefetch;
 use monet_core::retry::{AttemptOutcome, RetryPolicy};
 use monet_core::CancelToken;
 use monet_core::Client;
@@ -40,10 +41,6 @@ mod fetch;
 /// traits, with the pending-map resolve protocol (see docs/plans/2026-11-hooks.md).
 mod hooks;
 mod platform;
-/// The prefetch cache (v2/W4): complete responses keyed by prefetchKey,
-/// stored by prefetch() at its terminal, read by fetches carrying the
-/// key (fresh → zero-transport delivery, pending → join).
-mod prefetch;
 /// The WebSocket connection object: pure Rust (jsi + core types only),
 /// compiled unconditionally — the transport selection in platform.rs is
 /// what the `websocket` feature gates. The connection's lifetime is the
@@ -662,11 +659,11 @@ impl Monet {
             .parse::<monet_core::Url>()
             .map_err(|e| anyhow::anyhow!("invalid URL: {e}"))?;
         let key = options.prefetch_key.clone();
-        if !prefetch::begin(&key) {
-            // A fresh entry or a pending prefetch already covers it.
+        let Some(ticket) = prefetch::begin(&key) else {
+            // A prefetch for this key is already in flight.
             on_done.call_with_no_args();
             return Ok(());
-        }
+        };
         let on_done = Arc::new(on_done);
         let on_error = Arc::new(on_error);
         let transport = self.transport.read().unwrap().clone();
@@ -676,7 +673,7 @@ impl Monet {
             let mut request = match build_request(&options, &None) {
                 Ok(request) => request,
                 Err(error) => {
-                    prefetch::fail(&key);
+                    prefetch::fail(&key, ticket);
                     on_error.call(ErrorEvent::from(error));
                     return;
                 }
@@ -710,24 +707,36 @@ impl Monet {
                             }
                             match failure {
                                 None => {
-                                    prefetch::complete(
+                                    let status = response.status;
+                                    let stored = prefetch::complete(
                                         &key,
+                                        ticket,
                                         prefetch::CachedResponse {
-                                            status: response.status,
+                                            status,
                                             headers: response.headers,
                                             body: bytes,
                                         },
                                     );
-                                    on_done.call_with_no_args();
+                                    if stored || status < 500 {
+                                        on_done.call_with_no_args();
+                                    } else {
+                                        // Not cached (see complete): the
+                                        // caller learns why.
+                                        on_error.call(ErrorEvent::from(
+                                            monet_core::Error::transport(format!(
+                                                "monet-rn: prefetch got HTTP {status} — not cached"
+                                            )),
+                                        ));
+                                    }
                                 }
                                 Some(error) => {
-                                    prefetch::fail(&key);
+                                    prefetch::fail(&key, ticket);
                                     on_error.call(ErrorEvent::from(error));
                                 }
                             }
                         }
                         Err(error) => {
-                            prefetch::fail(&key);
+                            prefetch::fail(&key, ticket);
                             on_error.call(ErrorEvent::from(error));
                         }
                     }
@@ -735,13 +744,13 @@ impl Monet {
                 Ok(_) => {
                     // A mocked prefetch has no wire form to warm: fail
                     // closed (no entry).
-                    prefetch::fail(&key);
+                    prefetch::fail(&key, ticket);
                     on_error.call(ErrorEvent::from(monet_core::Error::transport(
                         "monet-rn: a request hook mocked the prefetch — nothing to cache",
                     )));
                 }
                 Err(error) => {
-                    prefetch::fail(&key);
+                    prefetch::fail(&key, ticket);
                     on_error.call(ErrorEvent::from(error));
                 }
             }
@@ -1583,6 +1592,14 @@ async fn ws_pump(
                     WsMessage::Text(String::from_utf8_lossy(&data).into_owned())
                 };
                 if stream.send(message).is_err() {
+                    on_error.call(ErrorEvent::from(monet_core::Error::Body(
+                        "websocket driver dropped".into(),
+                    )));
+                    return;
+                }
+            }
+            Step::Command(Some(WsCommand::Ping)) => {
+                if stream.send(WsMessage::Ping(bytes::Bytes::new())).is_err() {
                     on_error.call(ErrorEvent::from(monet_core::Error::Body(
                         "websocket driver dropped".into(),
                     )));

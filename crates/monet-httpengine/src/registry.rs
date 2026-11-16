@@ -454,9 +454,13 @@ fn spawn_body_watcher(id: u64, cancel: CancelToken, mut wake_rx: UnboundedReceiv
                             // stall resumes only what it actually
                             // delivered.
                             match drain_overflow(id).await {
-                                // The consumer is gone: stop the task.
+                                // The consumer is gone: stop the task and
+                                // drop the state — the cancel's terminal
+                                // would be staged for this (exiting)
+                                // watcher, so nothing else removes it.
                                 None => {
                                     cancel_native(id);
+                                    remove(id);
                                     return;
                                 }
                                 Some(0) if matches!(reason, Wake::Stall) => {
@@ -720,7 +724,10 @@ mod tests {
         cancel.cancel();
         let result = futures_lite::future::block_on(await_head(id, rx, cancel, None));
         assert!(matches!(result, Err(Error::Cancelled)), "got: {result:?}");
-        assert!(fired.load(Ordering::SeqCst), "the native request was left running");
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "the native request was left running"
+        );
     }
 
     /// The caller dropping the wait (a pump racing it against its own
@@ -734,7 +741,10 @@ mod tests {
             futures_lite::future::block_on(futures_lite::future::poll_once(&mut wait)).is_none()
         );
         drop(wait);
-        assert!(fired.load(Ordering::SeqCst), "the native request was left running");
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "the native request was left running"
+        );
     }
 
     #[test]
@@ -747,7 +757,10 @@ mod tests {
             cancel,
             Some(std::time::Duration::from_millis(10)),
         ));
-        assert!(matches!(result, Err(Error::Transport { .. })), "got: {result:?}");
+        assert!(
+            matches!(result, Err(Error::Transport { .. })),
+            "got: {result:?}"
+        );
         assert!(fired.load(Ordering::SeqCst));
     }
 
@@ -762,5 +775,58 @@ mod tests {
         // The body consumer leaving is a separate path (on_chunk); the
         // head wait itself must not cancel anything.
         assert!(!fired.load(Ordering::SeqCst));
+    }
+
+    /// The no-follow redirect path reports done, then cancels the paused
+    /// native request: its onCanceled must not turn the delivered
+    /// response into a failure.
+    #[test]
+    fn a_cancel_after_done_keeps_the_response() {
+        let (id, rx) = allocate(CancelToken::new());
+        arm_native_cancel(id, Arc::new(|| {}));
+        head_delivered(id, 302);
+        on_done(id);
+        on_cancelled(id);
+        let response = futures_lite::future::block_on(rx).unwrap().unwrap();
+        assert_eq!(response.status, 302);
+        assert_eq!(response_body(response), Vec::<u8>::new());
+    }
+
+    fn is_registered(id: u64) -> bool {
+        REGISTRY.states.lock().unwrap().contains_key(&id)
+    }
+
+    /// The consumer drops the body while the watcher still has overflow
+    /// to deliver: the watcher cancels the native request and must also
+    /// drop the state — nothing else will (the cancel's terminal is
+    /// staged for a watcher that has exited), and the state pins two
+    /// JNI global refs.
+    #[test]
+    fn a_vanished_consumer_with_overflow_releases_the_state() {
+        let (id, rx) = allocate(CancelToken::new());
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe = fired.clone();
+        arm_native_cancel(id, Arc::new(move || probe.store(true, Ordering::SeqCst)));
+        arm_resume_read(id, Arc::new(|| {}));
+        head_delivered(id, 200);
+        let response = futures_lite::future::block_on(rx).unwrap().unwrap();
+        // Five chunks fill the channel; the sixth overflows and stalls.
+        for i in 0..6u8 {
+            on_chunk(id, &[i]);
+        }
+        drop(response);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while is_registered(id) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "the native request was not cancelled"
+        );
+        assert!(
+            !is_registered(id),
+            "the request state outlived its consumer"
+        );
     }
 }

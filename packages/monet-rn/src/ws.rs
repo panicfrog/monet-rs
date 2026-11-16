@@ -25,6 +25,8 @@ use monet_core::CancelToken;
 pub(crate) enum WsCommand {
     /// Send a text (`false`) or binary (`true`) message.
     Send { data: Vec<u8>, is_binary: bool },
+    /// Send a ping frame (empty payload).
+    Ping,
     /// Start the close handshake with this code and reason.
     Close { code: u16, reason: String },
 }
@@ -124,13 +126,7 @@ impl MonetWsConnection {
 
     /// Sends a ping (the transport answers received pings by itself).
     pub fn send_ping(&self) -> anyhow::Result<bool> {
-        Ok(self
-            .commands
-            .unbounded_send(WsCommand::Send {
-                data: Vec::new(),
-                is_binary: true,
-            })
-            .is_ok())
+        Ok(self.commands.unbounded_send(WsCommand::Ping).is_ok())
     }
 
     /// Starts the close handshake with this code and reason; the peer's

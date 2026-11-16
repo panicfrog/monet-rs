@@ -267,6 +267,8 @@ export function fetch(
  * in flight. Racing prefetches for one key start a single request.
  * The request-hook chain runs (auth injection rides it); response
  * hooks do not (the response goes to the cache, not a consumer).
+ * A 5xx is not cached: the promise rejects, and keyed fetches go to
+ * the network (with their own retry policy) instead.
  */
 export function prefetch(
   input: string | {url: string},

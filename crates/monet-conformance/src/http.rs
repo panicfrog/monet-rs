@@ -257,6 +257,23 @@ static FLAKY_VISITS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, usize>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
+/// The `/redirect-held` ids whose connection the client has closed.
+static REDIRECT_RELEASED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Records its id in [`REDIRECT_RELEASED`] when dropped — hyper drops
+/// the response body once the client has closed the connection.
+struct ReleaseProbe(String);
+
+impl Drop for ReleaseProbe {
+    fn drop(&mut self) {
+        REDIRECT_RELEASED
+            .lock()
+            .unwrap()
+            .insert(std::mem::take(&mut self.0));
+    }
+}
+
 /// Registers the TLS battery server's leaf SPKI for `/leaf-spki`.
 pub(crate) fn set_tls_leaf_spki(hash: String) {
     let _ = TLS_LEAF_SPKI.set(hash);
@@ -357,9 +374,11 @@ async fn respond_route(
             let mut flaky = FLAKY_VISITS.lock().unwrap();
             let visits = flaky.entry(key).or_insert(0);
             *visits += 1;
+            // `fail=<n>` among `&`-separated pairs (other pairs just
+            // make the counter key unique).
             let fail_first: usize = query
-                .split('=')
-                .nth(1)
+                .split('&')
+                .find_map(|pair| pair.strip_prefix("fail="))
                 .and_then(|n| n.parse().ok())
                 .unwrap_or(0);
             if *visits <= fail_first {
@@ -386,9 +405,7 @@ async fn respond_route(
         // /echo reflection's lossy UTF-8.
         "/body-size" => ok(
             StatusCode::OK,
-            boxed(Full::new(Bytes::from(
-                request_body.len().to_string(),
-            ))),
+            boxed(Full::new(Bytes::from(request_body.len().to_string()))),
         ),
         // The TLS battery server's leaf SPKI (base64) — 404 when no TLS
         // variant is running, i.e. from every in-process battery server.
@@ -506,6 +523,37 @@ async fn respond_route(
                 .headers_mut()
                 .insert("location", "/redirect-final".parse().unwrap());
             response
+        }
+        // A 302 whose body never ends (a chunk every 50ms): the
+        // connection lives until the client cancels or follows. The body
+        // records `?id=` in REDIRECT_RELEASED when the client lets go —
+        // the no-follow check's observable that the native request was
+        // released rather than left paused at the redirect.
+        "/redirect-held" => {
+            let probe = ReleaseProbe(query.strip_prefix("id=").unwrap_or_default().to_string());
+            let stream = futures_lite::stream::repeat(()).then(move |()| {
+                let _held = &probe;
+                async {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    Ok(Frame::data(Bytes::from(vec![b'x'; 16 * 1024])))
+                }
+            });
+            let mut response = ok(
+                StatusCode::FOUND,
+                boxed(http_body_util::StreamBody::new(stream)),
+            );
+            response
+                .headers_mut()
+                .insert("location", "/redirect-final".parse().unwrap());
+            response
+        }
+        "/redirect-held-released" => {
+            let id = query.strip_prefix("id=").unwrap_or_default().to_string();
+            let released = REDIRECT_RELEASED.lock().unwrap().contains(&id);
+            ok(
+                StatusCode::OK,
+                boxed(Full::new(Bytes::from(if released { "1" } else { "0" }))),
+            )
         }
         "/redirect-final" => ok(
             StatusCode::OK,

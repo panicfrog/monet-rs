@@ -14,6 +14,8 @@
 #![cfg_attr(target_os = "android", allow(unsafe_code))] // JNI boundary.
 
 #[cfg(any(target_os = "android", test))]
+mod engine_life;
+#[cfg(any(target_os = "android", test))]
 mod read_slots;
 #[cfg(any(target_os = "android", test))]
 mod registry;
@@ -79,9 +81,10 @@ impl Drop for HttpengineTransport {
         // Every engine's Cronet context holds a broadcast receiver the
         // system keeps strongly referenced until shutdown() — dropping
         // without it leaks one per engine and the process dies at the
-        // 1000-receiver cap. Safe by construction: embedders share one
-        // transport behind an Arc, so this runs only after the last
-        // in-flight request's pump has let go of its clone. (Not on
+        // 1000-receiver cap. Embedders share one transport behind an
+        // Arc, so this runs once the last pump has let go of its clone —
+        // but a cancelled request's native task can outlive its pump, so
+        // the shutdown itself waits for the engine to go idle. (Not on
         // EngineHandle: execute() duplicates it per request, and those
         // must never shut the engine down mid-flight.)
         jni::shutdown_engine(&self.engine);

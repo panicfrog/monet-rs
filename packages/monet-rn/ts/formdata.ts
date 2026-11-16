@@ -26,6 +26,23 @@ function randomBoundary(): string {
   return `----monet${out}`;
 }
 
+/** The HTML multipart escaping for names, filenames (and here the part
+ *  content type, also a header value): `"`, CR and LF become %22, %0D,
+ *  %0A, so a value can neither end its quoted string nor start a new
+ *  header line. */
+function escapeHeaderValue(value: string): string {
+  return value
+    .replace(/"/g, '%22')
+    .replace(/\r/g, '%0D')
+    .replace(/\n/g, '%0A');
+}
+
+/** A view's own window of its buffer, as a fresh ArrayBuffer. */
+function viewBytes(view: ArrayBufferView): ArrayBuffer {
+  const bytes = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+  return bytes.slice().buffer;
+}
+
 type Part =
   | {kind: 'field'; name: string; value: string}
   | {
@@ -54,8 +71,9 @@ export class MonetFormData {
   private parts: Part[] = [];
   private boundary = randomBoundary();
 
-  /** Appends one field: a string (text), an ArrayBuffer (a binary part;
-   *  `meta` carries its filename/content-type the way browsers'
+  /** Appends one field: a string (text), an ArrayBuffer or a typed-array
+   *  view (a binary part — a view sends exactly its window; `meta`
+   *  carries its filename/content-type the way browsers'
    *  append(name, blob, filename) does), a Blob (read through
    *  FileReader at stream time — the filename defaults to "blob",
    *  the browser convention, and the content-type to blob.type), or a
@@ -67,17 +85,18 @@ export class MonetFormData {
     value:
       | string
       | ArrayBuffer
+      | ArrayBufferView
       | BlobLike
       | {uri: string; name?: string; type?: string},
     meta?: {filename?: string; contentType?: string},
   ): void {
     if (typeof value === 'string') {
       this.parts.push({kind: 'field', name, value});
-    } else if (value instanceof ArrayBuffer) {
+    } else if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) {
       this.parts.push({
         kind: 'bytes',
         name,
-        value,
+        value: value instanceof ArrayBuffer ? value : viewBytes(value),
         filename: meta?.filename,
         contentType: meta?.contentType,
       });
@@ -89,7 +108,7 @@ export class MonetFormData {
         filename: meta?.filename,
         contentType: meta?.contentType,
       });
-    } else {
+    } else if (typeof (value as {uri?: unknown}).uri === 'string') {
       this.parts.push({
         kind: 'file',
         name,
@@ -97,6 +116,10 @@ export class MonetFormData {
         filename: value.name ?? name,
         contentType: value.type ?? 'application/octet-stream',
       });
+    } else {
+      throw new TypeError(
+        'MonetFormData.append: expected a string, ArrayBuffer, typed array, Blob, or {uri, name?, type?}',
+      );
     }
   }
 
@@ -122,7 +145,7 @@ export class MonetFormData {
     for (const part of this.parts) {
       yield `--${this.boundary}\r\n`;
       if (part.kind === 'field') {
-        yield `Content-Disposition: form-data; name="${part.name}"\r\n\r\n`;
+        yield `Content-Disposition: form-data; name="${escapeHeaderValue(part.name)}"\r\n\r\n`;
         yield `${part.value}\r\n`;
       } else if (part.kind === 'bytes') {
         yield this.bytesPartHeaders(part.name, part.filename, part.contentType);
@@ -161,10 +184,11 @@ export class MonetFormData {
     contentType: string | undefined,
   ): string {
     const name_ = filename ?? name;
+    const type = contentType ?? 'application/octet-stream';
     return (
-      `Content-Disposition: form-data; name="${name}"; ` +
-      `filename="${name_}"\r\n` +
-      `Content-Type: ${contentType ?? 'application/octet-stream'}\r\n\r\n`
+      `Content-Disposition: form-data; name="${escapeHeaderValue(name)}"; ` +
+      `filename="${escapeHeaderValue(name_)}"\r\n` +
+      `Content-Type: ${escapeHeaderValue(type)}\r\n\r\n`
     );
   }
 
@@ -178,7 +202,7 @@ export class MonetFormData {
       pushText(`--${this.boundary}\r\n`);
       if (part.kind === 'field') {
         pushText(
-          `Content-Disposition: form-data; name="${part.name}"\r\n` +
+          `Content-Disposition: form-data; name="${escapeHeaderValue(part.name)}"\r\n` +
             `\r\n${part.value}\r\n`,
         );
       } else if (part.kind === 'bytes') {

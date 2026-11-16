@@ -186,13 +186,18 @@ pub extern "system" fn native_on_redirect(
     // parity), or deliver the 3xx itself. The platform engine's manual
     // mode never surfaces the redirect body, so the synthesized response
     // is head + empty body — the status and location header are the
-    // contract a no-follow consumer reads.
+    // contract a no-follow consumer reads. The request itself is then
+    // cancelled: left paused at the redirect it would hold its
+    // connection (and keep the engine from shutting down) forever. Its
+    // onCanceled finds the request already done — the first terminal
+    // wins.
     if is_no_follow(id as u64) {
         let () = env
             .with_env(|env| -> Result<(), jni::errors::Error> {
                 deliver_head_from_info(env, id as u64, &info)?;
                 terminal(id);
                 registry::on_done(id as u64);
+                env.call_method(&request, jni::jni_str!("cancel"), jni::jni_sig!("()V"), &[])?;
                 Ok(())
             })
             .resolve::<Policy>();
@@ -221,6 +226,7 @@ pub extern "system" fn native_on_succeeded(
 ) {
     terminal(id);
     registry::on_done(id as u64);
+    crate::engine_life::request_finished(id as u64);
 }
 
 #[unsafe(no_mangle)]
@@ -248,6 +254,7 @@ pub extern "system" fn native_on_failed(
             Ok(())
         })
         .resolve::<Policy>();
+    crate::engine_life::request_finished(id as u64);
 }
 
 #[unsafe(no_mangle)]
@@ -260,6 +267,7 @@ pub extern "system" fn native_on_canceled(
 ) {
     terminal(id);
     registry::on_cancelled(id as u64);
+    crate::engine_life::request_finished(id as u64);
 }
 
 /// The chunked provider's take (v2/W2d): fills Cronet's upload read
@@ -306,6 +314,8 @@ pub extern "system" fn native_close_upload(_env: EnvUnowned<'_>, _class: JClass<
 /// handle (the cancel closure owns a separate one).
 fn terminal(id: jlong) {
     release_read_buffer(id as u64);
+    // A no-follow request that never redirected still has its mark.
+    NO_FOLLOW.lock().unwrap().remove(&(id as u64));
     requests().lock().unwrap().remove(&(id as u64));
 }
 

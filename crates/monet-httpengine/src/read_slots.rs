@@ -45,7 +45,10 @@ impl ReadSlots {
             // The read never started; drop the buffer unless a newer
             // one has already replaced it.
             let mut slots = self.slots.lock().unwrap();
-            if slots.get(&id).is_some_and(|b| b.as_ptr() == ptr.cast_const()) {
+            if slots
+                .get(&id)
+                .is_some_and(|b| b.as_ptr() == ptr.cast_const())
+            {
                 slots.remove(&id);
             }
         }

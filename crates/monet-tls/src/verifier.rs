@@ -374,7 +374,9 @@ mod tests {
         fn ca_params(name: &str) -> rcgen::CertificateParams {
             let mut params = rcgen::CertificateParams::new(vec![]).unwrap();
             params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-            params.distinguished_name.push(rcgen::DnType::CommonName, name);
+            params
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, name);
             params
         }
 
@@ -408,8 +410,10 @@ mod tests {
         fn pin_on(cert: &CertificateDer<'_>) -> PinConfig {
             let spki = crate::spki::spki_der(cert.as_ref()).unwrap();
             let hash = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(spki));
-            PinConfig::from_json(&format!(r#"{{"{HOST}": {{"publicKeyHashes": ["{hash}"]}}}}"#))
-                .unwrap()
+            PinConfig::from_json(&format!(
+                r#"{{"{HOST}": {{"publicKeyHashes": ["{hash}"]}}}}"#
+            ))
+            .unwrap()
         }
 
         fn verify(
@@ -433,8 +437,13 @@ mod tests {
             let real_int = intermediate("real intermediate", &real_root);
             let leaf = leaf(&real_int);
             let int_der = real_int.cert.der().clone();
-            verify(&[&real_root], &pin_on(&int_der), &leaf, std::slice::from_ref(&int_der))
-                .expect("the pinned intermediate issued this leaf");
+            verify(
+                &[&real_root],
+                &pin_on(&int_der),
+                &leaf,
+                std::slice::from_ref(&int_der),
+            )
+            .expect("the pinned intermediate issued this leaf");
         }
 
         #[test]
@@ -479,7 +488,8 @@ mod tests {
             )
             .expect_err("the pinned key never signed the forged leaf");
             assert!(
-                err.to_string().contains("ERR_SSL_PINNED_KEY_NOT_IN_CERT_CHAIN"),
+                err.to_string()
+                    .contains("ERR_SSL_PINNED_KEY_NOT_IN_CERT_CHAIN"),
                 "got: {err}"
             );
         }

@@ -43,6 +43,7 @@ pub mod hook;
 pub mod method;
 pub mod mock;
 pub mod pin;
+pub mod prefetch;
 pub mod request;
 pub mod response;
 pub mod retry;

@@ -47,7 +47,9 @@ impl RetryPolicy {
             return None;
         }
         let factor = 1u64.checked_shl(used).unwrap_or(u64::MAX);
-        Some(Duration::from_millis(self.backoff_ms.saturating_mul(factor)))
+        Some(Duration::from_millis(
+            self.backoff_ms.saturating_mul(factor),
+        ))
     }
 }
 
@@ -75,12 +77,18 @@ mod tests {
 
     #[test]
     fn final_outcomes_are_not_retried() {
-        assert_eq!(POLICY.retry_after(AttemptOutcome::Response(404), 0, true), None);
+        assert_eq!(
+            POLICY.retry_after(AttemptOutcome::Response(404), 0, true),
+            None
+        );
         assert_eq!(
             POLICY.retry_after(AttemptOutcome::Error(&Error::Cancelled), 0, true),
             None
         );
-        assert_eq!(POLICY.retry_after(AttemptOutcome::Response(503), 2, true), None);
+        assert_eq!(
+            POLICY.retry_after(AttemptOutcome::Response(503), 2, true),
+            None
+        );
         assert_eq!(
             RetryPolicy::default().retry_after(AttemptOutcome::Response(503), 0, true),
             None
@@ -92,7 +100,10 @@ mod tests {
     /// network error with that replay failure — so the outcome stands.
     #[test]
     fn a_body_that_cannot_be_replayed_is_not_retried() {
-        assert_eq!(POLICY.retry_after(AttemptOutcome::Response(503), 0, false), None);
+        assert_eq!(
+            POLICY.retry_after(AttemptOutcome::Response(503), 0, false),
+            None
+        );
         let network = Error::transport("connection reset");
         assert_eq!(
             POLICY.retry_after(AttemptOutcome::Error(&network), 0, false),

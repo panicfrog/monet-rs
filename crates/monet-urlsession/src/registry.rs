@@ -395,12 +395,17 @@ fn spawn_body_watcher(id: u64, cancel: CancelToken, mut wake_rx: UnboundedReceiv
                                 };
                                 valve_log(&format!("WATCHER id={id} woke: {reason_tag}"));
                                 match drain_overflow(id).await {
-                                    // The consumer is gone: stop the task.
+                                    // The consumer is gone: stop the task and
+                                    // drop the state — the cancellation's
+                                    // terminal would be staged for this
+                                    // (exiting) watcher, so nothing else
+                                    // removes it.
                                     None => {
                                         crate::valve_log(&format!(
                                             "WATCH id={id} {reason_tag} consumer-gone"
                                         ));
                                         bridge::transport_cancel(id);
+                                        remove(id);
                                         return;
                                     }
                                     // A stall wake on a live request: the
@@ -537,5 +542,27 @@ mod tests {
         // Releasing the body unblocks the parked watcher (its send
         // errors out) so the test leaves no thread behind.
         drop(body);
+    }
+
+    /// The consumer drops the body while the watcher still has overflow
+    /// to deliver: the watcher cancels the task and must also drop the
+    /// state — the cancellation's terminal would be staged for a watcher
+    /// that has exited, so nothing else removes it.
+    #[test]
+    fn a_vanished_consumer_with_overflow_releases_the_state() {
+        let (id, rx) = allocate(CancelToken::new());
+        on_response_head(id, 200);
+        let response = futures_lite::future::block_on(rx).unwrap().unwrap();
+        for i in 0..7u8 {
+            on_chunk(id, &[i]);
+        }
+        drop(response);
+
+        let registered = || REGISTRY.states.lock().unwrap().contains_key(&id);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while registered() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!registered(), "the request state outlived its consumer");
     }
 }

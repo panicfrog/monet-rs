@@ -343,6 +343,44 @@ const CHECKS: Array<{
       );
     },
   },
+  // Android only — URLSession declines a redirect by loading the 3xx's
+  // own body before reporting it, so the endless /redirect-held body
+  // never resolves there; iOS's request ends with that body anyway.
+  ...(Platform.OS === 'android'
+    ? [
+        {
+          name: 'http:no_follow_releases_the_request',
+          run: async (base: string) => {
+            // /redirect-held's 302 body never ends: the connection lives until
+            // the native request is cancelled. After a no-follow fetch whose
+            // body the caller abandons, the server must see it let go.
+            const id = `nf-${Date.now()}`;
+            const response = await fetch(`${base}/redirect-held?id=${id}`, {
+              followRedirects: false,
+            });
+            assert(response.status === 302, `status ${response.status}, expected 302`);
+            for await (const _chunk of response.body) {
+              break;
+            }
+            const deadline = Date.now() + 3000;
+            let released = '0';
+            while (Date.now() < deadline) {
+              released = await (
+                await fetch(`${base}/redirect-held-released?id=${id}`)
+              ).text();
+              if (released === '1') {
+                break;
+              }
+              await new Promise<void>(resolve => setTimeout(resolve, 100));
+            }
+            assert(
+              released === '1',
+              'the redirected request still holds its connection 3s later',
+            );
+          },
+        },
+      ]
+    : []),
   {
     name: 'http:streaming_upload',
     run: async base => {
@@ -755,6 +793,29 @@ const CHECKS: Array<{
     },
   },
   {
+    name: 'http:prefetch_server_error_not_cached',
+    run: async base => {
+      // A 5xx is not cached: prefetch() rejects, and the keyed fetch
+      // goes to the network (the /flaky route answers 500 once, then
+      // 200) instead of being handed the stored 500.
+      const url = `${base}/flaky?fail=1&run=${Date.now()}`;
+      let rejected = false;
+      try {
+        await prefetch(url, {prefetchKey: 'battery-5xx'});
+      } catch {
+        rejected = true;
+      }
+      assert(rejected, 'prefetch() resolved on a 500');
+      const response = await fetch(url, {prefetchKey: 'battery-5xx'});
+      assert(response.status === 200, `status ${response.status}, expected 200`);
+      assert(
+        response.headers.get('x-monet-prefetched') !== 'true',
+        'the fetch was served from the prefetch cache',
+      );
+      await response.text();
+    },
+  },
+  {
     name: 'http:prefetch_ttl_expiry',
     run: async base => {
       // A stale entry (the reading fetch's TTL governs) falls through
@@ -1048,6 +1109,25 @@ const CHECKS: Array<{
         // the close_code_fidelity test; this check is about surfacing.
       } finally {
         ws.abort();
+      }
+    },
+  },
+  {
+    name: 'ws:ping_sends_a_ping_frame',
+    run: async base => {
+      // /ping-echo answers with the type of frame it received.
+      const ws = new MonetWebSocket(`${wsBaseFrom(base)}/ping-echo`);
+      try {
+        await waitForOpen(ws);
+        ws.ping();
+        const reply = await nextMessage(ws);
+        assert(
+          reply.data === 'ping',
+          `the server received ${JSON.stringify(reply.data)}, expected a ping frame`,
+        );
+      } finally {
+        ws.close(1000, 'done');
+        await waitForClose(ws);
       }
     },
   },

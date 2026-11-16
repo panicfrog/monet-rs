@@ -20,6 +20,7 @@ use monet_core::request::Request;
 use monet_core::response::Response;
 use monet_core::transport::BoxFuture;
 
+use crate::engine_life::{self, EngineLife};
 use crate::read_slots::ReadSlots;
 use crate::registry;
 
@@ -183,27 +184,39 @@ pub fn init(
 /// A shared handle to the constructed `HttpEngine`.
 pub struct EngineHandle {
     engine: Global<JObject<'static>>,
+    /// The engine's live requests and its pending shutdown.
+    life: Arc<EngineLife>,
 }
 
 /// Releases the engine's native resources. The engine's Cronet context
 /// holds a broadcast receiver the system keeps strongly referenced until
 /// `shutdown()` — without this call every engine ever built leaks one
 /// permanently, and the process dies at the 1000-receiver cap. Errors
-/// are dropped (and the global ref still releases with the handle): a
-/// failed shutdown must not crash the embedder.
+/// are logged, never raised (the global ref still releases with the
+/// handle): a failed shutdown must not crash the embedder.
+///
+/// `shutdown()` throws while any request is still running, so it runs
+/// once the engine is idle — now, or from the last live request's final
+/// callback (see [`EngineLife`]).
 pub fn shutdown_engine(engine: &EngineHandle) {
-    let Some(globals) = GLOBALS.get() else {
-        return;
-    };
-    let _ = globals.vm.scope(|env| -> JniResult<()> {
-        env.call_method(
-            &*engine.engine,
-            jni::jni_str!("shutdown"),
-            jni::jni_sig!("()V"),
-            &[],
-        )?;
-        Ok(())
-    });
+    let handle = duplicate_global(&engine.engine);
+    engine.life.shut_down_when_idle(Box::new(move || {
+        let Some(globals) = GLOBALS.get() else {
+            return;
+        };
+        let result = globals.vm.scope(|env| -> JniResult<()> {
+            env.call_method(
+                &*handle,
+                jni::jni_str!("shutdown"),
+                jni::jni_sig!("()V"),
+                &[],
+            )?;
+            Ok(())
+        });
+        if let Err(e) = result {
+            log::warn!("httpengine: engine shutdown failed: {e}");
+        }
+    }));
 }
 
 /// The engine's version string (e.g. "121.0.6167.71").
@@ -303,6 +316,7 @@ pub fn build_engine(pins: &PinConfig) -> Result<EngineHandle> {
             );
             Ok(EngineHandle {
                 engine: env.new_global_ref(engine)?,
+                life: Arc::new(EngineLife::default()),
             })
         })
         .map_err(|e| {
@@ -398,6 +412,7 @@ pub fn execute(
     cancel: CancelToken,
 ) -> BoxFuture<Result<Response>> {
     // One extra global ref for the async block's lifetime ('static).
+    let life = Arc::clone(&engine.life);
     let engine = duplicate_global(&engine.engine);
     Box::pin(async move {
         if cancel.is_cancelled() {
@@ -417,7 +432,7 @@ pub fn execute(
             monet_core::body::Completeness::Failed(error) => return Err(error),
         };
 
-        let (id, head_rx) = start_request(&engine, &req, &cancel, upload)?;
+        let (id, head_rx) = start_request(&engine, &life, &req, &cancel, upload)?;
         let timeout = req.timeout_ms.map(std::time::Duration::from_millis);
         registry::await_head(id, head_rx, cancel, timeout).await
     })
@@ -433,6 +448,7 @@ pub fn execute(
 /// reason `engine`'s global ref is duplicated before the block.
 fn start_request(
     engine: &Global<JObject<'static>>,
+    life: &Arc<EngineLife>,
     req: &Request,
     cancel: &CancelToken,
     upload: UploadBody,
@@ -445,7 +461,10 @@ fn start_request(
     } else {
         Some(crate::upload::create(id))
     };
+    // Live from before start(): its final callback may come at once.
+    engine_life::request_started(life, id);
     let request = setup_and_start(engine, id, req, &upload).inspect_err(|_| {
+        engine_life::request_finished(id);
         registry::remove(id);
         if close_rx.is_some() {
             crate::upload::close(id);
