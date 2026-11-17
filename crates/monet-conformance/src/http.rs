@@ -338,7 +338,6 @@ async fn respond(
 
 /// The route table — [`respond`] adds the TLS battery's connection close.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 async fn respond_route(
     method: &str,
     path: &str,

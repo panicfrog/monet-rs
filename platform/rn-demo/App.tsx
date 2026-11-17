@@ -677,7 +677,10 @@ const CHECKS: Array<{
       // RN 0.88's Blob constructor only accepts Blob|string parts, so
       // the fixture content is a string.
       const CONTENT = 'blob-part-content';
-      const blob = new Blob([CONTENT], {type: 'text/plain'});
+      const blob = new Blob([CONTENT], {
+        type: 'text/plain',
+        lastModified: Date.now(),
+      });
       // A direct Blob body: one streaming chunk, the Blob's type riding
       // the headers (ASCII-only content — length is the utf-8 size).
       const directSize = Number(await (await fetch(`${base}/body-size`, {
